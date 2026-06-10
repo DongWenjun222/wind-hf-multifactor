@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local IDE
+.vscode/
+
+# Runtime outputs and large research artifacts
+wind_hf_multifactor_output/
+runs/
+logs/
+*.log
+*.pkl
+*.pickle
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Local scratch notes
+临时思路杂
+
+# OS
+.DS_Store
+Thumbs.db
