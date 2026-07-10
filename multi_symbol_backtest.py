@@ -84,6 +84,16 @@ def build_symbol_config(base_config: BacktestConfig, symbol: str) -> BacktestCon
     prune_path = Path(getattr(base_config, "factor_prune_list_path", "factor_prune_list.csv"))
     if not prune_path.is_absolute():
         symbol_config.factor_prune_list_path = str(Path(base_config.output_dir) / prune_path)
+    progress_path = Path(
+        getattr(
+            base_config,
+            "single_factor_start_index_progress_path",
+            "factor_library/single_factor_start_index_progress.csv",
+        )
+    )
+    if not progress_path.is_absolute():
+        progress_path = Path(base_config.output_dir) / progress_path
+    symbol_config.single_factor_start_index_progress_path = str(progress_path)
     if base_config.multi_symbol_separate_output_dirs:
         symbol_config.output_dir = get_symbol_output_dir(
             base_config.output_dir,

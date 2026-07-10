@@ -32,6 +32,7 @@
 | `single_factor_backtest.py` | 可以 | 单因子批量回测入口。读取数据、构建因子、训练/验证/测试分段回测、生成单因子报告并更新因子库。 |
 | `composite_factor_backtest.py` | 可以 | 综合因子回测入口。只在 active 因子池内选因，使用 XGBoost/逻辑回归/随机森林等模型滚动训练预测，并输出综合策略效果。 |
 | `multi_symbol_backtest.py` | 可以 | 多品种批量入口。对多个期货品种独立运行单因子和综合因子流程，并生成多品种组合层汇总、图表和风控组合结果。 |
+| `trading_signal.py` | 可以 | 最新交易信号导出入口。读取已经生成的 `composite_detail.csv`，输出单品种或多品种下一根 K 线目标仓位和调仓指令。 |
 | `runtime_utils.py` | 否 | 运行追踪工具。把控制台输出同步写入日志，并生成 `execution_manifest.json`，记录运行状态、耗时、配置哈希、错误堆栈和输出文件。 |
 | `project_fingerprint.py` | 否 | 源码指纹工具。计算影响因子构建的源码哈希，用于让因子矩阵缓存随公式变更自动失效。 |
 | `experiment_utils.py` | 否 | 实验快照工具。负责创建 `runs/` 实验目录、保存配置、复制关键输出、快照 active 因子库和因子数量。 |
@@ -76,6 +77,10 @@ python factor_metadata.py
 
 # 3. 只使用 active 因子池做综合模型滚动预测与回测
 python cli.py composite --symbol C.DCE --models xgboost,logistic_regression
+
+# 4. 从已有综合回测结果中导出最新交易信号，不重新训练模型
+python cli.py signal --symbol C.DCE --source auto
+python cli.py signal --symbols C.DCE,M.DCE,Y.DCE,P.DCE --source multi
 ```
 
 多品种研究推荐顺序：
@@ -114,6 +119,7 @@ wind_hf_multifactor_output/
   single_factor/                     # 单因子汇总、分组、图表
   composite_factor/                  # 综合因子明细、摘要、模型对比、诊断图表
   by_symbol/                         # 多品种独立结果和组合汇总
+  trading_signals/                   # 最新交易信号文件
 ```
 
 ## 1. 项目结构
@@ -165,6 +171,7 @@ wind_hf_multifactor_output/
 | `single_factor_backtest.py` | 单因子批量回测，输出训练集/验证集/测试集表现，并调用因子库逻辑更新 active 因子。 |
 | `composite_factor_backtest.py` | 综合因子回测，使用 active 因子池内的因子做 XGBoost 滚动训练、滚动选因、滚动预测。 |
 | `multi_symbol_backtest.py` | 多品种批量入口，为每个品种创建独立输出目录，依次运行单因子和综合因子流程，并生成跨品种汇总。 |
+| `trading_signal.py` | 最新交易信号导出工具，从单品种或多品种 `composite_detail.csv` 中提取最新信号、下一根目标仓位和调仓量。 |
 | `hard_prune_factors.py` | 因子硬删除工具，把多品种淘汰池中的低质量因子结构真正从因子构造源码中删除。模块化后重点面向 `factor_builders/`。 |
 | `experiment_utils.py` | 实验运行目录、配置快照、输出快照、因子数量快照等工程辅助函数。 |
 | `smoke_test.py` | 轻量冒烟测试，快速检查数据读取、因子构建、active 因子池和小规模 XGBoost 是否能跑通。 |
@@ -199,6 +206,8 @@ wind_hf_multifactor_output/
 | `use_frozen_active_library` | `False` | 综合回测是否读取冻结版 active 因子库快照。 |
 | `frozen_active_library_path` | `None` | 冻结版 active 因子库路径，可用于严格样本外检验。 |
 | `single_factor_new_factor_start_index` | `126978` | 当前增量测试从第 126978 个因子开始，对应最新追加的 `macro_` 宏观状态因子。 |
+| `single_factor_auto_update_start_index` | `True` | 是否自动记录并读取新增因子测试进度，避免 `single_factor_scope="new"` 重复测试已经跑完的因子。 |
+| `single_factor_start_index_progress_path` | `factor_library/single_factor_start_index_progress.csv` | 新增因子测试进度文件；相对路径默认放在总 `output_dir` 下，多品种模式共用该文件并按品种分行记录。 |
 | `single_factor_new_factor_start_index_by_symbol` | `C.DCE/M.DCE/Y.DCE/P.DCE/CS.DCE -> 126978` | 多品种模式下可为不同期货品种单独设置新增因子起始编号。 |
 | `enable_factor_pruning` | `True` | 是否启用多品种因子淘汰池机制。 |
 | `factor_prune_list_path` | `factor_prune_list.csv` | 软淘汰清单路径；相对路径默认放在 `output_dir` 下。 |

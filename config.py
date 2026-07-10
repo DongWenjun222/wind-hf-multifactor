@@ -522,6 +522,15 @@ class BacktestConfig:
     # 适合自动生成新因子后，只增量回测新加入的一批因子。
     single_factor_new_factor_start_index: int = 126978
 
+    # 是否自动读取和更新新增因子测试进度。
+    # 开启后，程序会在每次 new 模式单因子测试结束后记录 next_start_index；
+    # 下次运行会自动从 max(config.py 中的起点, 进度文件中的起点) 开始，避免重复测试。
+    single_factor_auto_update_start_index: bool = True
+
+    # 新增因子测试进度文件路径。
+    # 相对路径默认放在 output_dir 下；多品种模式会按品种分别记录进度。
+    single_factor_start_index_progress_path: str = "factor_library/single_factor_start_index_progress.csv"
+
     # 不同品种可以单独覆盖 single_factor_new_factor_start_index。
     # 适合多品种持续扩因子时使用：例如 C.DCE 已经测到 126978，
     # 但 P.DCE 可能只测到 106885，可以在这里单独指定。

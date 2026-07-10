@@ -205,8 +205,34 @@ def normalize_factor_symbol_key(symbol: Any) -> str:
     return str(symbol).strip().upper().replace(".", "_").replace("/", "_").replace("-", "_")
 
 
-def get_single_factor_new_factor_start_index(config: Any) -> int:
-    """返回当前品种实际使用的新因子起始编号。"""
+def get_single_factor_start_index_progress_path(config: Any) -> Path:
+    """返回新增因子测试进度文件路径。"""
+    progress_path = Path(
+        getattr(
+            config,
+            "single_factor_start_index_progress_path",
+            "factor_library/single_factor_start_index_progress.csv",
+        )
+    )
+    if progress_path.is_absolute():
+        return progress_path
+    return Path(getattr(config, "output_dir", ".")) / progress_path
+
+
+def load_single_factor_start_index_progress(config: Any) -> pd.DataFrame:
+    """读取新增因子测试进度表。"""
+    progress_path = get_single_factor_start_index_progress_path(config)
+    if not progress_path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(progress_path)
+    except Exception as exc:
+        print(f"新增因子测试进度读取失败，暂不应用: {progress_path}, 原因: {exc}")
+        return pd.DataFrame()
+
+
+def get_symbol_configured_new_factor_start_index(config: Any) -> int:
+    """只根据 config.py 中的全局/按品种配置返回新增因子起点。"""
     default_start_index = max(1, int(getattr(config, "single_factor_new_factor_start_index", 1)))
     symbol_start_index_map = getattr(config, "single_factor_new_factor_start_index_by_symbol", {}) or {}
     if not symbol_start_index_map:
@@ -217,6 +243,97 @@ def get_single_factor_new_factor_start_index(config: Any) -> int:
         if normalize_factor_symbol_key(symbol_key) == current_symbol_key:
             return max(1, int(start_index))
     return default_start_index
+
+
+def get_symbol_progress_new_factor_start_index(config: Any) -> int | None:
+    """从进度文件中读取当前品种已推进到的新因子起点。"""
+    if not bool(getattr(config, "single_factor_auto_update_start_index", True)):
+        return None
+
+    progress = load_single_factor_start_index_progress(config)
+    if progress.empty or "next_start_index" not in progress.columns:
+        return None
+
+    current_symbol_key = normalize_factor_symbol_key(getattr(config, "symbol", ""))
+    if "symbol_key" in progress.columns:
+        matched = progress[
+            progress["symbol_key"].astype(str).map(normalize_factor_symbol_key) == current_symbol_key
+        ]
+    elif "symbol" in progress.columns:
+        matched = progress[
+            progress["symbol"].astype(str).map(normalize_factor_symbol_key) == current_symbol_key
+        ]
+    else:
+        matched = progress
+    if matched.empty:
+        return None
+
+    next_index = pd.to_numeric(matched["next_start_index"], errors="coerce").dropna()
+    if next_index.empty:
+        return None
+    return max(1, int(next_index.max()))
+
+
+def get_single_factor_new_factor_start_index(config: Any) -> int:
+    """返回当前品种实际使用的新因子起始编号。"""
+    configured_start_index = get_symbol_configured_new_factor_start_index(config)
+    progress_start_index = get_symbol_progress_new_factor_start_index(config)
+    if progress_start_index is None:
+        return configured_start_index
+    return max(configured_start_index, progress_start_index)
+
+
+def update_single_factor_start_index_progress(
+    config: Any,
+    tested_factor_id_map: dict[str, int],
+) -> Path | None:
+    """在 new 模式单因子测试结束后更新当前品种的下一次起始编号。"""
+    if not bool(getattr(config, "single_factor_auto_update_start_index", True)):
+        return None
+    if str(getattr(config, "single_factor_scope", "")).lower() != "new":
+        return None
+    if not tested_factor_id_map:
+        return None
+
+    tested_ids = pd.to_numeric(pd.Series(list(tested_factor_id_map.values())), errors="coerce").dropna()
+    if tested_ids.empty:
+        return None
+
+    configured_start_index = get_symbol_configured_new_factor_start_index(config)
+    previous_effective_start_index = get_single_factor_new_factor_start_index(config)
+    last_tested_factor_id = int(tested_ids.max())
+    next_start_index = max(previous_effective_start_index, last_tested_factor_id + 1)
+    symbol = str(getattr(config, "symbol", "")).strip()
+    symbol_key = normalize_factor_symbol_key(symbol)
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    progress_path = get_single_factor_start_index_progress_path(config)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress = load_single_factor_start_index_progress(config)
+    if progress.empty:
+        progress = pd.DataFrame()
+
+    row = {
+        "symbol": symbol,
+        "symbol_key": symbol_key,
+        "configured_start_index": configured_start_index,
+        "previous_effective_start_index": previous_effective_start_index,
+        "last_tested_factor_id": last_tested_factor_id,
+        "next_start_index": next_start_index,
+        "tested_factor_count": int(len(tested_factor_id_map)),
+        "updated_at": now,
+    }
+    if "symbol_key" in progress.columns:
+        keep_mask = progress["symbol_key"].astype(str).map(normalize_factor_symbol_key) != symbol_key
+        progress = progress.loc[keep_mask].copy()
+    elif "symbol" in progress.columns:
+        keep_mask = progress["symbol"].astype(str).map(normalize_factor_symbol_key) != symbol_key
+        progress = progress.loc[keep_mask].copy()
+    else:
+        progress = pd.DataFrame()
+    progress = pd.concat([progress, pd.DataFrame([row])], ignore_index=True)
+    progress = progress.sort_values(["symbol_key"]).reset_index(drop=True)
+    progress.to_csv(progress_path, index=False, encoding="utf-8-sig")
+    return progress_path
 
 
 def get_factor_prune_list_path(config: Any) -> Path:

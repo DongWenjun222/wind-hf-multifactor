@@ -19,6 +19,7 @@ from factors import build_single_factor_matrix, fetch_intraday_data, stop_wind
 from multi_symbol_backtest import run_multi_symbol_backtest
 from runtime_utils import run_tracked
 from single_factor_backtest import run_single_factor_backtests
+from trading_signal import run_trading_signal_export
 
 
 def parse_csv_values(value: str | None) -> list[str] | None:
@@ -114,6 +115,16 @@ def run_multi(config: BacktestConfig) -> Any:
         stop_wind()
 
 
+def run_signal(config: BacktestConfig, args: argparse.Namespace) -> Any:
+    """导出最新交易信号。"""
+    return run_trading_signal_export(
+        config,
+        symbols=getattr(args, "symbols", None) or getattr(args, "symbol", None),
+        source=getattr(args, "source", "auto"),
+        output_path=getattr(args, "output", None),
+    )
+
+
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     """添加全部流程可共享的运行参数。"""
     parser.add_argument("--config-json", help="JSON 配置覆盖文件路径。")
@@ -157,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="是否跳过已经存在结果的品种。",
     )
+
+    signal = subparsers.add_parser("signal", help="导出最新单品种或多品种交易信号。")
+    add_common_arguments(signal)
+    signal.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
+    signal.add_argument(
+        "--source",
+        choices=["auto", "single", "multi"],
+        default="auto",
+        help="信号来源：single 读根目录 composite_factor；multi 读 by_symbol；auto 优先 by_symbol。",
+    )
+    signal.add_argument("--output", help="输出 CSV 路径。")
     return parser
 
 
@@ -169,6 +191,7 @@ def main() -> None:
         "single": run_single,
         "composite": run_composite,
         "multi": run_multi,
+        "signal": lambda current_config: run_signal(current_config, args),
     }
     run_tracked(config, args.command, lambda: runners[args.command](config))
 

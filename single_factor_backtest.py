@@ -44,6 +44,7 @@ from factors import (
     score_to_raw_signal,
     select_single_factor_columns,
     stop_wind,
+    update_single_factor_start_index_progress,
 )
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS"]
@@ -1277,6 +1278,14 @@ def run_single_factor_backtests(
                     frame["图片文件"] = frame["因子"].map(plot_paths).fillna(frame["图片文件"])
 
     save_factor_library(active_library, library_all, rejected_library, config)
+    progress_path = update_single_factor_start_index_progress(
+        config,
+        {
+            factor_name: factor_id_map[factor_name]
+            for factor_name in factor_columns
+            if factor_name in factor_id_map
+        },
+    )
     full_summary_path = output_dir / "single_factor_all_summary.csv"
     active_library.to_csv(summary_path, index=False, encoding="utf-8-sig")
     full_summary.to_csv(full_summary_path, index=False, encoding="utf-8-sig")
@@ -1294,6 +1303,7 @@ def run_single_factor_backtests(
                 summary_path,
                 full_summary_path,
                 qcut_summary_path,
+                progress_path if progress_path is not None else Path("__missing_progress_file__"),
                 library_dir / "active_factors.csv",
                 library_dir / "factor_library_all.csv",
                 library_dir / "rejected_factors.csv",
@@ -1305,6 +1315,9 @@ def run_single_factor_backtests(
     print(f"因子库active: {library_dir / 'active_factors.csv'}")
     print(f"因子库全量: {library_dir / 'factor_library_all.csv'}")
     print(f"因子库拒绝: {library_dir / 'rejected_factors.csv'}")
+    if progress_path is not None:
+        print(f"新增因子测试进度: {progress_path}")
+        print(f"下次new模式当前品种起始编号将不低于: {get_single_factor_new_factor_start_index(config)}")
     print(f"qcut分组汇总: {qcut_summary_path}")
     return active_library
 
