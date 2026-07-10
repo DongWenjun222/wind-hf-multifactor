@@ -192,6 +192,81 @@ class BacktestConfig:
     # 1 表示线性加权；大于 1 会让权重更集中到最高机会品种。
     multi_symbol_opportunity_weight_power: float = 1.0
 
+    # 多品种组合是否启用板块/产业链风险预算。
+    # 开启后会限制同一板块在组合中的总权重，降低高度相关品种同时重仓的风险。
+    multi_symbol_use_group_risk_budget: bool = True
+
+    # 单个板块/产业链在组合中的最大权重。
+    # 例如 0.35 表示黑色、油脂、化工等任一组最多占组合权重 35%。
+    multi_symbol_max_group_weight: float = 0.35
+
+    # 品种到板块/产业链的映射。未配置品种会落入 "其他"。
+    # key 支持 Wind 主力连续代码写法，程序会统一转成大写匹配。
+    multi_symbol_group_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "CU.SHF": "有色金属",
+            "AL.SHF": "有色金属",
+            "ZN.SHF": "有色金属",
+            "PB.SHF": "有色金属",
+            "NI.SHF": "有色金属",
+            "SN.SHF": "有色金属",
+            "AO.SHF": "有色金属",
+            "BC.INE": "有色金属",
+            "AU.SHF": "贵金属",
+            "AG.SHF": "贵金属",
+            "RB.SHF": "黑色建材",
+            "HC.SHF": "黑色建材",
+            "SS.SHF": "黑色建材",
+            "I.DCE": "黑色原料",
+            "J.DCE": "黑色原料",
+            "JM.DCE": "黑色原料",
+            "SF.CZC": "黑色原料",
+            "SM.CZC": "黑色原料",
+            "RU.SHF": "橡胶",
+            "BR.SHF": "橡胶",
+            "NR.INE": "橡胶",
+            "SC.INE": "能源",
+            "LU.INE": "能源",
+            "FU.SHF": "能源",
+            "BU.SHF": "能源",
+            "PG.DCE": "能源",
+            "L.DCE": "化工",
+            "V.DCE": "化工",
+            "PP.DCE": "化工",
+            "EG.DCE": "化工",
+            "EB.DCE": "化工",
+            "TA.CZC": "化工",
+            "MA.CZC": "化工",
+            "UR.CZC": "化工",
+            "SA.CZC": "化工",
+            "PF.CZC": "化工",
+            "PX.CZC": "化工",
+            "SH.CZC": "化工",
+            "A.DCE": "油脂油料",
+            "B.DCE": "油脂油料",
+            "M.DCE": "油脂油料",
+            "Y.DCE": "油脂油料",
+            "P.DCE": "油脂油料",
+            "RM.CZC": "油脂油料",
+            "OI.CZC": "油脂油料",
+            "C.DCE": "谷物",
+            "CS.DCE": "谷物",
+            "CF.CZC": "软商品",
+            "SR.CZC": "软商品",
+            "AP.CZC": "农产品",
+            "CJ.CZC": "农产品",
+            "PK.CZC": "农产品",
+            "JD.DCE": "畜牧",
+            "LH.DCE": "畜牧",
+            "FG.CZC": "建材",
+            "SP.SHF": "纸浆",
+            "SI.GFE": "新能源",
+            "LC.GFE": "新能源",
+            "PS.GFE": "新能源",
+            "EC.INE": "航运",
+        }
+    )
+
     # 多品种组合是否启用波动率目标控制。
     # 开启后会根据组合过去一段时间的已实现波动率动态缩放总风险暴露。
     multi_symbol_use_vol_target: bool = True
@@ -541,6 +616,17 @@ class BacktestConfig:
     # 逻辑回归的 L2 正则强度倒数。越小正则越强，越不容易过拟合。
     composite_logistic_c: float = 1.0
 
+    # 是否输出验证集到最终测试集的表现衰减诊断。
+    # 该报告用于识别模型是否只在验证段表现好，到了最终留存测试段明显失效。
+    composite_enable_validation_test_gap_report: bool = True
+
+    # 验证/测试衰减预警阈值：测试夏普低于验证夏普的该比例时标记为衰减。
+    # 例如 0.5 表示测试夏普不到验证夏普一半时预警。
+    composite_gap_warn_sharpe_retention: float = 0.5
+
+    # 验证/测试衰减预警阈值：测试累计收益低于验证累计收益的该比例时标记为衰减。
+    composite_gap_warn_return_retention: float = 0.5
+
     # XGBoost 滚动训练窗口长度，单位为 K线根数。
     # 当前 240*5 表示约 1200 根 30分钟K线。调大通常更稳定，但对市场变化反应更慢。
     xgboost_train_window: int = 240*5
@@ -664,6 +750,22 @@ class BacktestConfig:
     # 用于估计波动率和流动性状态分位的滚动窗口。
     xgboost_trade_filter_window: int = 120
 
+    # 市场状态分层诊断使用的滚动窗口。
+    # 用于计算趋势强度、波动分位、流动性分位等状态标签。
+    market_state_regime_window: int = 120
+
+    # 判断趋势/震荡状态的趋势强度阈值。
+    # 趋势强度 = abs(过去窗口累计收益) / 过去窗口逐K线绝对收益和。
+    market_state_trend_strength_threshold: float = 0.25
+
+    # 是否按市场状态过滤交易。
+    # 默认关闭，仅输出分层诊断；如确认某些状态稳定亏损，可开启并配置 allowed_market_state_regimes。
+    xgboost_trade_use_regime_filter: bool = False
+
+    # 允许交易的市场状态标签。
+    # 空列表表示不限制；可填如 ["趋势上涨", "趋势下跌", "高波动", "高流动性"]。
+    allowed_market_state_regimes: list[str] = field(default_factory=list)
+
     # 允许交易所需的日内绝对收益滚动分位下限。
     xgboost_trade_min_volatility_rank: float = 0#0.05#0.10
 
@@ -727,6 +829,22 @@ class BacktestConfig:
     # XGBoost 训练时施加给中性标签（0）的类别权重。
     # 小于 1 可以降低中性类别在噪声数据中的主导性。
     xgboost_train_neutral_class_weight: float = 0.8
+
+    # 是否启用训练样本时间衰减权重。
+    # 开启后，越靠近当前预测时点的训练样本权重越高，较早历史样本权重逐步降低。
+    xgboost_train_use_time_decay_weight: bool = True
+
+    # 时间衰减半衰期，单位是 K 线根数。
+    # 例如 400 表示距离训练窗口尾部 400 根 K 线的样本，其时间权重大约降为近期样本的一半。
+    xgboost_train_time_decay_half_life: int = 400
+
+    # 时间衰减的最低权重下限。
+    # 避免过早历史样本权重过低，导致训练有效样本数骤降。
+    xgboost_train_time_decay_min_weight: float = 0.25
+
+    # 是否把时间衰减后的样本权重均值重新归一到 1。
+    # 建议保持开启，这样主要改变新旧样本相对重要性，而不是整体改变模型学习强度。
+    xgboost_train_time_decay_normalize: bool = True
 
     # 是否在训练窗口内自动校准 XGBoost 信号方向。
     # 开启后会根据训练窗口表现决定是否反向；如果你认为方向校准不符合研究原则，可关闭。

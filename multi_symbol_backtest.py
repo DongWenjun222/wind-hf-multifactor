@@ -318,6 +318,29 @@ def get_symbol_from_strategy_column(column: str) -> str:
     return column.removesuffix("_strategy_return")
 
 
+def normalize_symbol_for_group(symbol: str) -> str:
+    """把品种代码转成用于板块映射的标准形式。"""
+    return str(symbol).strip().replace("_", ".").upper()
+
+
+def get_symbol_group(symbol: str, config: BacktestConfig) -> str:
+    """返回品种所属板块/产业链。"""
+    group_map = getattr(config, "multi_symbol_group_map", {}) or {}
+    normalized_map = {normalize_symbol_for_group(key): str(value) for key, value in group_map.items()}
+    return normalized_map.get(normalize_symbol_for_group(symbol), "其他")
+
+
+def build_strategy_column_group_map(
+    strategy_columns: list[str],
+    config: BacktestConfig,
+) -> dict[str, str]:
+    """构建策略收益列到板块名称的映射。"""
+    return {
+        column: get_symbol_group(get_symbol_from_strategy_column(column), config)
+        for column in strategy_columns
+    }
+
+
 def build_static_portfolio_weights(
     returns: pd.DataFrame,
     method: str,
@@ -388,6 +411,65 @@ def normalize_and_cap_weights(raw_weights: pd.Series, max_weight: float) -> pd.S
             break
     if capped.sum() <= 0:
         return weights
+    return capped / capped.sum()
+
+
+def cap_group_weights(
+    weights: pd.Series,
+    column_group_map: dict[str, str],
+    max_group_weight: float,
+) -> pd.Series:
+    """限制同一板块/产业链的总权重，并把超额部分分配给未超限板块。"""
+    weights = weights.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    if weights.sum() <= 0:
+        return weights
+    original_weights = weights / weights.sum()
+    max_group_weight = float(max_group_weight)
+    if max_group_weight <= 0 or max_group_weight >= 1:
+        return original_weights
+
+    groups = pd.Series(
+        {column: column_group_map.get(column, "其他") for column in original_weights.index},
+        dtype="object",
+    )
+    unique_groups = groups[original_weights > 0].dropna().unique()
+    if len(unique_groups) <= 1:
+        return original_weights
+    max_group_weight = max(max_group_weight, 1.0 / len(unique_groups))
+
+    fixed_groups: set[str] = set()
+    capped_group_weights: dict[str, float] = {}
+    group_original_weights = original_weights.groupby(groups).sum()
+    for _ in range(len(unique_groups) + 2):
+        floating_groups = [group for group in unique_groups if group not in fixed_groups]
+        remaining_budget = max(0.0, 1.0 - sum(capped_group_weights.values()))
+        floating_total = group_original_weights.reindex(floating_groups).fillna(0.0).sum()
+        if not floating_groups or remaining_budget <= 0 or floating_total <= 0:
+            break
+
+        proposed = group_original_weights.reindex(floating_groups).fillna(0.0) / floating_total * remaining_budget
+        over_groups = proposed[proposed > max_group_weight + 1e-12]
+        if over_groups.empty:
+            capped_group_weights.update({str(group): float(weight) for group, weight in proposed.items()})
+            break
+
+        for group in over_groups.index:
+            fixed_groups.add(str(group))
+            capped_group_weights[str(group)] = max_group_weight
+
+    if not capped_group_weights:
+        return original_weights
+
+    capped = pd.Series(0.0, index=original_weights.index, dtype="float64")
+    for group, group_weight in capped_group_weights.items():
+        group_columns = groups[groups == group].index
+        group_original_total = original_weights.reindex(group_columns).sum()
+        if group_original_total <= 0:
+            continue
+        capped.loc[group_columns] = original_weights.loc[group_columns] / group_original_total * group_weight
+
+    if capped.sum() <= 0:
+        return original_weights
     return capped / capped.sum()
 
 
@@ -540,6 +622,55 @@ def apply_cross_sectional_opportunity_selection(
         selected_mask.loc[timestamp, adjusted_weights.index] = 1.0
 
     return adjusted, selected_mask
+
+
+def apply_group_risk_budget(
+    weights: pd.DataFrame,
+    column_group_map: dict[str, str],
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """对逐时点权重应用板块/产业链风险预算。"""
+    if not bool(getattr(config, "multi_symbol_use_group_risk_budget", False)):
+        return weights
+    max_group_weight = float(getattr(config, "multi_symbol_max_group_weight", 1.0) or 1.0)
+    if max_group_weight <= 0 or max_group_weight >= 1:
+        return weights
+
+    adjusted = pd.DataFrame(0.0, index=weights.index, columns=weights.columns, dtype="float64")
+    for timestamp in weights.index:
+        row = weights.loc[timestamp]
+        if row.fillna(0.0).sum() <= 0:
+            continue
+        adjusted.loc[timestamp] = cap_group_weights(row, column_group_map, max_group_weight)
+    return adjusted
+
+
+def build_group_weight_frame(
+    weights: pd.DataFrame,
+    column_group_map: dict[str, str],
+) -> pd.DataFrame:
+    """把品种权重聚合成板块权重。"""
+    group_weights = {}
+    for group in sorted(set(column_group_map.values())):
+        columns = [column for column, column_group in column_group_map.items() if column_group == group]
+        existing_columns = [column for column in columns if column in weights.columns]
+        if existing_columns:
+            group_weights[group] = weights[existing_columns].sum(axis=1)
+    return pd.DataFrame(group_weights, index=weights.index)
+
+
+def build_group_contribution_frame(
+    symbol_contribution: pd.DataFrame,
+    column_group_map: dict[str, str],
+) -> pd.DataFrame:
+    """把品种收益贡献聚合成板块收益贡献。"""
+    group_contribution = {}
+    for group in sorted(set(column_group_map.values())):
+        columns = [column for column, column_group in column_group_map.items() if column_group == group]
+        existing_columns = [column for column in columns if column in symbol_contribution.columns]
+        if existing_columns:
+            group_contribution[group] = symbol_contribution[existing_columns].sum(axis=1)
+    return pd.DataFrame(group_contribution, index=symbol_contribution.index)
 
 
 def build_portfolio_risk_multiplier(
@@ -697,10 +828,17 @@ def save_multi_symbol_portfolio(
     benchmark_returns = portfolio[benchmark_columns]
     abs_positions = portfolio[position_columns].abs()
     opportunity_scores = build_cross_sectional_opportunity_scores(portfolio, strategy_columns, config)
+    strategy_column_group_map = build_strategy_column_group_map(strategy_columns, config)
+    symbol_group_map = {
+        get_symbol_from_strategy_column(column): group
+        for column, group in strategy_column_group_map.items()
+    }
     summary_rows = []
     weight_frames = []
     contribution_frames = []
     opportunity_selection_frames = []
+    group_weight_frames = []
+    group_contribution_frames = []
     use_rolling_weights = bool(getattr(config, "multi_symbol_use_rolling_portfolio_weights", True))
     weight_window = int(getattr(config, "multi_symbol_portfolio_weight_window", 480) or 480)
     min_weight_samples = int(getattr(config, "multi_symbol_portfolio_min_weight_samples", 120) or 120)
@@ -723,6 +861,11 @@ def save_multi_symbol_portfolio(
                 weights_by_time,
                 opportunity_scores,
                 max_symbol_weight,
+                config,
+            )
+            weights_by_time = apply_group_risk_budget(
+                weights_by_time,
+                strategy_column_group_map,
                 config,
             )
             symbol_weight_columns = {
@@ -782,6 +925,11 @@ def save_multi_symbol_portfolio(
                 max_symbol_weight,
                 config,
             )
+            weights_by_time = apply_group_risk_budget(
+                weights_by_time,
+                strategy_column_group_map,
+                config,
+            )
             symbol_weight_columns = {
                 column: get_symbol_from_strategy_column(column) for column in weights_by_time.columns
             }
@@ -825,6 +973,18 @@ def save_multi_symbol_portfolio(
             symbol_weights_for_summary = avg_symbol_weights
         base_avg_selected_count = float((base_weights_by_time > 0).sum(axis=1).mean())
         avg_selected_count = float((weights_by_time > 0).sum(axis=1).mean())
+        group_weights_for_method = build_group_weight_frame(weights_by_time, strategy_column_group_map)
+        if not group_weights_for_method.empty:
+            group_weight_frames.append(group_weights_for_method.add_prefix(f"{method}_"))
+            max_group_weight_realized = float(group_weights_for_method.max(axis=1).mean())
+            avg_active_group_count = float((group_weights_for_method > 0).sum(axis=1).mean())
+            group_weight_summary = ",".join(
+                f"{group}:{weight:.4f}" for group, weight in group_weights_for_method.mean().sort_values(ascending=False).items()
+            )
+        else:
+            max_group_weight_realized = np.nan
+            avg_active_group_count = np.nan
+            group_weight_summary = ""
         portfolio[f"{method}_raw_strategy_return"] = portfolio[f"{method}_strategy_return"]
         portfolio[f"{method}_raw_avg_abs_position"] = portfolio[f"{method}_avg_abs_position"]
         risk_state = build_portfolio_risk_multiplier(
@@ -843,9 +1003,15 @@ def save_multi_symbol_portfolio(
         portfolio[f"{method}_avg_abs_position"] = (
             portfolio[f"{method}_raw_avg_abs_position"] * portfolio[f"{method}_risk_multiplier"]
         )
-        contribution_frames.append(
-            contribution_frame.mul(portfolio[f"{method}_risk_multiplier"], axis=0)
-        )
+        risk_adjusted_contribution = contribution_frame.mul(portfolio[f"{method}_risk_multiplier"], axis=0)
+        contribution_frames.append(risk_adjusted_contribution)
+        method_symbol_group_map = {
+            f"{method}_{symbol}": group
+            for symbol, group in symbol_group_map.items()
+        }
+        group_contribution = build_group_contribution_frame(risk_adjusted_contribution, method_symbol_group_map)
+        if not group_contribution.empty:
+            group_contribution_frames.append(group_contribution.add_prefix(f"{method}_"))
         portfolio[f"{method}_nav"] = (1.0 + portfolio[f"{method}_strategy_return"]).cumprod()
         portfolio[f"{method}_benchmark_nav"] = (
             1.0 + portfolio[f"{method}_benchmark_return"]
@@ -879,10 +1045,15 @@ def save_multi_symbol_portfolio(
         metrics["机会权重幂次"] = float(getattr(config, "multi_symbol_opportunity_weight_power", 1.0) or 1.0)
         metrics["机会选择前平均入选品种数"] = base_avg_selected_count
         metrics["机会选择后平均入选品种数"] = avg_selected_count
+        metrics["启用板块风险预算"] = bool(getattr(config, "multi_symbol_use_group_risk_budget", False))
+        metrics["单板块最大权重上限"] = float(getattr(config, "multi_symbol_max_group_weight", 1.0) or 1.0)
+        metrics["平均最大板块权重"] = max_group_weight_realized
+        metrics["平均活跃板块数"] = avg_active_group_count
         metrics["平均绝对仓位"] = float(portfolio[f"{method}_avg_abs_position"].mean())
         metrics["品种权重"] = ",".join(
             f"{symbol}:{weight:.4f}" for symbol, weight in symbol_weights_for_summary.items()
         )
+        metrics["板块权重"] = group_weight_summary
         summary_rows.append(metrics)
 
     detail_path = summary_dir / "multi_symbol_portfolio_detail.csv"
@@ -906,6 +1077,12 @@ def save_multi_symbol_portfolio(
     if contribution_frames:
         contribution_path = summary_dir / "multi_symbol_portfolio_contribution.csv"
         pd.concat(contribution_frames, axis=1).to_csv(contribution_path, encoding="utf-8-sig")
+    if group_weight_frames:
+        group_weights_path = summary_dir / "multi_symbol_group_weights.csv"
+        pd.concat(group_weight_frames, axis=1).to_csv(group_weights_path, encoding="utf-8-sig")
+    if group_contribution_frames:
+        group_contribution_path = summary_dir / "multi_symbol_group_contribution.csv"
+        pd.concat(group_contribution_frames, axis=1).to_csv(group_contribution_path, encoding="utf-8-sig")
     corr_path = summary_dir / "multi_symbol_strategy_return_corr.csv"
     strategy_returns.rename(columns={col: get_symbol_from_strategy_column(col) for col in strategy_columns}).corr().to_csv(
         corr_path,

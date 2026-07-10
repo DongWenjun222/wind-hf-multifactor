@@ -615,10 +615,20 @@ def build_market_state_filter(data: pd.DataFrame, config: BacktestConfig) -> pd.
     """仅使用当前和历史 K 线构造简单的交易质量过滤器。"""
     window = max(20, int(getattr(config, "xgboost_trade_filter_window", 120) or 120))
     min_periods = max(20, window // 3)
+    regime_window = max(20, int(getattr(config, "market_state_regime_window", window) or window))
+    regime_min_periods = max(20, regime_window // 3)
     use_filters = bool(getattr(config, "xgboost_trade_use_market_filters", False))
 
     abs_intrabar_return = (data["close"] / data["open"].replace(0, np.nan) - 1.0).abs()
     vol_rank = abs_intrabar_return.rolling(window=window, min_periods=min_periods).rank(pct=True)
+    close_return = data["close"].replace(0, np.nan).pct_change()
+    rolling_return = data["close"].replace(0, np.nan) / data["close"].replace(0, np.nan).shift(regime_window) - 1.0
+    rolling_abs_return_sum = close_return.abs().rolling(regime_window, min_periods=regime_min_periods).sum()
+    trend_strength = (rolling_return.abs() / rolling_abs_return_sum.replace(0, np.nan)).clip(0.0, 1.0)
+    trend_threshold = max(
+        0.0,
+        min(1.0, float(getattr(config, "market_state_trend_strength_threshold", 0.25) or 0.25)),
+    )
 
     liquidity_series = None
     for column in ("amt", "amount", "volume"):
@@ -646,10 +656,51 @@ def build_market_state_filter(data: pd.DataFrame, config: BacktestConfig) -> pd.
             trade_allowed &= liquidity_rank.fillna(0.0) >= min_liq_rank
     trade_allowed &= abs_intrabar_return.notna()
 
+    volatility_regime = pd.Series("未知波动", index=data.index, dtype="object")
+    volatility_regime[vol_rank <= 0.33] = "低波动"
+    volatility_regime[(vol_rank > 0.33) & (vol_rank <= 0.66)] = "中波动"
+    volatility_regime[vol_rank > 0.66] = "高波动"
+
+    liquidity_regime = pd.Series("未知流动性", index=data.index, dtype="object")
+    liquidity_regime[liquidity_rank <= 0.33] = "低流动性"
+    liquidity_regime[(liquidity_rank > 0.33) & (liquidity_rank <= 0.66)] = "中流动性"
+    liquidity_regime[liquidity_rank > 0.66] = "高流动性"
+
+    trend_regime = pd.Series("未知趋势", index=data.index, dtype="object")
+    trend_regime[(trend_strength >= trend_threshold) & (rolling_return > 0)] = "趋势上涨"
+    trend_regime[(trend_strength >= trend_threshold) & (rolling_return < 0)] = "趋势下跌"
+    trend_regime[(trend_strength < trend_threshold) & trend_strength.notna()] = "震荡"
+
+    hour = pd.Series(data.index.hour, index=data.index)
+    minute = pd.Series(data.index.minute, index=data.index)
+    intraday_minutes = hour * 60 + minute
+    session_regime = pd.Series("其他时段", index=data.index, dtype="object")
+    session_regime[(intraday_minutes >= 9 * 60) & (intraday_minutes < 10 * 60 + 30)] = "早盘"
+    session_regime[(intraday_minutes >= 10 * 60 + 30) & (intraday_minutes < 11 * 60 + 30)] = "上午后段"
+    session_regime[(intraday_minutes >= 13 * 60 + 30) & (intraday_minutes < 15 * 60)] = "下午盘"
+    session_regime[(intraday_minutes >= 21 * 60) | (intraday_minutes < 2 * 60 + 30)] = "夜盘"
+
+    if bool(getattr(config, "xgboost_trade_use_regime_filter", False)):
+        allowed_regimes = set(str(value) for value in (getattr(config, "allowed_market_state_regimes", []) or []))
+        if allowed_regimes:
+            regime_allowed = (
+                trend_regime.isin(allowed_regimes)
+                | volatility_regime.isin(allowed_regimes)
+                | liquidity_regime.isin(allowed_regimes)
+                | session_regime.isin(allowed_regimes)
+            )
+            trade_allowed &= regime_allowed.fillna(False)
+
     return pd.DataFrame(
         {
             "volatility_rank": vol_rank.astype("float64"),
             "liquidity_rank": liquidity_rank.astype("float64"),
+            "trend_strength": trend_strength.astype("float64"),
+            "rolling_regime_return": rolling_return.astype("float64"),
+            "volatility_regime": volatility_regime,
+            "liquidity_regime": liquidity_regime,
+            "trend_regime": trend_regime,
+            "session_regime": session_regime,
             "trade_allowed": trade_allowed.astype("float64"),
         },
         index=data.index,
@@ -1218,7 +1269,7 @@ def build_training_sample_weights(
     train_target: pd.Series,
     config: BacktestConfig,
 ) -> pd.Series:
-    """构造逐样本权重，让 XGBoost 更关注方向性标签。"""
+    """构造逐样本权重，同时支持类别权重和时间衰减权重。"""
     neutral_weight = max(
         0.0,
         float(getattr(config, "xgboost_train_neutral_class_weight", 1.0) or 1.0),
@@ -1230,6 +1281,23 @@ def build_training_sample_weights(
     weights = pd.Series(nonzero_weight, index=train_target.index, dtype="float64")
     weights[train_target == 0] = neutral_weight
     weights[train_target.isna()] = 0.0
+
+    if bool(getattr(config, "xgboost_train_use_time_decay_weight", False)) and len(weights) > 1:
+        half_life = float(getattr(config, "xgboost_train_time_decay_half_life", 0) or 0)
+        if half_life > 0:
+            min_time_weight = max(
+                0.0,
+                min(1.0, float(getattr(config, "xgboost_train_time_decay_min_weight", 0.0) or 0.0)),
+            )
+            age_from_window_end = len(weights) - 1 - np.arange(len(weights), dtype="float64")
+            time_weight = np.power(0.5, age_from_window_end / half_life)
+            time_weight = np.maximum(time_weight, min_time_weight)
+            if bool(getattr(config, "xgboost_train_time_decay_normalize", True)):
+                mean_weight = float(np.nanmean(time_weight))
+                if np.isfinite(mean_weight) and mean_weight > 0:
+                    time_weight = time_weight / mean_weight
+            weights *= pd.Series(time_weight, index=weights.index, dtype="float64")
+
     return weights
 
 
@@ -1820,6 +1888,58 @@ def append_segment_metric_row(
     )
 
 
+def append_market_state_row(
+    rows: list[dict[str, Any]],
+    state_type: str,
+    state_name: str,
+    segment_df: pd.DataFrame,
+    config: BacktestConfig,
+) -> None:
+    """追加一行市场状态分层表现。"""
+    required_columns = {"strategy_net_return", "benchmark_return", "position"}
+    if segment_df.empty or not required_columns.issubset(segment_df.columns):
+        return
+    segment_df = segment_df.dropna(subset=["strategy_net_return"])
+    if segment_df.empty:
+        return
+    try:
+        metrics = calculate_backtest_segment_metrics(segment_df, config)
+    except Exception:
+        return
+
+    traded = segment_df.get("raw_signal", pd.Series(0.0, index=segment_df.index)).fillna(0.0) != 0
+    target_direction = segment_df.get("target_direction")
+    raw_signal = segment_df.get("raw_signal")
+    if target_direction is not None and raw_signal is not None and traded.any():
+        direction_accuracy = float(
+            (np.sign(raw_signal.loc[traded]) == np.sign(target_direction.loc[traded])).mean()
+        )
+    else:
+        direction_accuracy = np.nan
+
+    prob_edge = segment_df.get("calibrated_prob_edge")
+    future_return = segment_df.get("future_horizon_return")
+    if prob_edge is not None and future_return is not None and prob_edge.notna().sum() >= 3:
+        edge_return_corr = float(prob_edge.corr(future_return))
+    else:
+        edge_return_corr = np.nan
+
+    rows.append(
+        {
+            "状态类型": state_type,
+            "状态": state_name,
+            "样本数": int(len(segment_df)),
+            "交易信号覆盖率": float(traded.mean()),
+            "平均仓位绝对值": float(segment_df["position"].fillna(0.0).abs().mean()),
+            "交易方向准确率": direction_accuracy,
+            "概率差与未来收益相关性": edge_return_corr,
+            "平均概率差": float(prob_edge.mean()) if prob_edge is not None else np.nan,
+            "平均绝对概率差": float(prob_edge.abs().mean()) if prob_edge is not None else np.nan,
+            **metrics,
+        }
+    )
+
+
 def get_supported_pandas_frequency(candidates: list[str]) -> str:
     """在不同 pandas 版本之间选择可用的频率别名。"""
     for freq in candidates:
@@ -1900,6 +2020,62 @@ def save_composite_robustness_report(
         )
 
 
+def save_market_state_report(
+    backtest_df: pd.DataFrame,
+    output_dir: Path,
+    config: BacktestConfig,
+) -> None:
+    """保存按市场状态拆分的综合策略表现报告。"""
+    required_columns = {"strategy_net_return", "benchmark_return", "position"}
+    if backtest_df.empty or not required_columns.issubset(backtest_df.columns):
+        return
+
+    cleaned = backtest_df.replace([np.inf, -np.inf], np.nan).copy()
+    cleaned = cleaned.dropna(subset=["strategy_net_return"])
+    if cleaned.empty:
+        return
+
+    rows: list[dict[str, Any]] = []
+    append_market_state_row(rows, "整体", "全部", cleaned, config)
+
+    state_columns = [
+        ("趋势状态", "trend_regime"),
+        ("波动状态", "volatility_regime"),
+        ("流动性状态", "liquidity_regime"),
+        ("交易时段", "session_regime"),
+    ]
+    for state_type, column in state_columns:
+        if column not in cleaned.columns:
+            continue
+        for state_name, segment_df in cleaned.groupby(column, dropna=False):
+            label = "未知" if pd.isna(state_name) else str(state_name)
+            append_market_state_row(rows, state_type, label, segment_df, config)
+
+    combined_specs = [
+        ("趋势×波动", ["trend_regime", "volatility_regime"]),
+        ("趋势×流动性", ["trend_regime", "liquidity_regime"]),
+        ("波动×流动性", ["volatility_regime", "liquidity_regime"]),
+        ("趋势×时段", ["trend_regime", "session_regime"]),
+    ]
+    for state_type, columns in combined_specs:
+        if not set(columns).issubset(cleaned.columns):
+            continue
+        combined = cleaned[columns].astype("string").fillna("未知").agg(" | ".join, axis=1)
+        for state_name, segment_df in cleaned.groupby(combined, dropna=False):
+            append_market_state_row(rows, state_type, str(state_name), segment_df, config)
+
+    if rows:
+        report = pd.DataFrame(rows)
+        sort_columns = [column for column in ["状态类型", "状态"] if column in report.columns]
+        if sort_columns:
+            report = report.sort_values(sort_columns).reset_index(drop=True)
+        report.to_csv(
+            output_dir / "composite_market_state_report.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+
 def save_cost_stress_report(
     backtest_df: pd.DataFrame,
     output_dir: Path,
@@ -1937,6 +2113,120 @@ def save_cost_stress_report(
     if rows:
         pd.DataFrame(rows).to_csv(
             output_dir / "composite_cost_stress_report.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+
+def parse_comparison_model_segment(model_label: str) -> tuple[str, str]:
+    """把模型比较表中的名称拆成模型名和样本段。"""
+    label = str(model_label)
+    suffix_map = {
+        "_train": "训练集",
+        "_validation": "验证集",
+    }
+    for suffix, segment in suffix_map.items():
+        if label.endswith(suffix):
+            return label[: -len(suffix)], segment
+    return label, "最终测试集"
+
+
+def safe_metric_retention(test_value: float, validation_value: float) -> float:
+    """计算测试指标相对验证指标的保留比例。"""
+    if not np.isfinite(test_value) or not np.isfinite(validation_value):
+        return np.nan
+    if validation_value <= 0:
+        return np.nan
+    return float(test_value / validation_value)
+
+
+def save_validation_test_gap_report(
+    comparison_rows: list[dict[str, Any]],
+    output_dir: Path,
+    config: BacktestConfig,
+) -> None:
+    """保存训练/验证/最终测试表现差异诊断，辅助识别过拟合和样本外衰减。"""
+    if not bool(getattr(config, "composite_enable_validation_test_gap_report", True)):
+        return
+    if not comparison_rows:
+        return
+
+    comparison_df = pd.DataFrame(comparison_rows)
+    if comparison_df.empty or "模型" not in comparison_df.columns:
+        return
+    comparison_df = comparison_df[comparison_df.get("错误").isna()] if "错误" in comparison_df.columns else comparison_df
+    if comparison_df.empty:
+        return
+
+    parsed = comparison_df["模型"].map(parse_comparison_model_segment)
+    comparison_df = comparison_df.copy()
+    comparison_df["基础模型"] = parsed.map(lambda value: value[0])
+    comparison_df["样本段"] = parsed.map(lambda value: value[1])
+
+    metric_columns = [
+        "累计收益",
+        "年化收益",
+        "夏普比率",
+        "最大回撤",
+        "胜率",
+        "交易次数",
+        "样本K线数",
+        "平均仓位",
+    ]
+    available_metrics = [column for column in metric_columns if column in comparison_df.columns]
+    if not available_metrics:
+        return
+
+    sharpe_warn = max(0.0, float(getattr(config, "composite_gap_warn_sharpe_retention", 0.5) or 0.5))
+    return_warn = max(0.0, float(getattr(config, "composite_gap_warn_return_retention", 0.5) or 0.5))
+    rows: list[dict[str, Any]] = []
+    for model_name, model_df in comparison_df.groupby("基础模型", dropna=False):
+        by_segment = {
+            str(row["样本段"]): row
+            for _, row in model_df.drop_duplicates("样本段", keep="last").iterrows()
+        }
+        if "验证集" not in by_segment or "最终测试集" not in by_segment:
+            continue
+
+        validation_row = by_segment["验证集"]
+        test_row = by_segment["最终测试集"]
+        train_row = by_segment.get("训练集")
+        row: dict[str, Any] = {"模型": model_name}
+        for metric in available_metrics:
+            train_value = float(train_row[metric]) if train_row is not None and pd.notna(train_row.get(metric)) else np.nan
+            validation_value = float(validation_row[metric]) if pd.notna(validation_row.get(metric)) else np.nan
+            test_value = float(test_row[metric]) if pd.notna(test_row.get(metric)) else np.nan
+            row[f"训练_{metric}"] = train_value
+            row[f"验证_{metric}"] = validation_value
+            row[f"最终测试_{metric}"] = test_value
+            row[f"测试减验证_{metric}"] = (
+                test_value - validation_value
+                if np.isfinite(test_value) and np.isfinite(validation_value)
+                else np.nan
+            )
+            row[f"测试相对验证_{metric}"] = safe_metric_retention(test_value, validation_value)
+            row[f"验证减训练_{metric}"] = (
+                validation_value - train_value
+                if np.isfinite(validation_value) and np.isfinite(train_value)
+                else np.nan
+            )
+
+        sharpe_retention = row.get("测试相对验证_夏普比率", np.nan)
+        return_retention = row.get("测试相对验证_累计收益", np.nan)
+        sharpe_warning = np.isfinite(sharpe_retention) and sharpe_retention < sharpe_warn
+        return_warning = np.isfinite(return_retention) and return_retention < return_warn
+        row["样本外衰减预警"] = bool(sharpe_warning or return_warning)
+        warning_reasons = []
+        if sharpe_warning:
+            warning_reasons.append("测试夏普相对验证衰减")
+        if return_warning:
+            warning_reasons.append("测试累计收益相对验证衰减")
+        row["预警原因"] = "；".join(warning_reasons)
+        rows.append(row)
+
+    if rows:
+        pd.DataFrame(rows).to_csv(
+            output_dir / "composite_validation_test_gap.csv",
             index=False,
             encoding="utf-8-sig",
         )
@@ -1996,6 +2286,15 @@ def save_composite_outputs(
     summary.loc["分裂最小损失下降"] = config.xgboost_gamma
     summary.loc["L2正则"] = config.xgboost_reg_lambda
     summary.loc["L1正则"] = config.xgboost_reg_alpha
+    summary.loc["启用验证测试衰减诊断"] = bool(
+        getattr(config, "composite_enable_validation_test_gap_report", True)
+    )
+    summary.loc["验证测试夏普保留率预警阈值"] = float(
+        getattr(config, "composite_gap_warn_sharpe_retention", 0.5) or 0.5
+    )
+    summary.loc["验证测试收益保留率预警阈值"] = float(
+        getattr(config, "composite_gap_warn_return_retention", 0.5) or 0.5
+    )
     summary.loc["启用验证集EarlyStopping"] = config.xgboost_use_validation_early_stopping
     summary.loc["验证集比例"] = config.xgboost_validation_ratio
     summary.loc["EarlyStopping轮数"] = config.xgboost_early_stopping_rounds
@@ -2005,6 +2304,16 @@ def save_composite_outputs(
     summary.loc["阈值校准最少交易数"] = config.xgboost_threshold_min_trades
     summary.loc["启用市场状态过滤"] = config.xgboost_trade_use_market_filters
     summary.loc["过滤窗口"] = config.xgboost_trade_filter_window
+    summary.loc["市场状态分层窗口"] = int(getattr(config, "market_state_regime_window", 120) or 120)
+    summary.loc["趋势强度阈值"] = float(
+        getattr(config, "market_state_trend_strength_threshold", 0.25) or 0.25
+    )
+    summary.loc["启用市场状态标签过滤"] = bool(
+        getattr(config, "xgboost_trade_use_regime_filter", False)
+    )
+    summary.loc["允许交易市场状态"] = ",".join(
+        str(value) for value in (getattr(config, "allowed_market_state_regimes", []) or [])
+    )
     summary.loc["最小波动率分位"] = config.xgboost_trade_min_volatility_rank
     summary.loc["最小流动性分位"] = config.xgboost_trade_min_liquidity_rank
     summary.loc["动态仓位"] = config.xgboost_use_dynamic_position_sizing
@@ -2023,6 +2332,18 @@ def save_composite_outputs(
     summary.loc["训练最少方向样本数"] = config.xgboost_train_min_directional_samples
     summary.loc["训练非中性类别权重"] = config.xgboost_train_nonzero_class_weight
     summary.loc["训练中性类别权重"] = config.xgboost_train_neutral_class_weight
+    summary.loc["训练样本时间衰减加权"] = bool(
+        getattr(config, "xgboost_train_use_time_decay_weight", False)
+    )
+    summary.loc["训练样本时间衰减半衰期K线数"] = int(
+        getattr(config, "xgboost_train_time_decay_half_life", 0) or 0
+    )
+    summary.loc["训练样本时间衰减最低权重"] = float(
+        getattr(config, "xgboost_train_time_decay_min_weight", 0.0) or 0.0
+    )
+    summary.loc["训练样本时间衰减归一化"] = bool(
+        getattr(config, "xgboost_train_time_decay_normalize", True)
+    )
     summary.loc["XGBoost自动校准方向"] = config.xgboost_auto_calibrate_signal_direction
     summary.loc["等权投票自动校准方向"] = config.benchmark_vote_auto_calibrate_direction
     if "raw_signal" in backtest_df.columns:
@@ -2120,6 +2441,7 @@ def save_composite_outputs(
 
     save_prediction_diagnostics(backtest_df, output_dir)
     save_composite_robustness_report(backtest_df, output_dir, config)
+    save_market_state_report(backtest_df, output_dir, config)
     save_cost_stress_report(backtest_df, output_dir, config)
 
 
@@ -2348,12 +2670,14 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
             index=False,
             encoding="utf-8-sig",
         )
+        save_validation_test_gap_report(comparison_rows, output_dir, config)
         if run_dir is not None:
             copy_existing_files(
                 [
                     output_dir / "composite_detail.csv",
                     output_dir / "composite_summary.csv",
                     output_dir / "composite_model_comparison.csv",
+                    output_dir / "composite_validation_test_gap.csv",
                     output_dir / "composite_xgboost_feature_importance.csv",
                     output_dir / "composite_factor_contribution.csv",
                     output_dir / "composite_xgboost_feature_selection.csv",
@@ -2377,6 +2701,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
         print(output_dir / "composite_detail.csv")
         print(output_dir / "composite_summary.csv")
         print(output_dir / "composite_model_comparison.csv")
+        print(output_dir / "composite_validation_test_gap.csv")
         print(output_dir / "composite_xgboost_feature_importance.csv")
         print(output_dir / "composite_factor_contribution.csv")
         print(output_dir / "composite_robustness_report.csv")

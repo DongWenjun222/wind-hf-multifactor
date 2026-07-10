@@ -216,17 +216,30 @@ wind_hf_multifactor_output/
 | `multi_symbol_opportunity_top_n` | `8` | 每根 K 线最多交易机会评分最高的 8 个品种；设为 0 表示不限制数量。 |
 | `multi_symbol_opportunity_score_mode` | `"edge_probability"` | 机会评分使用上一根综合模型概率差绝对值乘方向概率，避免组合层偷看当前收益。 |
 | `multi_symbol_opportunity_weight_power` | `1.0` | 机会评分对原组合权重的放大幂次，越大权重越集中到强机会品种。 |
+| `multi_symbol_use_group_risk_budget` | `True` | 是否启用多品种板块/产业链风险预算，限制同一板块权重过度集中。 |
+| `multi_symbol_max_group_weight` | `0.35` | 单一板块最大组合权重，默认任一板块最多 35%。 |
 | `composite_model_names` | `["xgboost", "logistic_regression", "random_forest", "extra_trees"]` | 综合因子滚动训练时依次对比的模型；如果某个 sklearn 模型依赖缺失，会自动跳过并在模型比较表中记录。 |
 | `composite_sklearn_n_estimators` | `120` | RandomForest 和 ExtraTrees 使用的树数量。 |
 | `composite_logistic_max_iter` | `1000` | 逻辑回归最大迭代次数。 |
 | `composite_logistic_c` | `1.0` | 逻辑回归 L2 正则强度倒数，越小正则越强。 |
+| `composite_enable_validation_test_gap_report` | `True` | 是否输出验证集到最终测试集的表现衰减诊断，用于识别样本外失效和过拟合风险。 |
+| `composite_gap_warn_sharpe_retention` | `0.5` | 测试夏普低于验证夏普该比例时触发衰减预警。 |
+| `composite_gap_warn_return_retention` | `0.5` | 测试累计收益低于验证累计收益该比例时触发衰减预警。 |
 | `xgboost_feature_scope` | `"best"` | 综合模型在 active 池内滚动选择表现较好的因子。 |
 | `xgboost_best_top_n` | `50` | 每次重训最多选 50 个基础因子。 |
 | `xgboost_train_window` | `1200` | 每次 XGBoost 训练最多使用过去 1200 根 K 线。 |
 | `xgboost_min_train_samples` | `600` | 训练样本少于 600 时跳过预测。 |
 | `xgboost_retrain_every` | `25` | 每 25 根 K 线重新选因并训练一次。 |
+| `xgboost_train_use_time_decay_weight` | `True` | 是否启用训练样本时间衰减加权，让更靠近预测时点的样本在模型训练中占更高权重。 |
+| `xgboost_train_time_decay_half_life` | `400` | 时间衰减半衰期，单位是 K 线根数；距离训练窗口尾部 400 根 K 线的样本时间权重大约减半。 |
+| `xgboost_train_time_decay_min_weight` | `0.25` | 时间衰减最低权重下限，避免早期样本几乎完全失效。 |
+| `xgboost_train_time_decay_normalize` | `True` | 是否把时间衰减权重均值归一到 1，建议开启以保持模型整体学习强度稳定。 |
 | `xgboost_feature_mode` | `"both"` | 同时使用因子连续值和因子多空信号。 |
 | `xgboost_include_factor_state_features` | `False` | 当前默认不额外加入因子状态特征。 |
+| `market_state_regime_window` | `120` | 市场状态分层诊断的滚动窗口，用于计算趋势强度、波动分位和流动性分位。 |
+| `market_state_trend_strength_threshold` | `0.25` | 趋势/震荡状态划分阈值，趋势强度等于窗口累计收益绝对值除以窗口逐 K 线绝对收益和。 |
+| `xgboost_trade_use_regime_filter` | `False` | 是否按市场状态标签过滤交易。默认关闭，只输出诊断报告，不直接改变策略。 |
+| `allowed_market_state_regimes` | `[]` | 开启状态标签过滤后允许交易的状态标签，例如 `趋势上涨`、`趋势下跌`、`高波动`、`高流动性`。 |
 | `xgboost_use_position_rules` | `True` | 是否启用综合策略持仓规则优化。 |
 | `xgboost_min_holding_bars` | `2` | 新开仓后最少持有 2 根 K 线，减少短期噪声反向。 |
 | `xgboost_reentry_cooldown_bars` | `1` | 清仓或反转后冷却 1 根 K 线再允许重新开仓。 |
@@ -905,6 +918,7 @@ wind_hf_multifactor_output/composite_factor/
 | `composite_detail.csv` | 最终测试集逐 K 线明细，包含预测、概率、信号、持仓、收益和净值。 |
 | `composite_summary.csv` | XGBoost 测试集绩效与关键配置摘要，包含预测目标跨度、训练标签隔离K线数、阈值和仓位配置。 |
 | `composite_model_comparison.csv` | XGBoost、LogisticRegression、RandomForest、ExtraTrees 的训练/验证/最终测试表现，以及等权投票基准表现对比。 |
+| `composite_validation_test_gap.csv` | 各模型验证集到最终测试集的收益、夏普、回撤、胜率等指标衰减诊断，用于发现验证有效但最终测试明显失效的模型。 |
 | `composite_report.png` | XGBoost 训练集、验证集和最终测试集三栏图；其他模型会输出 `composite_report_{model_name}.png`。 |
 | `benchmark_vote_report.png` | 等权投票基准训练集、验证集和最终测试集三栏图。 |
 | `composite_xgboost_feature_importance.csv` | XGBoost 特征重要性。 |
@@ -914,6 +928,7 @@ wind_hf_multifactor_output/composite_factor/
 | `composite_prediction_confusion_matrix.csv` | 校准后预测方向与真实方向的混淆矩阵。 |
 | `composite_xgboost_edge_diagnostics.csv` | 按概率优势分桶统计未来收益。 |
 | `composite_robustness_report.csv` | 最终测试集按月度、季度、波动状态和模型置信度拆分后的稳健性表现。 |
+| `composite_market_state_report.csv` | 最终测试集按趋势、波动、流动性、交易时段以及组合状态拆分后的策略表现和预测诊断。 |
 | `composite_cost_stress_report.csv` | 基于同一组持仓重算不同交易成本档位下的策略表现。 |
 | `related_data_coverage.csv` | 跨品种数据对齐审计，包含覆盖率、前向填充占比、缺失段和对齐滞后。 |
 
@@ -965,6 +980,9 @@ python cli.py multi --symbols liquid_commodity
 | `multi_symbol_opportunity_min_score` | 机会评分最低阈值，低于该阈值的品种不参与当期组合。 |
 | `multi_symbol_opportunity_score_mode` | 机会评分模式，支持 `edge`、`edge_probability`、`edge_rank`、`position`。默认用上一根概率差绝对值乘方向概率。 |
 | `multi_symbol_opportunity_weight_power` | 机会评分对基础权重的放大幂次，越大越偏向强机会品种。 |
+| `multi_symbol_use_group_risk_budget` | 是否启用板块/产业链风险预算。开启后会在机会选择之后限制同一板块总权重。 |
+| `multi_symbol_max_group_weight` | 单个板块最大权重上限，默认 0.35。若活跃板块数量太少导致数学上无法满足，程序会自动使用可行上限。 |
+| `multi_symbol_group_map` | 品种到板块/产业链的映射，例如黑色、有色、化工、油脂油料、能源、农产品等。 |
 | `multi_symbol_use_vol_target` | 是否启用组合层波动率目标，根据历史已实现波动率缩放风险暴露。 |
 | `multi_symbol_target_annual_vol` | 多品种组合目标年化波动率。 |
 | `multi_symbol_max_portfolio_leverage` | 组合风控允许的最大风险杠杆倍数。 |
@@ -1001,6 +1019,8 @@ wind_hf_multifactor_output/
     multi_symbol_portfolio_weights.csv
     multi_symbol_opportunity_scores.csv
     multi_symbol_opportunity_selection.csv
+    multi_symbol_group_weights.csv
+    multi_symbol_group_contribution.csv
     multi_symbol_portfolio_contribution.csv
     multi_symbol_strategy_return_corr.csv
     multi_symbol_run_manifest.json
@@ -1038,6 +1058,8 @@ active最高入库夏普
 | `multi_symbol_portfolio_weights.csv` | 滚动组合权重明细，每一行是该时点各品种权重。 |
 | `multi_symbol_opportunity_scores.csv` | 每根 K 线每个品种的横截面机会评分。默认使用上一根综合模型概率优势，避免当前收益信息泄露。 |
 | `multi_symbol_opportunity_selection.csv` | 每个组合方法在每根 K 线上实际选中的品种，1 表示入选，0 表示未入选。 |
+| `multi_symbol_group_weights.csv` | 每个组合方法在每根 K 线上的板块/产业链权重。 |
+| `multi_symbol_group_contribution.csv` | 每个组合方法下，各板块/产业链对组合收益的贡献。 |
 | `multi_symbol_portfolio_contribution.csv` | 各品种按权重计算后的组合收益贡献。 |
 | `multi_symbol_strategy_return_corr.csv` | 各品种综合策略最终测试集收益相关矩阵。 |
 | `multi_symbol_run_manifest.json` | 多品种批量运行清单，包含配置快照、品种状态、错误信息和输出文件索引。 |
@@ -1055,7 +1077,7 @@ inverse_vol：波动率倒数加权
 positive_sharpe：夏普正向加权
 ```
 
-默认情况下，组合层使用滚动历史窗口估计权重：每根 K 线的权重只使用它之前的历史收益，不使用当前及未来测试集表现，因此比全样本静态权重更接近真实样本外组合。在基础权重生成后，横截面机会选择会使用上一根 K 线已经产生的模型概率优势，对当前 K 线组合权重做 TopN 过滤和机会强度加权。若关闭 `multi_symbol_use_rolling_portfolio_weights`，静态基础权重也会被转换成逐时点权重矩阵，再经过同一套横截面机会选择逻辑，仅建议用于诊断对比。
+默认情况下，组合层使用滚动历史窗口估计权重：每根 K 线的权重只使用它之前的历史收益，不使用当前及未来测试集表现，因此比全样本静态权重更接近真实样本外组合。在基础权重生成后，横截面机会选择会使用上一根 K 线已经产生的模型概率优势，对当前 K 线组合权重做 TopN 过滤和机会强度加权。随后板块/产业链风险预算会限制同一板块总权重，避免强机会集中在高度相关的一组品种中。若关闭 `multi_symbol_use_rolling_portfolio_weights`，静态基础权重也会被转换成逐时点权重矩阵，再经过同一套横截面机会选择和风险预算逻辑，仅建议用于诊断对比。
 
 使用建议：
 
