@@ -283,6 +283,20 @@ def get_single_factor_new_factor_start_index(config: Any) -> int:
     return max(configured_start_index, progress_start_index)
 
 
+def get_single_factor_range(config: Any) -> tuple[int, int]:
+    """返回 range 模式下最终生效的因子编号区间，起止都包含。"""
+    raw_range = getattr(config, "single_factor_range", (1, 1))
+    if raw_range is None:
+        raise ValueError("single_factor_scope='range' 时必须配置 single_factor_range。")
+    if len(raw_range) != 2:
+        raise ValueError("single_factor_range 必须是包含起止编号的二元组或列表。")
+    start_factor_id = max(1, int(raw_range[0]))
+    end_factor_id = max(1, int(raw_range[1]))
+    if end_factor_id < start_factor_id:
+        raise ValueError("single_factor_range 的结束编号不能小于起始编号。")
+    return start_factor_id, end_factor_id
+
+
 def update_single_factor_start_index_progress(
     config: Any,
     tested_factor_id_map: dict[str, int],
@@ -369,9 +383,10 @@ def load_pruned_factor_names(config: Any) -> set[str]:
 def select_single_factor_columns(factors: pd.DataFrame, config: Any) -> list[str]:
     """根据配置选择本轮需要做单因子回测的因子。
 
-    支持三种模式：
+    支持四种模式：
     - all：测试全部因子。
     - new：从指定编号之后开始测试，适合增量测试 AI 新生成的因子。
+    - range：只测试指定编号区间内的因子。
     - selected：只测试手工指定的因子列表。
     """
     factor_columns = get_factor_columns(factors)
@@ -385,6 +400,10 @@ def select_single_factor_columns(factors: pd.DataFrame, config: Any) -> list[str
         # 因子编号从 1 开始，Python 列表切片从 0 开始；这里选择编号 >= start_factor_id 的因子。
         return factor_columns[start_factor_id - 1 :]
 
+    if scope == "range":
+        start_factor_id, end_factor_id = get_single_factor_range(config)
+        return factor_columns[start_factor_id - 1 : end_factor_id]
+
     if scope == "selected":
         selected = config.single_factor_selected_factors or []
         if not selected:
@@ -394,7 +413,7 @@ def select_single_factor_columns(factors: pd.DataFrame, config: Any) -> list[str
             raise ValueError(f"single_factor_selected_factors 中存在未知因子: {missing}")
         return selected
 
-    raise ValueError("single_factor_scope 只能是 'all'、'new' 或 'selected'。")
+    raise ValueError("single_factor_scope 只能是 'all'、'new'、'range' 或 'selected'。")
 
 
 def make_factor_catalog_dummy_data(data: pd.DataFrame, rows: int = 4) -> pd.DataFrame:
@@ -443,13 +462,82 @@ def make_dummy_macro_data_map(config: Any, dummy_data: pd.DataFrame) -> dict[str
     return macro_data_map
 
 
-def build_factor_name_catalog(data: pd.DataFrame, config: Any) -> list[str]:
-    """用极小样本生成完整因子名称目录，供 single_factor_scope='new' 推导新增因子。"""
+def build_factor_name_catalog(
+    data: pd.DataFrame,
+    config: Any,
+    max_count: int | None = None,
+) -> list[str]:
+    """用极小样本生成因子名称目录。
+
+    max_count 不为空时只生成到足够覆盖目标编号为止，避免 range=1~100 这类任务
+    仍然为了拿完整目录而触发全部跨品种/复杂因子的计算。
+    """
     dummy_data = make_factor_catalog_dummy_data(data)
     try:
         catalog_config = replace(config, factor_pruning_apply_to_build=False)
     except TypeError:
         catalog_config = config
+
+    if max_count is not None:
+        max_count = max(0, int(max_count))
+        catalog_columns: list[str] = []
+
+        def append_columns(frame: pd.DataFrame) -> bool:
+            catalog_columns.extend(list(frame.columns))
+            return len(catalog_columns) >= max_count
+
+        def trim_catalog() -> list[str]:
+            return catalog_columns[:max_count]
+
+        df = dummy_data.copy()
+        df["bar_return_cc"] = df["close"].pct_change()
+        df["bar_return_oc"] = df["close"] / df["open"].replace(0, np.nan) - 1.0
+        df["volume"] = df.get("volume", pd.Series(0.0, index=df.index)).fillna(0.0)
+
+        if append_columns(add_basic_factors(df, catalog_config)):
+            return trim_catalog()
+        if append_columns(add_parametric_factors(df, catalog_config)):
+            return trim_catalog()
+
+        related_dummy_map = (
+            make_dummy_related_data_map(catalog_config, dummy_data)
+            if getattr(catalog_config, "enable_cross_asset_factors", False)
+            else {}
+        )
+        if getattr(catalog_config, "enable_cross_asset_factors", False):
+            if append_columns(add_cross_asset_factors(df, related_dummy_map, catalog_config)):
+                return trim_catalog()
+
+        if append_columns(add_complex_non_cross_factors(df, catalog_config)):
+            return trim_catalog()
+
+        if getattr(catalog_config, "enable_cross_asset_factors", False):
+            if append_columns(add_complex_cross_asset_factors(df, related_dummy_map, catalog_config)):
+                return trim_catalog()
+
+        if append_columns(add_hyper_non_cross_factors(df, catalog_config)):
+            return trim_catalog()
+
+        if getattr(catalog_config, "enable_cross_asset_factors", False):
+            if append_columns(add_hyper_cross_asset_factors(df, related_dummy_map, catalog_config)):
+                return trim_catalog()
+
+        if append_columns(add_omega_non_cross_factors(df, catalog_config)):
+            return trim_catalog()
+
+        if getattr(catalog_config, "enable_cross_asset_factors", False):
+            if append_columns(add_omega_cross_asset_factors(df, related_dummy_map, catalog_config)):
+                return trim_catalog()
+
+        if append_columns(add_calendar_seasonality_factors(df, catalog_config)):
+            return trim_catalog()
+
+        if getattr(catalog_config, "enable_macro_state_factors", False):
+            macro_dummy_map = make_dummy_macro_data_map(catalog_config, dummy_data)
+            append_columns(add_macro_state_factors(df, macro_dummy_map, catalog_config))
+
+        return trim_catalog()
+
     related_dummy_map = (
         make_dummy_related_data_map(catalog_config, dummy_data)
         if getattr(catalog_config, "enable_cross_asset_factors", False)
@@ -496,6 +584,18 @@ def resolve_single_factor_requested_factors(
     if scope == "selected":
         selected = list(getattr(config, "single_factor_selected_factors", []) or [])
         return selected, None
+    if scope == "range":
+        start_factor_id, end_factor_id = get_single_factor_range(config)
+        catalog_columns = build_factor_name_catalog(data, config, max_count=end_factor_id)
+        requested = catalog_columns[start_factor_id - 1 : end_factor_id]
+        pruned_names = load_pruned_factor_names(config)
+        if pruned_names:
+            requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
+        factor_id_map = {
+            factor_name: factor_id
+            for factor_id, factor_name in enumerate(catalog_columns, start=1)
+        }
+        return requested, factor_id_map
     if scope != "new":
         return None, None
 
@@ -544,7 +644,12 @@ def build_single_factor_matrix(data: pd.DataFrame, config: Any) -> pd.DataFrame:
     if requested_factors is None:
         factors = build_factors(data, config)
     else:
-        print(f"单因子按需构建因子数量: {len(requested_factors)}")
+        scope = str(getattr(config, "single_factor_scope", "all")).lower()
+        extra = ""
+        if scope == "range":
+            start_factor_id, end_factor_id = get_single_factor_range(config)
+            extra = f"，编号区间=[{start_factor_id}, {end_factor_id}]"
+        print(f"单因子按需构建: scope={scope}{extra}，因子数量={len(requested_factors)}")
         if not requested_factors:
             factors = pd.DataFrame(index=data.index)
         else:
@@ -638,10 +743,10 @@ def build_factors(
             factor_parts.append(parametric_factors)
 
     if getattr(config, "enable_cross_asset_factors", False):
-        if related_data_map is None:
-            related_data_map = fetch_related_intraday_data(config)
         cross_asset_factors = pd.DataFrame(index=df.index)
         if need_any_factor() or has_requested_prefix(("cross_", "crossmega_")):
+            if related_data_map is None:
+                related_data_map = fetch_related_intraday_data(config)
             cross_asset_factors = filter_requested(add_cross_asset_factors(df, related_data_map, config))
         if not cross_asset_factors.empty:
             print(f"跨品种因子数量: {cross_asset_factors.shape[1]}")
@@ -656,6 +761,8 @@ def build_factors(
     if getattr(config, "enable_cross_asset_factors", False):
         complex_cross_asset_factors = pd.DataFrame(index=df.index)
         if need_any_factor() or has_requested_prefix(("crossultra_",)):
+            if related_data_map is None:
+                related_data_map = fetch_related_intraday_data(config)
             complex_cross_asset_factors = filter_requested(
                 add_complex_cross_asset_factors(df, related_data_map or {}, config)
             )
@@ -672,6 +779,8 @@ def build_factors(
     if getattr(config, "enable_cross_asset_factors", False):
         hyper_cross_asset_factors = pd.DataFrame(index=df.index)
         if need_any_factor() or has_requested_prefix(("crosshyper_",)):
+            if related_data_map is None:
+                related_data_map = fetch_related_intraday_data(config)
             hyper_cross_asset_factors = filter_requested(
                 add_hyper_cross_asset_factors(df, related_data_map or {}, config)
             )
@@ -688,6 +797,8 @@ def build_factors(
     if getattr(config, "enable_cross_asset_factors", False):
         omega_cross_asset_factors = pd.DataFrame(index=df.index)
         if need_any_factor() or has_requested_prefix(("crossomega_",)):
+            if related_data_map is None:
+                related_data_map = fetch_related_intraday_data(config)
             omega_cross_asset_factors = filter_requested(
                 add_omega_cross_asset_factors(df, related_data_map or {}, config)
             )
@@ -702,10 +813,10 @@ def build_factors(
         factor_parts.append(calendar_factors)
 
     if getattr(config, "enable_macro_state_factors", False):
-        if macro_data_map is None:
-            macro_data_map = fetch_macro_state_data(config)
         macro_factors = pd.DataFrame(index=df.index)
         if need_any_factor() or has_requested_prefix(("macro_",)):
+            if macro_data_map is None:
+                macro_data_map = fetch_macro_state_data(config)
             macro_factors = filter_requested(add_macro_state_factors(df, macro_data_map, config))
         if not macro_factors.empty:
             print(f"宏观状态因子数量: {macro_factors.shape[1]}")
@@ -714,6 +825,14 @@ def build_factors(
     if not factor_parts:
         missing_preview = ", ".join(sorted(requested_set)[:10])
         raise ValueError(f"请求的因子当前都无法生成: {missing_preview}")
+
+    matrix_dtype = str(getattr(config, "factor_matrix_dtype", "float32") or "float32").lower()
+    if matrix_dtype in {"float32", "float64"}:
+        # 先逐块降精度，再横向拼接，避免 concat 时先申请巨大的 float64 数组。
+        factor_parts = [
+            part.astype(matrix_dtype, copy=False)
+            for part in factor_parts
+        ]
     return pd.concat(factor_parts, axis=1).copy()
 
 

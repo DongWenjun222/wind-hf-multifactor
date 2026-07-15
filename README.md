@@ -39,6 +39,7 @@
 | `factor_metadata.py` | 可以 | 因子元数据导出工具。生成 `factor_metadata.csv` 和因子家族汇总，用于解释、聚类、治理和 AI 因子管理。 |
 | `leakage_audit.py` | 是，改代码后推荐 | 未来函数/数据泄露静态审计工具。扫描 `shift(-n)`、`bfill`、全样本统计等高风险写法并输出审计报告。 |
 | `hard_prune_factors.py` | 谨慎运行 | 因子硬删除工具。读取淘汰池，扫描 `factor_builders/*.py` 中可安全定位的公式行，预演或执行源码级删除。默认先预演，不加 `--apply` 不会改代码。 |
+| `cleanup_outputs.py` | ???? | ??????/???????????????? `runs/` ??????????????? `output_cleanup_report.csv`?? `--apply` ????????? |
 | `smoke_test.py` | 是，改代码后推荐 | 轻量冒烟测试。用于快速检查数据读取、因子构建、active 因子池和小规模综合模型是否能跑通。 |
 
 ### 0.2 因子构造文件作用
@@ -62,7 +63,7 @@
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py smoke_test.py
+python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py
 ```
 
 日常单品种研究推荐顺序：
@@ -97,6 +98,12 @@ python hard_prune_factors.py
 
 # 3. 检查 factor_hard_delete_report.csv 后，如确认无误再真正删除
 python hard_prune_factors.py --apply
+
+# 4. ?????? runs ???????? output_cleanup_report.csv
+python cleanup_outputs.py --keep-runs 5 --mode archive
+
+# 5. ?? output_cleanup_report.csv ?????????? runs
+python cleanup_outputs.py --keep-runs 5 --mode archive --apply
 ```
 
 如果不想使用 CLI，也可以直接运行旧入口：
@@ -235,6 +242,7 @@ wind_hf_multifactor_output/
 | `composite_gap_warn_sharpe_retention` | `0.5` | 测试夏普低于验证夏普该比例时触发衰减预警。 |
 | `composite_gap_warn_return_retention` | `0.5` | 测试累计收益低于验证累计收益该比例时触发衰减预警。 |
 | `xgboost_feature_scope` | `"best"` | 综合模型在 active 池内滚动选择表现较好的因子。 |
+| `selected_factors` | `None` | ?? `xgboost_feature_scope="selected"` ????best/all ????????????????? active ?????? |
 | `xgboost_best_top_n` | `50` | 每次重训最多选 50 个基础因子。 |
 | `xgboost_train_window` | `1200` | 每次 XGBoost 训练最多使用过去 1200 根 K 线。 |
 | `xgboost_min_train_samples` | `600` | 训练样本少于 600 时跳过预测。 |

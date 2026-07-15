@@ -128,6 +128,19 @@ class BacktestConfig:
     # 数据读取与基础回测设置
     # ----------------------------
 
+    # 是否隐藏 Python / pandas / sklearn 等库产生的 warning。
+    # 只隐藏 warning，不会隐藏真正的异常报错；适合长时间批量跑多品种时减少控制台噪音。
+    suppress_warnings: bool = True
+
+    # 因子矩阵保存使用的数据类型。
+    # float32 可以把全量因子矩阵内存占用约减半，适合多品种 all 模式和长历史数据；
+    # 如果需要最高数值精度，可改为 "float64"。
+    factor_matrix_dtype: str = "float32"
+
+    # 多品种 all 模式初始化单因子库时，单品种最多使用最近多少根 K 线。
+    # 0 表示不截断。长历史 + 海量因子会非常吃内存，建议初始化全市场时保留 30000-60000 根。
+    multi_symbol_single_factor_max_bars: int = 60000
+
     # 回测标的代码。当前为万得或本地数据中使用的合约代码，例如 "C.DCE"。
     symbol: str = "C.DCE"
 
@@ -141,7 +154,7 @@ class BacktestConfig:
     multi_symbol_run_single_factor: bool = True
 
     # 多品种批量回测时是否为每个品种运行 XGBoost 综合因子流程。
-    multi_symbol_run_composite: bool = True
+    multi_symbol_run_composite: bool = False#True
 
     # 多品种批量回测时，每个品种是否使用独立输出目录。
     # 开启后输出目录形如 output_dir/by_symbol/C_DCE/，避免不同品种的因子库和结果互相覆盖。
@@ -153,6 +166,15 @@ class BacktestConfig:
     # 多品种批量回测是否跳过已经完成的品种流程。
     # 开启后，如果品种目录中已经存在对应结果文件，就直接复用，适合长任务中断后的断点续跑。
     multi_symbol_skip_existing: bool = True
+
+    # 多品种运行时是否每次都重新运行单因子流程，用最新候选因子补充并重筛 active 因子库。
+    # 建议保持开启：active_factors.csv 是动态因子库，不应该因为文件已经存在就停止更新。
+    # 如果只是断点续跑旧结果、完全不想重算单因子，可以临时改为 False。
+    multi_symbol_always_update_active_library: bool = True
+
+    # 多品种断点续跑时，如果 active_factors.csv 已存在但没有任何有效因子，是否仍然重新运行单因子流程。
+    # 建议保持开启：否则空表头文件也会被当成“已完成”，导致该品种 active 因子库一直无法更新。
+    multi_symbol_rerun_empty_active_library: bool = True
 
     # 多品种组合权重是否使用滚动历史窗口估计。
     # 开启后 inverse_vol / positive_sharpe 不再使用整段测试集计算权重，避免组合层未来函数。
@@ -409,8 +431,12 @@ class BacktestConfig:
 
     # 单因子测试范围。
     # "all"：测试全部因子；"new"：只测试编号 >= single_factor_new_factor_start_index 的新因子；
-    # "selected"：只测试 single_factor_selected_factors 中指定的因子。
-    single_factor_scope: str = "new"  # 可选："all"、"new"、"selected"
+    # "range"：只测试指定编号区间；"selected"：只测试 single_factor_selected_factors 中指定的因子。
+    single_factor_scope: str = "range" # new # 可选："all"、"new"、"range"、"selected"
+
+    # 当 single_factor_scope="range" 时使用的因子编号区间，起止都包含。
+    # 因子编号从 1 开始；如果写成 [0, 10000]，程序会自动按 [1, 10000] 处理。
+    single_factor_range: tuple[int, int] = (1, 100)
 
     # 当 single_factor_scope="selected" 时使用的单因子名单。
     # 留空表示不额外指定；如果启用 selected，建议填入因子列名列表。
@@ -444,7 +470,7 @@ class BacktestConfig:
 
     # 当不全量出图时，只给入库排名前 N 的因子生成图表。
     # 设为 0 可完全关闭单因子图表生成。
-    single_factor_plot_top_n: int = 50
+    single_factor_plot_top_n: int = 1#50
 
     # 因子库子目录名。如果是相对路径，会放在 output_dir 下面。
     factor_library_dir: str = "factor_library"
@@ -522,6 +548,22 @@ class BacktestConfig:
     # 适合自动生成新因子后，只增量回测新加入的一批因子。
     single_factor_new_factor_start_index: int = 126978
 
+    # 单因子正式回测前，是否先用因子值相关性做预过滤。
+    # 开启后，和已保留代表因子高度相关的候选因子会被直接跳过，不进入单因子回测，可显著减少海量重复因子的耗时。
+    single_factor_enable_corr_prefilter: bool = True
+
+    # 单因子相关性预过滤阈值。绝对相关性大于等于该值的后出现因子会被忽略。
+    # 建议取 0.95-0.99；越低过滤越激进，速度越快，但也更可能误删细微差异因子。
+    single_factor_corr_prefilter_threshold: float = 0.98
+
+    # 相关性预过滤使用最近多少根 K 线估计相关性。
+    # 使用抽样窗口而不是全历史，是为了避免海量因子相关矩阵造成内存爆炸。
+    single_factor_corr_prefilter_sample_rows: int = 5000
+
+    # 相关性预过滤最多保留多少个代表因子用于后续相关性比较。
+    # 数值越大，去重更充分但更慢；数值越小，速度更快但可能漏掉部分重复因子。
+    single_factor_corr_prefilter_max_reference_factors: int = 5000
+
     # 是否自动读取和更新新增因子测试进度。
     # 开启后，程序会在每次 new 模式单因子测试结束后记录 next_start_index；
     # 下次运行会自动从 max(config.py 中的起点, 进度文件中的起点) 开始，避免重复测试。
@@ -572,7 +614,8 @@ class BacktestConfig:
     # 关闭后仍会生成淘汰报告，但不会实际从候选因子矩阵中过滤。
     factor_pruning_apply_to_build: bool = True
 
-    # 综合因子或 XGBoost 默认使用的人工精选因子列表。
+    # 综合因子手工指定因子列表。
+    # 仅当 xgboost_feature_scope="selected" 时生效；best/all 模式一律以 active 因子库为准。
     # 注释中的数字是因子编号，方便和单因子汇总表、因子库文件对应。
     selected_factors: Optional[list[str]] = None
 
@@ -584,10 +627,12 @@ class BacktestConfig:
     # 开启：训练集表现正向则顺用，反向更好则乘以 -1；关闭：全部按原始方向使用。
     auto_detect_factor_direction: bool = True
 
-    # 早期单因子筛选用的最低夏普要求。当前主要因子库逻辑更依赖 factor_library_min_sharpe。
+    # 兼容旧配置：早期综合 best 选因使用的最低夏普要求。
+    # 新逻辑统一使用 factor_library_min_sharpe；该字段只保留给旧配置文件读取，不再作为独立门槛。
     min_select_sharpe: float = 1
 
-    # 早期单因子筛选用的最低累计收益要求。当前主要因子库逻辑更依赖 factor_library_min_total_return。
+    # 兼容旧配置：早期综合 best 选因使用的最低累计收益要求。
+    # 新逻辑统一使用 factor_library_min_total_return；该字段只保留给旧配置文件读取，不再作为独立门槛。
     min_select_total_return: float = 0.0
 
     # 单因子训练/测试切分比例。0.7 表示前 70% 样本用于判断方向和训练内表现，后 30% 用于样本外测试。
@@ -645,7 +690,7 @@ class BacktestConfig:
 
     # XGBoost 重新训练间隔，单位为 K线根数。
     # 当前 5*5 表示每 25 根K线重新训练一次，中间复用上一次模型滚动预测。
-    xgboost_retrain_every: int = 5*5
+    xgboost_retrain_every: int = 5*5*5
 
     # XGBoost 树的数量。调大可能提升拟合能力，但更慢且更容易过拟合。
     xgboost_n_estimators: int = 80
@@ -813,6 +858,44 @@ class BacktestConfig:
     # 仓位平滑系数。
     # 1 表示不平滑；0.5 表示新目标仓位和上一期目标仓位各占一半。
     xgboost_position_smoothing_alpha: float = 1.0
+
+    # 最新交易信号导出时是否启用执行层质量过滤。
+    # 该过滤只影响 trading_signal.py 输出的执行建议，不会改写综合回测结果。
+    trading_signal_use_quality_gate: bool = True
+
+    # 最新交易信号导出时的最小调仓幅度。
+    # 例如 0.10 表示执行建议仓位变化小于 10% 时标记为不交易，减少实盘噪音换手。
+    trading_signal_min_adjustment: float = 0.10
+
+    # 最新交易信号导出时允许开仓/加仓所需的最低置信度分位。
+    # 低于该阈值时仍允许减仓或平仓，但不建议新增风险暴露。
+    trading_signal_min_confidence_rank: float = 0.30
+
+    # 最新交易信号导出时，是否尊重综合模型自身的 trade_allowed 和 confidence_trade_allowed。
+    # 开启后，如果模型过滤器不允许交易，交易信号层只允许减仓/平仓。
+    trading_signal_block_when_model_denies_trade: bool = True
+
+    # 最新交易信号导出时，低流动性状态下是否禁止开仓/加仓。
+    # 开启后 liquidity_regime 含有“低”时，只允许减仓或平仓。
+    trading_signal_block_low_liquidity_open: bool = True
+
+    # 最新交易信号导出时的信号有效期，单位为分钟。
+    # 0 表示不检查过期；如果用于实盘定时任务，可设置为 bar_size 的 1-2 倍。
+    trading_signal_max_age_minutes: int = 0
+
+    # 最新交易信号现场计算时，是否优先复用综合回测生成的 active 因子矩阵缓存。
+    # 开启后会读取因子值或因子信号重新加权合成，不会直接复制 composite_detail.csv 里的目标仓位。
+    trading_signal_use_factor_cache: bool = True
+
+    # 最新交易信号现场计算时，如果没有可复用的因子缓存/明细因子列，是否临时重建因子。
+    # 默认关闭，避免全品种交易信号导出时因为某个品种缺缓存而卡很久；
+    # 需要重建时建议先运行 single 或 multi 流程。
+    trading_signal_rebuild_missing_factors: bool = False
+
+    # 最新交易信号默认生成模式。
+    # compute：读取最新可用 active 因子值/因子信号，并按因子库表现权重现场合成；
+    # detail：只读取已经存在的 composite_detail.csv 最后一行，速度快但依赖已有回测结果。
+    trading_signal_mode: str = "compute"
 
     # 是否要求当前模型置信度相对近期历史处于较高分位才交易。
     xgboost_trade_use_confidence_rank_filter: bool = False

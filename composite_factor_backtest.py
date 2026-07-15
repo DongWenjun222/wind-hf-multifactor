@@ -243,13 +243,18 @@ def select_best_factors_on_training(
     if summary.empty:
         raise ValueError("训练段没有可用因子，无法选择 best 特征。")
 
+    min_sharpe = float(getattr(config, "factor_library_min_sharpe", 0.0) or 0.0)
+    min_total_return = float(getattr(config, "factor_library_min_total_return", 0.0) or 0.0)
     summary = summary.dropna(subset=["夏普比率", "累计收益"])
     summary = summary[
-        (summary["夏普比率"] >= config.min_select_sharpe)
-        & (summary["累计收益"] >= config.min_select_total_return)
+        (summary["夏普比率"] >= min_sharpe)
+        & (summary["累计收益"] >= min_total_return)
     ]
     if summary.empty:
-        raise ValueError("训练段没有因子满足 min_select_sharpe/min_select_total_return。")
+        raise ValueError(
+            "训练段没有因子满足 factor_library_min_sharpe/"
+            "factor_library_min_total_return。"
+        )
 
     summary = summary.sort_values(["夏普比率", "累计收益"], ascending=False)
     selected = summary["因子"].head(config.xgboost_best_top_n).tolist()
@@ -272,6 +277,8 @@ def get_selected_factors(
     active_factor_columns = load_active_factor_pool(factors, config)
     active_factors = factors[active_factor_columns]
     scope = config.xgboost_feature_scope.lower()
+    if scope != "selected" and config.selected_factors:
+        print("提示: selected_factors 仅在 xgboost_feature_scope='selected' 时生效，当前模式将忽略该列表。")
 
     if scope == "all":
         return active_factor_columns, None

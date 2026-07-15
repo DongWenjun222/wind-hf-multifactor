@@ -18,12 +18,21 @@ import platform
 import sys
 import traceback
 from typing import Any, Callable, TextIO, TypeVar
+import warnings
 
 from config import BacktestConfig
 from experiment_utils import get_experiment_run_dir, write_run_config
 
 
 T = TypeVar("T")
+
+
+def configure_warning_output(config: BacktestConfig) -> None:
+    """根据配置控制 warning 输出。"""
+    if bool(getattr(config, "suppress_warnings", True)):
+        warnings.filterwarnings("ignore")
+    else:
+        warnings.resetwarnings()
 
 
 class TeeStream:
@@ -152,6 +161,7 @@ def run_tracked(
     action: Callable[[], T],
 ) -> T:
     """带日志和执行清单运行一个研究任务。"""
+    configure_warning_output(config)
     make_stable_run_id(config)
     log_path = get_log_path(config, run_type)
     started_at = dt.datetime.now()

@@ -19,8 +19,8 @@ import pandas as pd
 
 from composite_factor_backtest import run_composite_backtest
 from config import BacktestConfig
-from factors import build_single_factor_matrix, fetch_intraday_data, get_factor_prune_list_path, safe_symbol_name, stop_wind
-from single_factor_backtest import calculate_metrics, infer_annual_periods, run_single_factor_backtests
+from factors import get_factor_prune_list_path, safe_symbol_name, stop_wind
+from single_factor_backtest import calculate_metrics, infer_annual_periods, run_single_factor_pipeline
 from runtime_utils import run_tracked
 
 
@@ -42,6 +42,25 @@ def get_symbol_active_library_path(config: BacktestConfig) -> Path:
     return Path(config.output_dir) / "factor_library" / "active_factors.csv"
 
 
+def active_library_has_factors(config: BacktestConfig) -> bool:
+    """判断 active 因子库文件里是否真的存在可用因子。"""
+    active_path = get_symbol_active_library_path(config)
+    if not active_path.exists():
+        return False
+    try:
+        active_library = pd.read_csv(active_path, usecols=["因子"])
+    except Exception:
+        try:
+            active_library = pd.read_csv(active_path)
+        except Exception:
+            return False
+    if active_library.empty:
+        return False
+    if "因子" in active_library.columns:
+        return active_library["因子"].dropna().astype(str).str.strip().ne("").any()
+    return len(active_library) > 0
+
+
 def get_symbol_composite_detail_path(config: BacktestConfig) -> Path:
     """返回单个品种综合回测明细路径。"""
     return Path(config.output_dir) / "composite_factor" / "composite_detail.csv"
@@ -49,6 +68,9 @@ def get_symbol_composite_detail_path(config: BacktestConfig) -> Path:
 
 def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
     """判断是否可以复用已存在的单因子库结果。"""
+    if bool(getattr(config, "multi_symbol_always_update_active_library", True)):
+        return False
+
     if not bool(getattr(config, "multi_symbol_skip_existing", False)):
         return False
 
@@ -57,7 +79,11 @@ def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
     if str(getattr(config, "single_factor_scope", "")).lower() == "new":
         return False
 
-    return get_symbol_active_library_path(config).exists()
+    if not get_symbol_active_library_path(config).exists():
+        return False
+    if bool(getattr(config, "multi_symbol_rerun_empty_active_library", True)):
+        return active_library_has_factors(config)
+    return True
 
 
 def should_skip_composite_pipeline(config: BacktestConfig) -> bool:
@@ -132,6 +158,7 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
     }
 
     active_library: pd.DataFrame | None = None
+    single_factor_reran = False
     if config.multi_symbol_run_single_factor:
         if should_skip_single_factor_pipeline(config):
             print(f"\n========== {config.symbol} 单因子流程已存在，跳过 ==========")
@@ -139,16 +166,16 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
             row["单因子状态"] = "复用已有结果"
         else:
             print(f"\n========== {config.symbol} 单因子流程 ==========")
-            data = fetch_intraday_data(config)
-            factors = build_single_factor_matrix(data, config)
-            active_library = run_single_factor_backtests(data, factors, config)
+            max_bars = int(getattr(config, "multi_symbol_single_factor_max_bars", 0) or 0)
+            active_library = run_single_factor_pipeline(config, max_bars=max_bars)
+            single_factor_reran = True
             row["单因子状态"] = "完成"
         row.update(summarize_active_library(active_library))
     else:
         row.update(summarize_active_library(None))
 
     if config.multi_symbol_run_composite:
-        if should_skip_composite_pipeline(config):
+        if not single_factor_reran and should_skip_composite_pipeline(config):
             print(f"\n========== {config.symbol} 综合因子流程已存在，跳过 ==========")
             metrics = {}
             row["综合因子状态"] = "复用已有结果"

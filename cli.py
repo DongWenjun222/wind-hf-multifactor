@@ -121,6 +121,7 @@ def run_signal(config: BacktestConfig, args: argparse.Namespace) -> Any:
         config,
         symbols=getattr(args, "symbols", None) or getattr(args, "symbol", None),
         source=getattr(args, "source", "auto"),
+        mode=getattr(args, "mode", None),
         output_path=getattr(args, "output", None),
     )
 
@@ -172,6 +173,12 @@ def build_parser() -> argparse.ArgumentParser:
     signal = subparsers.add_parser("signal", help="导出最新单品种或多品种交易信号。")
     add_common_arguments(signal)
     signal.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
+    signal.add_argument(
+        "--mode",
+        choices=["compute", "detail"],
+        default=None,
+        help="信号生成模式：compute 基于 active 因子现场加权合成；detail 读取已有 composite_detail.csv。",
+    )
     signal.add_argument(
         "--source",
         choices=["auto", "single", "multi"],

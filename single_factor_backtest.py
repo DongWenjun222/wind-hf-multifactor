@@ -41,6 +41,7 @@ from factors import (
     get_factor_label_map,
     get_last_related_data_coverage,
     get_single_factor_new_factor_start_index,
+    get_single_factor_range,
     score_to_raw_signal,
     select_single_factor_columns,
     stop_wind,
@@ -856,6 +857,125 @@ def get_single_factor_plot_top_n(config: BacktestConfig) -> int:
     return max(0, int(getattr(config, "single_factor_plot_top_n", 0) or 0))
 
 
+def _normalize_factor_vector(values: np.ndarray) -> np.ndarray | None:
+    """把单个因子抽样值标准化成单位向量，便于用点积近似相关性。"""
+    values = values.astype("float32", copy=False)
+    finite_mask = np.isfinite(values)
+    if finite_mask.sum() < 3:
+        return None
+    mean_value = float(values[finite_mask].mean())
+    centered = np.where(finite_mask, values - mean_value, 0.0).astype("float32", copy=False)
+    norm = float(np.sqrt(np.dot(centered, centered)))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        return None
+    return centered / norm
+
+
+def prefilter_correlated_single_factors(
+    factors: pd.DataFrame,
+    factor_columns: list[str],
+    config: BacktestConfig,
+    output_dir: Path,
+) -> list[str]:
+    """在正式单因子回测前，按因子值相关性跳过高度重复的候选因子。"""
+    if not bool(getattr(config, "single_factor_enable_corr_prefilter", False)):
+        return factor_columns
+    if len(factor_columns) <= 1:
+        return factor_columns
+
+    threshold = float(getattr(config, "single_factor_corr_prefilter_threshold", 0.98) or 0.98)
+    if threshold <= 0 or threshold > 1:
+        return factor_columns
+
+    sample_rows = max(50, int(getattr(config, "single_factor_corr_prefilter_sample_rows", 5000) or 5000))
+    max_reference_factors = max(
+        1,
+        int(getattr(config, "single_factor_corr_prefilter_max_reference_factors", 5000) or 5000),
+    )
+    sampled = factors.loc[:, factor_columns].tail(sample_rows)
+
+    kept: list[str] = []
+    reference_names: list[str] = []
+    reference_matrix = np.zeros((max_reference_factors, len(sampled)), dtype="float32")
+    reference_count = 0
+    filtered_rows: list[dict[str, Any]] = []
+
+    for factor_name in factor_columns:
+        vector = _normalize_factor_vector(sampled[factor_name].to_numpy(dtype="float32", copy=False))
+        if vector is None:
+            filtered_rows.append(
+                {
+                    "品种": config.symbol,
+                    "因子": factor_name,
+                    "保留代表因子": "",
+                    "最大相关性": np.nan,
+                    "过滤原因": "empty_or_constant_factor",
+                    "阈值": threshold,
+                    "抽样K线数": len(sampled),
+                }
+            )
+            continue
+
+        max_corr = np.nan
+        representative = ""
+        if reference_count > 0:
+            corr_values = reference_matrix[:reference_count] @ vector
+            max_index = int(np.nanargmax(np.abs(corr_values)))
+            max_corr = float(corr_values[max_index])
+            representative = reference_names[max_index]
+
+        if pd.notna(max_corr) and abs(max_corr) >= threshold:
+            filtered_rows.append(
+                {
+                    "品种": config.symbol,
+                    "因子": factor_name,
+                    "保留代表因子": representative,
+                    "最大相关性": max_corr,
+                    "过滤原因": "high_value_corr_prefilter",
+                    "阈值": threshold,
+                    "抽样K线数": len(sampled),
+                }
+            )
+            continue
+
+        kept.append(factor_name)
+        if reference_count < max_reference_factors:
+            reference_names.append(factor_name)
+            reference_matrix[reference_count] = vector
+            reference_count += 1
+
+    report = pd.DataFrame(filtered_rows)
+    report_path = output_dir / "single_factor_corr_prefilter.csv"
+    if not report.empty:
+        report.to_csv(report_path, index=False, encoding="utf-8-sig")
+    elif report_path.exists():
+        report_path.unlink()
+
+    summary = pd.DataFrame(
+        [
+            {
+                "品种": config.symbol,
+                "原始候选因子数": len(factor_columns),
+                "保留回测因子数": len(kept),
+                "相关性预过滤因子数": len(filtered_rows),
+                "相关性阈值": threshold,
+                "抽样K线数": len(sampled),
+                "最多代表因子数": max_reference_factors,
+            }
+        ]
+    )
+    summary.to_csv(
+        output_dir / "single_factor_corr_prefilter_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print(
+        f"单因子相关性预过滤: 原始 {len(factor_columns)} 个，"
+        f"保留 {len(kept)} 个，跳过 {len(filtered_rows)} 个；记录: {report_path}"
+    )
+    return kept
+
+
 def generate_top_single_factor_plots(
     active_library: pd.DataFrame,
     data: pd.DataFrame,
@@ -1009,16 +1129,27 @@ def run_single_factor_backtests(
     qcut_summary_rows = []
     factor_id_map = factors.attrs.get("factor_id_map") or get_factor_id_map(factors)
     factor_label_map = factors.attrs.get("factor_label_map") or get_factor_label_map(factors)
-    if str(getattr(config, "single_factor_scope", "")).lower() == "new" and factors.attrs.get("factor_id_map"):
+    scope = str(getattr(config, "single_factor_scope", "")).lower()
+    if scope in {"new", "range"} and factors.attrs.get("factor_id_map"):
         factor_columns = list(factors.columns)
     else:
         factor_columns = select_single_factor_columns(factors, config)
+    progress_factor_columns = list(factor_columns)
+    factor_columns = prefilter_correlated_single_factors(
+        factors,
+        factor_columns,
+        config,
+        output_dir,
+    )
     print(f"单因子回测范围: {config.single_factor_scope}, 因子数量: {len(factor_columns)}")
-    if str(getattr(config, "single_factor_scope", "")).lower() == "new":
+    if scope == "new":
         start_index = get_single_factor_new_factor_start_index(config)
         print(f"当前品种新因子起始编号: {start_index}")
+    if scope == "range":
+        start_index, end_index = get_single_factor_range(config)
+        print(f"当前品种因子编号区间: [{start_index}, {end_index}]")
     if not factor_columns:
-        raise ValueError("本轮没有可回测的单因子，请检查 single_factor_scope 和 single_factor_new_factor_start_index。")
+        raise ValueError("本轮没有可回测的单因子，请检查 single_factor_scope、新因子起点或区间配置。")
     plot_all = bool(getattr(config, "single_factor_plot_all", False))
     plot_top_n = get_single_factor_plot_top_n(config)
     if plot_all:
@@ -1079,6 +1210,9 @@ def run_single_factor_backtests(
                     or test_error
                     or "训练集、验证集或测试集回测结果为空"
                 )
+            train_stability = calculate_monthly_stability(train_df)
+            validation_stability = calculate_monthly_stability(validation_df)
+            test_stability = calculate_monthly_stability(backtest_df)
 
             qcut_df, _ = build_qcut_group_nav(
                 data,
@@ -1282,7 +1416,7 @@ def run_single_factor_backtests(
         config,
         {
             factor_name: factor_id_map[factor_name]
-            for factor_name in factor_columns
+            for factor_name in progress_factor_columns
             if factor_name in factor_id_map
         },
     )
@@ -1322,19 +1456,38 @@ def run_single_factor_backtests(
     return active_library
 
 
+def run_single_factor_pipeline(
+    config: BacktestConfig,
+    max_bars: int | None = None,
+) -> pd.DataFrame:
+    """运行单品种单因子完整流程，供单品种入口和多品种调度共同复用。"""
+    print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
+    data = fetch_intraday_data(config)
+
+    effective_max_bars = int(max_bars or 0)
+    if (
+        effective_max_bars > 0
+        and str(getattr(config, "single_factor_scope", "")).lower() == "all"
+        and len(data) > effective_max_bars
+    ):
+        print(
+            f"{config.symbol} 单因子all模式历史过长，"
+            f"仅使用最近 {effective_max_bars} 根K线初始化因子库。"
+        )
+        data = data.tail(effective_max_bars).copy()
+
+    print("按需构建单因子矩阵...")
+    factors = build_single_factor_matrix(data, config)
+    return run_single_factor_backtests(data, factors, config)
+
+
 def main() -> None:
     """单因子回测脚本入口。"""
     config = BacktestConfig()
 
     def action() -> pd.DataFrame:
         try:
-            print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
-            data = fetch_intraday_data(config)
-
-            print("按需构建单因子矩阵...")
-            factors = build_single_factor_matrix(data, config)
-
-            return run_single_factor_backtests(data, factors, config)
+            return run_single_factor_pipeline(config)
         finally:
             stop_wind()
 
