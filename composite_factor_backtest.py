@@ -1938,6 +1938,170 @@ def save_prediction_diagnostics(backtest_df: pd.DataFrame, output_dir: Path) -> 
     )
 
 
+def calculate_prediction_metrics_for_segment(
+    segment_name: str,
+    segment_df: pd.DataFrame,
+) -> dict[str, Any] | None:
+    """计算不依赖交易规则和策略收益的纯预测质量指标。"""
+    required = {
+        "target_direction",
+        "future_horizon_return",
+        "xgboost_predicted_direction",
+        "calibrated_predicted_direction",
+        "calibrated_prob_edge",
+    }
+    if segment_df.empty or not required.issubset(segment_df.columns):
+        return None
+
+    valid = segment_df[list(required) + [c for c in ["prob_down", "prob_flat", "prob_up", "raw_signal"] if c in segment_df.columns]]
+    valid = valid.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["target_direction", "future_horizon_return", "xgboost_predicted_direction"]
+    )
+    if valid.empty:
+        return None
+
+    target = valid["target_direction"].astype("float64")
+    raw_pred = valid["xgboost_predicted_direction"].astype("float64")
+    calibrated_pred = valid["calibrated_predicted_direction"].astype("float64")
+    future_return = valid["future_horizon_return"].astype("float64")
+    prob_edge = valid["calibrated_prob_edge"].astype("float64")
+    directional_target = target != 0
+    predicted_directional = calibrated_pred != 0
+    traded = valid.get("raw_signal", pd.Series(0.0, index=valid.index)).fillna(0.0) != 0
+
+    rows: dict[str, Any] = {
+        "样本段": segment_name,
+        "预测样本数": int(len(valid)),
+        "目标上涨占比": float((target > 0).mean()),
+        "目标下跌占比": float((target < 0).mean()),
+        "目标中性占比": float((target == 0).mean()),
+        "原始三分类准确率": float((raw_pred == target).mean()),
+        "校准后三分类准确率": float((calibrated_pred == target).mean()),
+        "方向目标样本数": int(directional_target.sum()),
+        "方向目标准确率": (
+            float((np.sign(calibrated_pred[directional_target]) == np.sign(target[directional_target])).mean())
+            if directional_target.any()
+            else np.nan
+        ),
+        "预测方向覆盖率": float(predicted_directional.mean()),
+        "交易信号覆盖率": float(traded.mean()),
+        "交易信号方向准确率": (
+            float((np.sign(valid.loc[traded, "raw_signal"]) == np.sign(target[traded])).mean())
+            if traded.any() and "raw_signal" in valid.columns
+            else np.nan
+        ),
+        "概率差与未来收益Pearson": safe_corr(prob_edge, future_return, method="pearson"),
+        "概率差与未来收益Spearman": safe_corr(prob_edge, future_return, method="spearman"),
+        "平均绝对概率差": float(prob_edge.abs().mean()),
+        "预测为多样本未来平均收益": float(future_return[calibrated_pred > 0].mean())
+        if (calibrated_pred > 0).any()
+        else np.nan,
+        "预测为空样本未来平均收益": float(future_return[calibrated_pred < 0].mean())
+        if (calibrated_pred < 0).any()
+        else np.nan,
+        "预测为中性样本未来平均绝对收益": float(future_return[calibrated_pred == 0].abs().mean())
+        if (calibrated_pred == 0).any()
+        else np.nan,
+    }
+
+    class_recalls = {}
+    for class_value, class_name in [(-1.0, "下跌"), (0.0, "中性"), (1.0, "上涨")]:
+        class_mask = target == class_value
+        class_recalls[f"{class_name}召回率"] = (
+            float((calibrated_pred[class_mask] == class_value).mean()) if class_mask.any() else np.nan
+        )
+    rows.update(class_recalls)
+
+    if {"prob_down", "prob_flat", "prob_up"}.issubset(valid.columns):
+        class_label = target.map(TARGET_TO_CLASS).astype("Int64")
+        prob_matrix = valid[["prob_down", "prob_flat", "prob_up"]].clip(1e-12, 1.0)
+        prob_matrix = prob_matrix.div(prob_matrix.sum(axis=1).replace(0, np.nan), axis=0)
+        logloss_frame = prob_matrix.assign(__label__=class_label).dropna(subset=["__label__"])
+        if not logloss_frame.empty:
+            labels = logloss_frame["__label__"].astype(int).to_numpy()
+            probs = logloss_frame[["prob_down", "prob_flat", "prob_up"]].to_numpy()
+            rows["三分类LogLoss"] = float(-np.log(probs[np.arange(len(labels)), labels]).mean())
+            one_hot = np.eye(3)[labels]
+            rows["三分类BrierScore"] = float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
+    return rows
+
+
+def calculate_trading_metrics_for_segment(
+    segment_name: str,
+    segment_df: pd.DataFrame,
+    config: BacktestConfig,
+) -> dict[str, Any] | None:
+    """计算交易规则、仓位和成本之后的策略效果指标。"""
+    required = {"strategy_net_return", "benchmark_return", "position"}
+    if segment_df.empty or not required.issubset(segment_df.columns):
+        return None
+    cleaned = segment_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["strategy_net_return"])
+    if cleaned.empty:
+        return None
+    annual_periods = infer_annual_periods(pd.DatetimeIndex(cleaned.index), config.annual_trading_days)
+    metrics = calculate_metrics(
+        cleaned["strategy_net_return"],
+        cleaned["benchmark_return"],
+        cleaned["position"],
+        annual_periods,
+    )
+    turnover = cleaned.get("turnover", pd.Series(0.0, index=cleaned.index)).fillna(0.0)
+    position = cleaned["position"].fillna(0.0)
+    raw_signal = cleaned.get("raw_signal", pd.Series(0.0, index=cleaned.index)).fillna(0.0)
+    target_position = cleaned.get("target_position", pd.Series(0.0, index=cleaned.index)).fillna(0.0)
+    rows: dict[str, Any] = {
+        "样本段": segment_name,
+        "交易样本数": int(len(cleaned)),
+        **metrics,
+        "策略毛收益": float(cleaned.get("strategy_gross_return", cleaned["strategy_net_return"]).sum()),
+        "策略净收益": float(cleaned["strategy_net_return"].sum()),
+        "总换手": float(turnover.sum()),
+        "平均换手": float(turnover.mean()),
+        "实际持仓覆盖率": float((position != 0).mean()),
+        "平均实际仓位绝对值": float(position.abs().mean()),
+        "目标仓位覆盖率": float((target_position != 0).mean()),
+        "平均目标仓位绝对值": float(target_position.abs().mean()),
+        "交易信号覆盖率": float((raw_signal != 0).mean()),
+    }
+    if "trade_allowed" in cleaned.columns:
+        rows["交易过滤后可交易覆盖率"] = float(cleaned["trade_allowed"].fillna(0.0).mean())
+    if "flat_trade_allowed" in cleaned.columns:
+        rows["中性概率过滤后覆盖率"] = float(cleaned["flat_trade_allowed"].fillna(0.0).mean())
+    if "confidence_trade_allowed" in cleaned.columns:
+        rows["置信度过滤后覆盖率"] = float(cleaned["confidence_trade_allowed"].fillna(0.0).mean())
+    return rows
+
+
+def save_prediction_and_trading_reports(
+    segment_backtests: dict[str, pd.DataFrame],
+    output_dir: Path,
+    config: BacktestConfig,
+) -> None:
+    """分别保存预测质量报告和交易结果报告。"""
+    prediction_rows = []
+    trading_rows = []
+    for segment_name, segment_df in segment_backtests.items():
+        prediction_row = calculate_prediction_metrics_for_segment(segment_name, segment_df)
+        if prediction_row is not None:
+            prediction_rows.append(prediction_row)
+        trading_row = calculate_trading_metrics_for_segment(segment_name, segment_df, config)
+        if trading_row is not None:
+            trading_rows.append(trading_row)
+
+    if prediction_rows:
+        pd.DataFrame(prediction_rows).to_csv(
+            output_dir / "composite_prediction_report.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if trading_rows:
+        pd.DataFrame(trading_rows).to_csv(
+            output_dir / "composite_trading_report.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+
 def plot_train_test_backtest_result(
     train_df: pd.DataFrame,
     validation_df: pd.DataFrame,
@@ -2427,6 +2591,7 @@ def save_composite_outputs(
     validation_end_time: pd.Timestamp,
     config: BacktestConfig,
     selection_summary: pd.DataFrame | None = None,
+    segment_backtests: dict[str, pd.DataFrame] | None = None,
 ) -> None:
     """保存综合因子回测的全部输出文件。
 
@@ -2444,7 +2609,8 @@ def save_composite_outputs(
     summary.loc["模型"] = "xgboost_rolling_multiclass"
     summary.loc["训练验证切分时间"] = str(split_time)
     summary.loc["验证测试切分时间"] = str(validation_end_time)
-    summary.loc["预测目标"] = "future_horizon_return_direction_with_cost_neutral(-1,0,1)"
+    summary.loc["预测目标"] = "future_horizon_return_direction(-1,0,1)"
+    summary.loc["预测标签模式"] = get_xgboost_target_label_mode(config)
     summary.loc["预测目标跨度K线数"] = get_xgboost_target_horizon(config)
     summary.loc["训练标签隔离K线数"] = max(0, get_xgboost_target_horizon(config) - 1)
     summary.loc["目标中性区间bps"] = (
@@ -2460,6 +2626,12 @@ def save_composite_outputs(
     )
     summary.loc["动态目标中性区间波动率倍率"] = float(
         getattr(config, "xgboost_target_dynamic_neutral_multiplier", 0.0) or 0.0
+    )
+    summary.loc["目标分位窗口"] = int(getattr(config, "xgboost_target_quantile_window", 0) or 0)
+    summary.loc["目标下分位"] = float(getattr(config, "xgboost_target_quantile_lower", 0.0) or 0.0)
+    summary.loc["目标上分位"] = float(getattr(config, "xgboost_target_quantile_upper", 0.0) or 0.0)
+    summary.loc["目标分位最小绝对阈值bps"] = float(
+        getattr(config, "xgboost_target_quantile_min_abs_bps", 0.0) or 0.0
     )
     summary.loc["手续费bps"] = config.commission_bps
     summary.loc["滑点bps"] = config.slippage_bps
@@ -2642,6 +2814,8 @@ def save_composite_outputs(
         )
 
     save_prediction_diagnostics(backtest_df, output_dir)
+    if segment_backtests is not None:
+        save_prediction_and_trading_reports(segment_backtests, output_dir, config)
     save_composite_robustness_report(backtest_df, output_dir, config)
     save_market_state_report(backtest_df, output_dir, config)
     save_cost_stress_report(backtest_df, output_dir, config)
@@ -2808,6 +2982,11 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                         if rolling_selection_summary is not None
                         else selection_summary
                     ),
+                    segment_backtests={
+                        "训练集": train_df,
+                        "验证集": validation_df,
+                        "最终测试集": backtest_df,
+                    },
                 )
                 primary_metrics = metrics
 
