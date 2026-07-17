@@ -46,8 +46,16 @@ def conservative_pair(
     fallback_column: str | None = None,
 ) -> pd.Series:
     """优先取训练/验证两段的较弱值；没有验证时回退到训练，再回退到兼容列。"""
-    train = pd.to_numeric(frame.get(train_column), errors="coerce")
-    validation = pd.to_numeric(frame.get(validation_column), errors="coerce")
+    train = (
+        pd.to_numeric(frame[train_column], errors="coerce")
+        if train_column in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
+    validation = (
+        pd.to_numeric(frame[validation_column], errors="coerce")
+        if validation_column in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
     if train is not None and validation is not None and (train.notna().any() or validation.notna().any()):
         return pd.concat([train, validation], axis=1).min(axis=1)
     if train is not None and train.notna().any():
@@ -82,10 +90,11 @@ def add_factor_research_scores(frame: pd.DataFrame, config: BacktestConfig) -> p
     )
 
     predictive_score = (
-        0.35 * normalize_score_series(conservative_pair(scored, "训练RankIC", "验证RankIC", "初筛RankIC"))
-        + 0.20 * normalize_score_series(conservative_pair(scored, "训练RankICIR", "验证RankICIR"))
+        0.30 * normalize_score_series(conservative_pair(scored, "训练RankIC", "验证RankIC", "初筛RankIC"))
+        + 0.15 * normalize_score_series(conservative_pair(scored, "训练RankICIR", "验证RankICIR"))
         + 0.15 * normalize_score_series(conservative_pair(scored, "训练IC胜率", "验证IC胜率"))
-        + 0.20 * normalize_score_series(conservative_pair(scored, "训练分组单调性", "验证分组单调性", "初筛分组单调性"))
+        + 0.15 * normalize_score_series(conservative_pair(scored, "训练方向命中率", "验证方向命中率"))
+        + 0.15 * normalize_score_series(conservative_pair(scored, "训练分组单调性", "验证分组单调性", "初筛分组单调性"))
         + 0.10 * normalize_score_series(conservative_pair(scored, "训练分组收益差", "验证分组收益差"))
     )
 
@@ -200,8 +209,8 @@ def rank_single_factor_summary(
     ranked = ranked.sort_values(
         [
             "初筛有效",
-            "初筛科研综合评分",
             "初筛预测能力评分",
+            "初筛科研综合评分",
             "初筛一致性评分",
             "初筛夏普",
             "初筛RankIC",
@@ -328,6 +337,9 @@ def build_factor_library(
         "训练ICIR",
         "训练RankICIR",
         "训练IC胜率",
+        "训练方向命中率",
+        "训练多空方向命中率",
+        "训练有效方向样本数",
         "训练分组单调性",
         "训练分组收益差",
         "训练胜率",
@@ -339,6 +351,9 @@ def build_factor_library(
         "验证ICIR",
         "验证RankICIR",
         "验证IC胜率",
+        "验证方向命中率",
+        "验证多空方向命中率",
+        "验证有效方向样本数",
         "验证分组单调性",
         "验证分组收益差",
         "验证夏普比率",
@@ -352,6 +367,9 @@ def build_factor_library(
         "测试ICIR",
         "测试RankICIR",
         "测试IC胜率",
+        "测试方向命中率",
+        "测试多空方向命中率",
+        "测试有效方向样本数",
         "测试分组单调性",
         "测试分组收益差",
         "测试夏普比率",
@@ -369,8 +387,8 @@ def build_factor_library(
     combined = combined.sort_values(
         [
             "初筛有效",
-            "初筛科研综合评分",
             "初筛预测能力评分",
+            "初筛科研综合评分",
             "初筛一致性评分",
             "初筛夏普",
             "初筛RankIC",
@@ -410,6 +428,8 @@ def build_factor_library(
     min_selection_rank_ic = getattr(config, "factor_library_min_selection_rank_ic", None)
     min_selection_monotonicity = getattr(config, "factor_library_min_selection_monotonicity", None)
     min_research_score = getattr(config, "factor_library_min_research_score", None)
+    min_predictive_score = getattr(config, "factor_library_min_predictive_score", None)
+    threshold_epsilon = 1e-12
     selection_win_rate_column = choose_metric_column(combined, "验证胜率", "测试胜率")
     selection_trade_column = choose_metric_column(combined, "验证交易次数", "测试交易次数")
     selection_coverage_column = choose_metric_column(combined, "验证信号覆盖率", "测试信号覆盖率")
@@ -430,7 +450,9 @@ def build_factor_library(
     if min_selection_monotonicity is not None:
         eligible_mask &= combined["初筛分组单调性"].fillna(-np.inf) >= float(min_selection_monotonicity)
     if min_research_score is not None:
-        eligible_mask &= combined["初筛科研综合评分"].fillna(-np.inf) >= float(min_research_score)
+        eligible_mask &= combined["初筛科研综合评分"].fillna(-np.inf) + threshold_epsilon >= float(min_research_score)
+    if min_predictive_score is not None:
+        eligible_mask &= combined["初筛预测能力评分"].fillna(-np.inf) + threshold_epsilon >= float(min_predictive_score)
     if min_test_trades > 0:
         eligible_mask &= combined[selection_trade_column].fillna(0.0) >= min_test_trades
     if min_train_trades > 0:
@@ -501,8 +523,10 @@ def build_factor_library(
             reject_reason = "low_selection_rank_ic"
         elif min_selection_monotonicity is not None and get_numeric_value(row, "初筛分组单调性", -np.inf) < float(min_selection_monotonicity):
             reject_reason = "low_selection_monotonicity"
-        elif min_research_score is not None and get_numeric_value(row, "初筛科研综合评分", -np.inf) < float(min_research_score):
+        elif min_research_score is not None and get_numeric_value(row, "初筛科研综合评分", -np.inf) + threshold_epsilon < float(min_research_score):
             reject_reason = "low_research_score"
+        elif min_predictive_score is not None and get_numeric_value(row, "初筛预测能力评分", -np.inf) + threshold_epsilon < float(min_predictive_score):
+            reject_reason = "low_predictive_score"
         elif get_numeric_value(row, selection_trade_column, 0.0) < min_test_trades:
             reject_reason = "low_selection_trade_count"
         elif get_numeric_value(row, "训练交易次数", 0.0) < min_train_trades:
@@ -608,6 +632,8 @@ def save_factor_library(
                 平均初筛夏普=("初筛夏普", "mean"),
                 平均初筛RankIC=("初筛RankIC", "mean"),
                 平均分组单调性=("初筛分组单调性", "mean"),
+                平均预测能力评分=("初筛预测能力评分", "mean"),
+                平均科研综合评分=("初筛科研综合评分", "mean"),
             )
             .reset_index()
             .sort_values("active因子数", ascending=False)

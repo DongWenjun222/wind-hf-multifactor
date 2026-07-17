@@ -17,6 +17,7 @@ from composite_factor_backtest import run_composite_backtest
 from config import BacktestConfig, resolve_symbol_universe
 from factors import build_single_factor_matrix, fetch_intraday_data, stop_wind
 from multi_symbol_backtest import run_multi_symbol_backtest
+from pooled_model_backtest import run_pooled_model_backtest
 from runtime_utils import run_tracked
 from single_factor_backtest import run_single_factor_backtests
 from trading_signal import run_trading_signal_export
@@ -82,6 +83,16 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
         config.xgboost_retrain_every = args.retrain_every
     if getattr(args, "symbols", None) is not None:
         config.symbols = resolve_symbol_universe(args.symbols)
+        if getattr(args, "command", "") == "pooled":
+            config.pooled_model_symbols = config.symbols
+    if getattr(args, "pooled_scope", None) is not None:
+        config.pooled_model_scope = args.pooled_scope
+    if getattr(args, "pooled_feature_source", None) is not None:
+        config.pooled_model_feature_source = args.pooled_feature_source
+    if getattr(args, "pooled_max_features", None) is not None:
+        config.pooled_model_max_features = args.pooled_max_features
+    if getattr(args, "pooled_model", None) is not None:
+        config.pooled_model_name = args.pooled_model
     if getattr(args, "skip_existing", None) is not None:
         config.multi_symbol_skip_existing = args.skip_existing
     return config
@@ -111,6 +122,14 @@ def run_multi(config: BacktestConfig) -> Any:
     """运行多品种流程。"""
     try:
         return run_multi_symbol_backtest(config)
+    finally:
+        stop_wind()
+
+
+def run_pooled(config: BacktestConfig) -> Any:
+    """运行多品种共享信息模型。"""
+    try:
+        return run_pooled_model_backtest(config)
     finally:
         stop_wind()
 
@@ -170,6 +189,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否跳过已经存在结果的品种。",
     )
 
+    pooled = subparsers.add_parser("pooled", help="运行多品种共享信息 pooled 模型。")
+    add_common_arguments(pooled)
+    pooled.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
+    pooled.add_argument(
+        "--pooled-scope",
+        choices=["sector", "market"],
+        help="共享模型范围：sector 按板块训练；market 全市场训练。",
+    )
+    pooled.add_argument(
+        "--pooled-feature-source",
+        choices=["active_union", "active_intersection"],
+        help="共享特征来源：active_union 使用 active 并集；active_intersection 使用交集。",
+    )
+    pooled.add_argument("--pooled-max-features", type=int, help="共享模型最多使用的基础因子数。")
+    pooled.add_argument(
+        "--pooled-model",
+        choices=["xgboost", "logistic_regression", "random_forest", "extra_trees"],
+        help="共享模型分类器。",
+    )
+
     signal = subparsers.add_parser("signal", help="导出最新单品种或多品种交易信号。")
     add_common_arguments(signal)
     signal.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
@@ -198,6 +237,7 @@ def main() -> None:
         "single": run_single,
         "composite": run_composite,
         "multi": run_multi,
+        "pooled": run_pooled,
         "signal": lambda current_config: run_signal(current_config, args),
     }
     run_tracked(config, args.command, lambda: runners[args.command](config))

@@ -2016,7 +2016,9 @@ def calculate_prediction_metrics_for_segment(
         class_label = target.map(TARGET_TO_CLASS).astype("Int64")
         prob_matrix = valid[["prob_down", "prob_flat", "prob_up"]].clip(1e-12, 1.0)
         prob_matrix = prob_matrix.div(prob_matrix.sum(axis=1).replace(0, np.nan), axis=0)
-        logloss_frame = prob_matrix.assign(__label__=class_label).dropna(subset=["__label__"])
+        logloss_frame = prob_matrix.assign(__label__=class_label).dropna(
+            subset=["prob_down", "prob_flat", "prob_up", "__label__"]
+        )
         if not logloss_frame.empty:
             labels = logloss_frame["__label__"].astype(int).to_numpy()
             probs = logloss_frame[["prob_down", "prob_flat", "prob_up"]].to_numpy()

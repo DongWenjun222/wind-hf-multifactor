@@ -257,6 +257,9 @@ def empty_predictive_metrics() -> dict[str, float]:
         "RankICIR": np.nan,
         "IC样本数": 0.0,
         "IC胜率": np.nan,
+        "方向命中率": np.nan,
+        "多空方向命中率": np.nan,
+        "有效方向样本数": 0.0,
         "月度IC样本数": 0.0,
         "分组单调性": np.nan,
         "分组收益差": np.nan,
@@ -298,6 +301,14 @@ def calculate_predictive_metrics(
         rank_ic = frame["score"].corr(frame["future_return"], method="spearman")
         metrics["IC"] = float(ic) if pd.notna(ic) else np.nan
         metrics["RankIC"] = float(rank_ic) if pd.notna(rank_ic) else np.nan
+
+    direction_frame = frame[(frame["score"] != 0) & (frame["future_return"] != 0)].copy()
+    metrics["有效方向样本数"] = float(len(direction_frame))
+    if not direction_frame.empty:
+        predicted_sign = np.sign(direction_frame["score"])
+        realized_sign = np.sign(direction_frame["future_return"])
+        metrics["方向命中率"] = float((predicted_sign == realized_sign).mean())
+        metrics["多空方向命中率"] = metrics["方向命中率"]
 
     if isinstance(frame.index, pd.DatetimeIndex) and not frame.empty:
         month_freq = get_supported_pandas_frequency(["ME", "M"])

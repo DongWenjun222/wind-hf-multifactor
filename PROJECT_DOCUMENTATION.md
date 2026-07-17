@@ -23,7 +23,7 @@
 
 | 文件 | 是否建议直接运行 | 作用 |
 | --- | --- | --- |
-| `cli.py` | 是，推荐入口 | 统一命令行入口。支持运行单因子、综合因子、多品种流程，并可通过命令行参数或 JSON 覆盖 `config.py`。 |
+| `cli.py` | 是，推荐入口 | 统一命令行入口。支持运行单因子、综合因子、多品种、共享 pooled 模型和交易信号流程，并可通过命令行参数或 JSON 覆盖 `config.py`。 |
 | `config.py` | 否 | 全局配置中心。控制数据源、品种、时间区间、因子库门槛、XGBoost/模型参数、图表、实验目录、多品种组合风控等。 |
 | `data_loader.py` | 否 | 数据读取层。负责本地 CSV 缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
 | `data_quality_report.py` | 是，回测前推荐 | 数据质量报告工具。检查主品种、相关品种、宏观数据的缺失、重复时间戳、K线间隔异常、OHLC异常、零成交量和极端收益。 |
@@ -32,6 +32,7 @@
 | `single_factor_backtest.py` | 可以 | 单因子批量回测入口。读取数据、构建因子、训练/验证/测试分段回测、生成单因子报告并更新因子库。 |
 | `composite_factor_backtest.py` | 可以 | 综合因子回测入口。只在 active 因子池内选因，使用 XGBoost/逻辑回归/随机森林等模型滚动训练预测，并输出综合策略效果。 |
 | `multi_symbol_backtest.py` | 可以 | 多品种批量入口。对多个期货品种独立运行单因子和综合因子流程，并生成多品种组合层汇总、图表和风控组合结果。 |
+| `pooled_model_backtest.py` | 可以 | 多品种共享信息模型入口。读取各品种 active 因子库，按板块或全市场拼接 long-format 样本，训练共享模型并回落到单品种回测。 |
 | `trading_signal.py` | 可以 | 最新交易信号导出入口。读取已经生成的 `composite_detail.csv`，输出单品种或多品种下一根 K 线目标仓位和调仓指令。 |
 | `runtime_utils.py` | 否 | 运行追踪工具。把控制台输出同步写入日志，并生成 `execution_manifest.json`，记录运行状态、耗时、配置哈希、错误堆栈和输出文件。 |
 | `project_fingerprint.py` | 否 | 源码指纹工具。计算影响因子构建的源码哈希，用于让因子矩阵缓存随公式变更自动失效。 |
@@ -64,7 +65,7 @@
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
+python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py pooled_model_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
 ```
 
 日常单品种研究推荐顺序：
@@ -94,10 +95,13 @@ python cli.py multi --symbols liquid_commodity
 # 也可以手工指定少量品种做快速实验
 python cli.py multi --symbols C.DCE,M.DCE,Y.DCE,P.DCE
 
-# 2. 预演低质量因子硬删除，不修改源码
+# 2. 在已有各品种 active 因子库基础上，运行板块共享 pooled 模型
+python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE --pooled-scope sector
+
+# 3. 预演低质量因子硬删除，不修改源码
 python hard_prune_factors.py
 
-# 3. 检查 factor_hard_delete_report.csv 后，如确认无误再真正删除
+# 4. 检查 factor_hard_delete_report.csv 后，如确认无误再真正删除
 python hard_prune_factors.py --apply
 
 # 4. ?????? runs ???????? output_cleanup_report.csv
@@ -181,6 +185,7 @@ wind_hf_multifactor_output/
 | `single_factor_backtest.py` | 单因子批量回测，输出训练集/验证集/测试集表现，并调用因子库逻辑更新 active 因子。 |
 | `composite_factor_backtest.py` | 综合因子回测，使用 active 因子池内的因子做 XGBoost 滚动训练、滚动选因、滚动预测。 |
 | `multi_symbol_backtest.py` | 多品种批量入口，为每个品种创建独立输出目录，依次运行单因子和综合因子流程，并生成跨品种汇总。 |
+| `pooled_model_backtest.py` | 多品种共享信息模型入口，把同一板块或全市场多个品种的样本拼成 long-format 训练集，训练共享模型并输出每个品种的回测结果。 |
 | `trading_signal.py` | 最新交易信号导出工具，从单品种或多品种 `composite_detail.csv` 中提取最新信号、下一根目标仓位和调仓量。 |
 | `hard_prune_factors.py` | 因子硬删除工具，把多品种淘汰池中的低质量因子结构真正从因子构造源码中删除。模块化后重点面向 `factor_builders/`。 |
 | `experiment_utils.py` | 实验运行目录、配置快照、输出快照、因子数量快照等工程辅助函数。 |
@@ -271,6 +276,9 @@ wind_hf_multifactor_output/
 | `xgboost_position_smoothing_alpha` | `1.0` | 仓位平滑系数，1 表示不平滑。 |
 | `xgboost_walk_forward_feature_selection` | `False` | 当前默认不在每个滚动窗口内重新选因。 |
 | `xgboost_target_horizon` | `1` | 默认预测下一根 K 线方向。 |
+| `xgboost_target_label_mode` | `"threshold"` | XGBoost 标签生成模式。`threshold` 使用固定/动态中性阈值；`quantile` 使用已落地历史 horizon 收益滚动分位数。 |
+| `xgboost_target_quantile_window` | `1200` | `quantile` 标签模式下计算历史收益分位阈值的滚动窗口。 |
+| `xgboost_target_quantile_lower/upper` | `0.35/0.65` | `quantile` 标签模式下的下/上分位，低于下分位标为空，高于上分位标为多，中间标为中性。 |
 
 ## 3. 数据读取与因子生成
 
@@ -521,6 +529,7 @@ IC：方向调整后的因子值与下一根 K 线 open-to-close 收益的 Pears
 RankIC：方向调整后的因子值与下一根 K 线收益的 Spearman 秩相关，更关注排序能力。
 ICIR / RankICIR：按月计算 IC 后，用月度均值除以月度波动，衡量预测相关性的稳定性。
 IC胜率：月度 IC 大于 0 的月份占比。
+方向命中率：方向调整后的因子值方向与下一根 K 线收益方向一致的比例。
 分组单调性：Q1-Q5 分组平均未来收益与分组编号的 Spearman 相关，越接近 1 越单调。
 分组收益差：最高组平均收益 - 最低组平均收益，用于观察强弱组是否真正拉开。
 ```
@@ -566,7 +575,7 @@ rejected_factors.csv
 | `active_factors.csv` | 当前正式进入综合模型候选池的因子。 |
 | `factor_library_all.csv` | 历史上评估过的全部因子及其最新表现。 |
 | `rejected_factors.csv` | 未通过入库条件、被相关性去重淘汰或排名靠后的因子。 |
-| `active_factor_family_summary.csv` | active 因子库按因子家族统计的数量、平均初筛夏普、平均 RankIC 和平均分组单调性。 |
+| `active_factor_family_summary.csv` | active 因子库按因子家族统计的数量、平均初筛夏普、平均 RankIC、平均分组单调性、平均预测能力评分和平均科研综合评分。 |
 
 当前入库逻辑：
 
@@ -578,11 +587,14 @@ rejected_factors.csv
 验证集和训练集满足可选交易次数、信号覆盖率和最大回撤约束
 与已入库因子的最大相关性 < factor_library_max_corr
 若启用家族配额，则同一因子家族 active 数量不能超过 factor_library_family_max_counts
-按训练集和验证集的较弱夏普、较弱 RankIC、较弱分组单调性、较弱累计收益排序
+初筛预测能力评分 >= factor_library_min_predictive_score
+按初筛预测能力评分、初筛科研综合评分、训练/验证一致性、夏普、RankIC、累计收益排序
 active 因子最多保留 single_factor_keep_top_n 个
 ```
 
-默认情况下，`factor_library_min_selection_rank_ic` 和 `factor_library_min_selection_monotonicity` 为 `None`，表示预测指标先参与排序和诊断，但不强制过滤。若希望更严格，可以在 `config.py` 中设置最低 RankIC 或最低分组单调性门槛。
+当前因子入库已经从“收益排名”升级为“预测优先筛选”。`初筛预测能力评分` 综合 RankIC、RankICIR、IC胜率、方向命中率、分组单调性和分组收益差；默认 `factor_library_score_weight_predictive=0.50`，高于交易表现权重 `factor_library_score_weight_performance=0.20`。如果预测能力评分低于 `factor_library_min_predictive_score`，即使单因子收益或夏普较高，也会以 `low_predictive_score` 拒绝入库。
+
+默认情况下，`factor_library_min_selection_rank_ic` 和 `factor_library_min_selection_monotonicity` 为 `None`，表示不单独硬卡 RankIC 或分组单调性，但它们已经进入预测能力评分和入库排序。若希望更严格，可以在 `config.py` 中设置最低 RankIC、最低分组单调性或提高 `factor_library_min_predictive_score`。
 
 active 因子库默认启用家族配额控制：
 
@@ -838,12 +850,15 @@ future_horizon_return < -neutral_threshold -> -1
 当前默认：
 
 ```text
+xgboost_target_label_mode = "threshold"
 xgboost_target_horizon = 1
 xgboost_target_neutral_bps = 3.0
 neutral_threshold = 3.0 bps
 ```
 
 如果 `xgboost_target_neutral_bps=None`，才会退回使用 `commission_bps + slippage_bps` 作为中性阈值。
+
+也可以把 `xgboost_target_label_mode` 设置为 `"quantile"`。这种模式不会用全样本未来收益分位，而是使用已经完全落地的历史 horizon 收益滚动计算上下分位阈值；预测 t 时，阈值只依赖 t 时刻之前已经可知的数据。它更适合波动状态变化明显、固定 bps 阈值过松或过严的品种。
 
 XGBoost 使用三分类模型：
 
@@ -951,6 +966,8 @@ wind_hf_multifactor_output/composite_factor/
 | `composite_xgboost_feature_importance.csv` | XGBoost 特征重要性。 |
 | `composite_factor_contribution.csv` | 把模型特征重要性聚合回基础因子后的贡献表，可用于判断 active 因子是否真的被模型使用。 |
 | `composite_xgboost_feature_selection.csv` | 每次滚动重训时的选因明细。 |
+| `composite_prediction_report.csv` | 纯预测质量报告，按训练集、验证集、最终测试集拆分，包含三分类准确率、方向准确率、类别召回率、LogLoss、BrierScore、概率差与未来收益相关性等。 |
+| `composite_trading_report.csv` | 交易结果报告，按训练集、验证集、最终测试集拆分，包含收益、夏普、回撤、换手、仓位覆盖率和交易过滤后覆盖率等。 |
 | `composite_prediction_diagnostics.csv` | 预测准确率、方向准确率、概率差相关性等诊断。 |
 | `composite_prediction_confusion_matrix.csv` | 校准后预测方向与真实方向的混淆矩阵。 |
 | `composite_xgboost_edge_diagnostics.csv` | 按概率优势分桶统计未来收益。 |
@@ -1095,6 +1112,71 @@ active最高入库夏普
 | `factor_prune_list.csv` | 全局软淘汰清单，后续构建因子时可自动过滤。 |
 | `factor_hard_delete_pool.csv` | 硬删除池，由 `hard_prune_factors.py` 从软淘汰清单合并生成。 |
 | `factor_hard_delete_report.csv` | 硬删除预演/执行报告，记录每个因子是否能匹配到可安全删除的源码公式行。 |
+
+### 10.1 多品种共享信息 pooled 模型
+
+`multi_symbol_backtest.py` 的定位是“逐品种独立建模 + 组合层汇总”；`pooled_model_backtest.py` 的定位是“多个品种共享训练样本”。它不会覆盖现有逐品种结果，而是在 `output_dir/pooled_model/` 下生成一套独立输出，便于和逐品种模型做对照。
+
+运行示例：
+
+```bash
+# 按板块训练共享模型，例如谷物、油脂油料、化工、有色等分别 pooled
+python cli.py pooled --symbols C.DCE,CS.DCE,M.DCE,Y.DCE,P.DCE --pooled-scope sector
+
+# 全市场训练一个共享模型
+python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-scope market
+```
+
+核心逻辑：
+
+```text
+读取每个品种自己的 active_factors.csv
+按 active_union 或 active_intersection 选择共享基础因子
+逐品种构建相同特征列
+追加 symbol/group one-hot 特征
+把多个品种样本拼成 long-format 数据集
+按时间滚动训练共享 XGBoost/分类器
+预测结果再回落到每个品种单独回测
+```
+
+核心配置：
+
+| 参数 | 含义 |
+| --- | --- |
+| `pooled_model_scope` | `sector` 表示按板块分别训练共享模型；`market` 表示全市场训练一个共享模型。 |
+| `pooled_model_symbols` | pooled 模型使用的品种列表；为空时使用 `symbols`。 |
+| `pooled_model_feature_source` | `active_union` 使用各品种 active 因子并集；`active_intersection` 只使用所有品种 active 因子交集。 |
+| `pooled_model_max_features` | 共享模型最多使用多少个基础因子，用于控制内存和训练速度。 |
+| `pooled_model_max_bars_per_symbol` | 每个品种最多使用最近多少根 K 线构建 pooled 数据集。 |
+| `pooled_model_min_symbols_per_group` | 每个共享组至少需要多少个品种才训练。 |
+| `pooled_model_max_train_rows` | 每次滚动训练最多使用多少条 long-format 样本。 |
+| `pooled_model_include_symbol_features` | 是否加入品种 one-hot 特征，让共享模型学习品种专属修正。 |
+| `pooled_model_include_group_features` | 是否加入板块 one-hot 特征，`market` 模式下更有用。 |
+| `pooled_model_name` | pooled 分类器，支持 `xgboost`、`logistic_regression`、`random_forest`、`extra_trees`。 |
+
+主要输出：
+
+| 文件 | 含义 |
+| --- | --- |
+| `pooled_selected_factors.csv` | 本次 pooled 模型最终使用的共享基础因子。 |
+| `pooled_shared_factor_candidates.csv` | 各 active 因子在不同品种中的出现次数和平均质量分。 |
+| `pooled_symbol_data_coverage.csv` | 每个品种的样本数和实际可用共享因子数量。 |
+| `pooled_predictions.csv` | long-format 逐样本预测概率、预测方向、真实标签和未来收益。 |
+| `pooled_symbol_detail.csv` | 预测落回单品种后的逐 K 线回测明细。 |
+| `pooled_symbol_summary.csv` | 每个品种的 pooled 模型回测绩效和预测诊断。 |
+| `pooled_group_summary.csv` | 每个共享组的平均收益、平均夏普、平均回撤和预测准确率。 |
+| `pooled_portfolio_detail.csv` | pooled 单品种结果合成后的多品种组合逐 K 线明细，包含各组合方法净值、回撤、风险乘数和仓位。 |
+| `pooled_portfolio_summary.csv` | pooled 组合层绩效摘要，对比等权、波动率倒数加权和正夏普加权。 |
+| `pooled_portfolio_weights.csv` | pooled 组合层逐 K 线品种权重。 |
+| `pooled_opportunity_scores.csv` | pooled 组合层横截面机会评分，默认基于上一根 K 线的模型概率优势。 |
+| `pooled_opportunity_selection.csv` | pooled 组合层每根 K 线实际入选品种记录。 |
+| `pooled_portfolio_contribution.csv` | pooled 组合层品种收益贡献。 |
+| `pooled_group_weights.csv` | pooled 组合层板块/产业链权重。 |
+| `pooled_group_contribution.csv` | pooled 组合层板块/产业链收益贡献。 |
+| `pooled_strategy_return_corr.csv` | pooled 单品种策略收益相关性矩阵。 |
+| `pooled_portfolio_report.png` | pooled 组合层净值、回撤、累计收益和平均仓位图。 |
+
+注意：pooled 模型依赖各品种已有 active 因子库，因此推荐先运行 `python cli.py multi --symbols ...` 或逐品种 `single` 流程更新 active 因子库，再运行 `python cli.py pooled ...`。
 
 当前组合层支持三种方法：
 

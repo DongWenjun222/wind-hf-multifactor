@@ -312,6 +312,48 @@ class BacktestConfig:
     # 组合回撤达到该水平后降到 0 仓位。例如 -0.12 表示回撤超过 12% 暂停组合风险暴露。
     multi_symbol_drawdown_stop: float = -0.12
 
+    # ----------------------------
+    # 多品种共享信息建模设置
+    # ----------------------------
+
+    # 共享模型输出子目录。
+    pooled_model_output_subdir: str = "pooled_model"
+
+    # 共享模型训练方式。
+    # "sector"：按 multi_symbol_group_map 中的板块分别训练共享模型；
+    # "market"：所有品种训练一个全市场共享模型。
+    pooled_model_scope: str = "sector"
+
+    # 共享模型使用的品种列表。为空时使用 symbols。
+    pooled_model_symbols: list[str] = field(default_factory=list)
+
+    # 共享模型特征来源。
+    # "active_union"：使用各品种 active 因子并集，按出现次数和入库质量排序后取前 N；
+    # "active_intersection"：只使用所有入选品种 active 因子的交集，更严格但可能过少。
+    pooled_model_feature_source: str = "active_union"
+
+    # 共享模型最多使用多少个基础因子。并集模式下用于控制内存和训练速度。
+    pooled_model_max_features: int = 80
+
+    # 每个品种构建 pooled 数据集时最多使用最近多少根 K 线；0 表示不截断。
+    pooled_model_max_bars_per_symbol: int = 12000
+
+    # 每个共享组至少需要多少个品种才训练；低于该值会跳过该组。
+    pooled_model_min_symbols_per_group: int = 2
+
+    # 共享模型滚动预测时，每次训练最多使用多少条 long-format 样本。
+    # 0 表示不截断；建议保留一个上限，避免全市场 pooled 训练过慢。
+    pooled_model_max_train_rows: int = 60000
+
+    # 共享模型是否加入 symbol one-hot 特征，让模型学习品种专属截距/修正。
+    pooled_model_include_symbol_features: bool = True
+
+    # 共享模型是否加入 group one-hot 特征。sector 模式下通常只有一个组，market 模式更有用。
+    pooled_model_include_group_features: bool = True
+
+    # 共享模型使用的分类器名称。建议先用 xgboost；也可使用 logistic_regression/random_forest/extra_trees。
+    pooled_model_name: str = "xgboost"
+
     # 回测开始时间。格式建议使用 "YYYY-MM-DD HH:MM:SS"。
     start_time: str = "2025-01-02 09:00:00"
 
@@ -559,11 +601,12 @@ class BacktestConfig:
 
     # 因子入库综合科研评分中，单因子交易表现的权重。
     # 交易表现主要来自训练/验证较弱一侧的夏普和累计收益。
-    factor_library_score_weight_performance: float = 0.40
+    # 当前默认降低收益权重，让入库更偏“预测有效性”而不是单纯收益排名。
+    factor_library_score_weight_performance: float = 0.20
 
     # 因子入库综合科研评分中，预测能力的权重。
-    # 预测能力主要来自 RankIC、ICIR、IC胜率、分组单调性和分组收益差。
-    factor_library_score_weight_predictive: float = 0.30
+    # 预测能力主要来自 RankIC、ICIR、IC胜率、方向命中率、分组单调性和分组收益差。
+    factor_library_score_weight_predictive: float = 0.50
 
     # 因子入库综合科研评分中，训练/验证一致性的权重。
     # 一致性越高，说明因子不太像只在某一段样本偶然有效。
@@ -576,6 +619,11 @@ class BacktestConfig:
     # 因子入库最低综合科研评分要求。
     # None 表示只用综合科研评分排序，不作为硬门槛；例如设为 0.55 可过滤综合质量偏低的因子。
     factor_library_min_research_score: Optional[float] = None
+
+    # 因子入库最低预测能力评分要求。
+    # 该评分是横截面 0-1 分位综合分，默认 0.40 表示预测能力至少不能明显低于候选因子的中位水平。
+    # 如果 active 因子过少，可临时设为 None；如果希望更科研化，可提高到 0.55 或 0.60。
+    factor_library_min_predictive_score: Optional[float] = 0.40
 
     # 因子入库允许的最大测试回撤。
     # None 表示不限制；例如 -0.10 表示测试最大回撤低于 -10% 的因子会被拒绝。
