@@ -21,6 +21,7 @@ import pandas as pd
 from config import BacktestConfig
 from data_loader import (
     ensure_wind_started as data_ensure_wind_started,
+    fetch_external_daily_data as data_fetch_external_daily_data,
     fetch_intraday_data as data_fetch_intraday_data,
     fetch_macro_state_data as data_fetch_macro_state_data,
     fetch_related_intraday_data as data_fetch_related_intraday_data,
@@ -39,6 +40,7 @@ from factor_builders import (
     add_complex_cross_asset_factors,
     add_complex_non_cross_factors,
     add_cross_asset_factors,
+    add_external_daily_factors,
     add_hyper_cross_asset_factors,
     add_hyper_non_cross_factors,
     add_macro_state_factors,
@@ -66,6 +68,7 @@ fetch_intraday_data = data_fetch_intraday_data
 get_macro_data_cache_path = data_get_macro_data_cache_path
 normalize_macro_daily_data = data_normalize_macro_daily_data
 fetch_macro_state_data = data_fetch_macro_state_data
+fetch_external_daily_data = data_fetch_external_daily_data
 fetch_related_intraday_data = data_fetch_related_intraday_data
 
 def align_related_data_to_main(
@@ -462,6 +465,26 @@ def make_dummy_macro_data_map(config: Any, dummy_data: pd.DataFrame) -> dict[str
     return macro_data_map
 
 
+def make_dummy_external_daily_data_map(config: Any, dummy_data: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """为因子名称目录构造外部日频哑数据，避免为了拿列名触发 Wind。"""
+    external_data_map: dict[str, pd.DataFrame] = {}
+    daily_index = pd.date_range(dummy_data.index.min().normalize(), periods=8, freq="D")
+    values = 50.0 + np.arange(len(daily_index), dtype="float64") * 0.2
+    default_lag = max(0, int(getattr(config, "external_daily_lag_daily_bars", 1) or 0))
+    for raw_source in getattr(config, "external_daily_sources", []) or []:
+        if isinstance(raw_source, dict):
+            source_name = str(raw_source.get("name") or raw_source.get("symbol") or "").strip()
+            lag = int(raw_source.get("lag", default_lag) or 0)
+        else:
+            source_name = str(raw_source).strip()
+            lag = default_lag
+        if source_name:
+            frame = pd.DataFrame({"value": values}, index=daily_index)
+            frame.attrs["lag_daily_bars"] = max(0, lag)
+            external_data_map[source_name] = frame
+    return external_data_map
+
+
 def build_factor_name_catalog(
     data: pd.DataFrame,
     config: Any,
@@ -536,6 +559,10 @@ def build_factor_name_catalog(
             macro_dummy_map = make_dummy_macro_data_map(catalog_config, dummy_data)
             append_columns(add_macro_state_factors(df, macro_dummy_map, catalog_config))
 
+        if getattr(catalog_config, "enable_external_daily_factors", False):
+            external_dummy_map = make_dummy_external_daily_data_map(catalog_config, dummy_data)
+            append_columns(add_external_daily_factors(df, external_dummy_map, catalog_config))
+
         return trim_catalog()
 
     related_dummy_map = (
@@ -548,11 +575,17 @@ def build_factor_name_catalog(
         if getattr(catalog_config, "enable_macro_state_factors", False)
         else None
     )
+    external_dummy_map = (
+        make_dummy_external_daily_data_map(catalog_config, dummy_data)
+        if getattr(catalog_config, "enable_external_daily_factors", False)
+        else None
+    )
     catalog = build_factors(
         dummy_data,
         catalog_config,
         related_data_map=related_dummy_map,
         macro_data_map=macro_dummy_map,
+        external_data_map=external_dummy_map,
         requested_factors=None,
     )
     return list(catalog.columns)
@@ -674,6 +707,7 @@ def build_factors(
     config: Any,
     related_data_map: dict[str, pd.DataFrame] | None = None,
     macro_data_map: dict[str, pd.DataFrame] | None = None,
+    external_data_map: dict[str, pd.DataFrame] | None = None,
     requested_factors: list[str] | set[str] | None = None,
 ) -> pd.DataFrame:
     """构建完整因子矩阵。
@@ -726,6 +760,7 @@ def build_factors(
             (
                 "calendar_",
                 "macro_",
+                "external_",
                 "cross_",
                 "crossmega_",
                 "crossultra_",
@@ -821,6 +856,16 @@ def build_factors(
         if not macro_factors.empty:
             print(f"宏观状态因子数量: {macro_factors.shape[1]}")
             factor_parts.append(macro_factors)
+
+    if getattr(config, "enable_external_daily_factors", False):
+        external_factors = pd.DataFrame(index=df.index)
+        if need_any_factor() or has_requested_prefix(("external_",)):
+            if external_data_map is None:
+                external_data_map = fetch_external_daily_data(config)
+            external_factors = filter_requested(add_external_daily_factors(df, external_data_map, config))
+        if not external_factors.empty:
+            print(f"外部日频因子数量: {external_factors.shape[1]}")
+            factor_parts.append(external_factors)
 
     if not factor_parts:
         missing_preview = ", ".join(sorted(requested_set)[:10])

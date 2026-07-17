@@ -30,6 +30,105 @@ def get_family_quota_limit(config: BacktestConfig, family: str) -> int | None:
     return max(0, int(value))
 
 
+def normalize_score_series(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    """把不同量纲的指标转换成 0-1 横截面分位分数。"""
+    clean = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if clean.notna().sum() == 0:
+        return pd.Series(0.0, index=series.index, dtype="float64")
+    rank = clean.rank(pct=True, ascending=higher_is_better)
+    return rank.fillna(0.0).astype("float64")
+
+
+def conservative_pair(
+    frame: pd.DataFrame,
+    train_column: str,
+    validation_column: str,
+    fallback_column: str | None = None,
+) -> pd.Series:
+    """优先取训练/验证两段的较弱值；没有验证时回退到训练，再回退到兼容列。"""
+    train = pd.to_numeric(frame.get(train_column), errors="coerce")
+    validation = pd.to_numeric(frame.get(validation_column), errors="coerce")
+    if train is not None and validation is not None and (train.notna().any() or validation.notna().any()):
+        return pd.concat([train, validation], axis=1).min(axis=1)
+    if train is not None and train.notna().any():
+        return train
+    if fallback_column and fallback_column in frame.columns:
+        return pd.to_numeric(frame[fallback_column], errors="coerce")
+    return pd.Series(np.nan, index=frame.index, dtype="float64")
+
+
+def consistency_score(frame: pd.DataFrame, train_column: str, validation_column: str) -> pd.Series:
+    """计算训练/验证一致性分数，越接近 1 说明两段表现越接近。"""
+    if train_column not in frame.columns or validation_column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype="float64")
+    train = pd.to_numeric(frame[train_column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    validation = pd.to_numeric(frame[validation_column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    denominator = train.abs() + validation.abs()
+    score = 1.0 - (train - validation).abs() / denominator.replace(0.0, np.nan)
+    return score.clip(lower=0.0, upper=1.0)
+
+
+def add_factor_research_scores(frame: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
+    """为因子增加科研化综合评分。
+
+    评分只使用训练集和验证集的表现；如果缺少验证集，则回退训练集。
+    最终测试集仍保留在报表中，但不参与入库主排序，避免测试集污染。
+    """
+    scored = frame.copy()
+
+    performance_score = (
+        0.65 * normalize_score_series(conservative_pair(scored, "训练夏普比率", "验证夏普比率", "初筛夏普"))
+        + 0.35 * normalize_score_series(conservative_pair(scored, "训练累计收益", "验证累计收益", "初筛累计收益"))
+    )
+
+    predictive_score = (
+        0.35 * normalize_score_series(conservative_pair(scored, "训练RankIC", "验证RankIC", "初筛RankIC"))
+        + 0.20 * normalize_score_series(conservative_pair(scored, "训练RankICIR", "验证RankICIR"))
+        + 0.15 * normalize_score_series(conservative_pair(scored, "训练IC胜率", "验证IC胜率"))
+        + 0.20 * normalize_score_series(conservative_pair(scored, "训练分组单调性", "验证分组单调性", "初筛分组单调性"))
+        + 0.10 * normalize_score_series(conservative_pair(scored, "训练分组收益差", "验证分组收益差"))
+    )
+
+    consistency = pd.concat(
+        [
+            consistency_score(scored, "训练夏普比率", "验证夏普比率"),
+            consistency_score(scored, "训练RankIC", "验证RankIC"),
+            consistency_score(scored, "训练分组单调性", "验证分组单调性"),
+        ],
+        axis=1,
+    ).mean(axis=1).fillna(0.0)
+
+    profit_month_share = conservative_pair(scored, "训练盈利月份占比", "验证盈利月份占比")
+    concentration = conservative_pair(scored, "训练月度收益集中度", "验证月度收益集中度")
+    stability_score = (
+        0.60 * pd.to_numeric(profit_month_share, errors="coerce").clip(lower=0.0, upper=1.0).fillna(0.0)
+        + 0.40 * (1.0 - pd.to_numeric(concentration, errors="coerce").clip(lower=0.0, upper=1.0)).fillna(0.0)
+    )
+
+    weights = {
+        "performance": max(0.0, float(getattr(config, "factor_library_score_weight_performance", 0.40) or 0.0)),
+        "predictive": max(0.0, float(getattr(config, "factor_library_score_weight_predictive", 0.30) or 0.0)),
+        "consistency": max(0.0, float(getattr(config, "factor_library_score_weight_consistency", 0.20) or 0.0)),
+        "stability": max(0.0, float(getattr(config, "factor_library_score_weight_stability", 0.10) or 0.0)),
+    }
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        weights = {"performance": 1.0, "predictive": 0.0, "consistency": 0.0, "stability": 0.0}
+        total_weight = 1.0
+
+    scored["初筛交易表现评分"] = performance_score.astype("float64")
+    scored["初筛预测能力评分"] = predictive_score.astype("float64")
+    scored["初筛一致性评分"] = consistency.astype("float64")
+    scored["初筛稳定性评分"] = stability_score.astype("float64")
+    scored["初筛科研综合评分"] = (
+        weights["performance"] * scored["初筛交易表现评分"]
+        + weights["predictive"] * scored["初筛预测能力评分"]
+        + weights["consistency"] * scored["初筛一致性评分"]
+        + weights["stability"] * scored["初筛稳定性评分"]
+    ) / total_weight
+    return scored
+
+
 def rank_single_factor_summary(
     summary: pd.DataFrame,
     config: BacktestConfig,
@@ -97,9 +196,18 @@ def rank_single_factor_summary(
     ranked["初筛样本"] = selection_sample
     ranked["因子家族"] = ranked["因子"].map(get_factor_family)
     ranked["初筛有效"] = sharpe.notna() & total_return.notna()
+    ranked = add_factor_research_scores(ranked, config)
     ranked = ranked.sort_values(
-        ["初筛有效", "初筛夏普", "初筛RankIC", "初筛分组单调性", "初筛累计收益"],
-        ascending=[False, False, False, False, False],
+        [
+            "初筛有效",
+            "初筛科研综合评分",
+            "初筛预测能力评分",
+            "初筛一致性评分",
+            "初筛夏普",
+            "初筛RankIC",
+            "初筛累计收益",
+        ],
+        ascending=[False, False, False, False, False, False, False],
         na_position="last",
     )
 
@@ -208,6 +316,11 @@ def build_factor_library(
         "初筛累计收益",
         "初筛RankIC",
         "初筛分组单调性",
+        "初筛交易表现评分",
+        "初筛预测能力评分",
+        "初筛一致性评分",
+        "初筛稳定性评分",
+        "初筛科研综合评分",
         "训练夏普比率",
         "训练累计收益",
         "训练IC",
@@ -252,9 +365,18 @@ def build_factor_library(
         if numeric_column not in combined.columns:
             combined[numeric_column] = np.nan
         combined[numeric_column] = pd.to_numeric(combined[numeric_column], errors="coerce")
+    combined = add_factor_research_scores(combined, config)
     combined = combined.sort_values(
-        ["初筛有效", "初筛夏普", "初筛RankIC", "初筛分组单调性", "初筛累计收益"],
-        ascending=[False, False, False, False, False],
+        [
+            "初筛有效",
+            "初筛科研综合评分",
+            "初筛预测能力评分",
+            "初筛一致性评分",
+            "初筛夏普",
+            "初筛RankIC",
+            "初筛累计收益",
+        ],
+        ascending=[False, False, False, False, False, False, False],
         na_position="last",
     ).reset_index(drop=True)
 
@@ -287,6 +409,7 @@ def build_factor_library(
     max_train_drawdown = getattr(config, "factor_library_max_train_drawdown", None)
     min_selection_rank_ic = getattr(config, "factor_library_min_selection_rank_ic", None)
     min_selection_monotonicity = getattr(config, "factor_library_min_selection_monotonicity", None)
+    min_research_score = getattr(config, "factor_library_min_research_score", None)
     selection_win_rate_column = choose_metric_column(combined, "验证胜率", "测试胜率")
     selection_trade_column = choose_metric_column(combined, "验证交易次数", "测试交易次数")
     selection_coverage_column = choose_metric_column(combined, "验证信号覆盖率", "测试信号覆盖率")
@@ -306,6 +429,8 @@ def build_factor_library(
         eligible_mask &= combined["初筛RankIC"].fillna(-np.inf) >= float(min_selection_rank_ic)
     if min_selection_monotonicity is not None:
         eligible_mask &= combined["初筛分组单调性"].fillna(-np.inf) >= float(min_selection_monotonicity)
+    if min_research_score is not None:
+        eligible_mask &= combined["初筛科研综合评分"].fillna(-np.inf) >= float(min_research_score)
     if min_test_trades > 0:
         eligible_mask &= combined[selection_trade_column].fillna(0.0) >= min_test_trades
     if min_train_trades > 0:
@@ -376,6 +501,8 @@ def build_factor_library(
             reject_reason = "low_selection_rank_ic"
         elif min_selection_monotonicity is not None and get_numeric_value(row, "初筛分组单调性", -np.inf) < float(min_selection_monotonicity):
             reject_reason = "low_selection_monotonicity"
+        elif min_research_score is not None and get_numeric_value(row, "初筛科研综合评分", -np.inf) < float(min_research_score):
+            reject_reason = "low_research_score"
         elif get_numeric_value(row, selection_trade_column, 0.0) < min_test_trades:
             reject_reason = "low_selection_trade_count"
         elif get_numeric_value(row, "训练交易次数", 0.0) < min_train_trades:

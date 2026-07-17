@@ -17,7 +17,7 @@ def estimate_factor_complexity(factor_name: str, family: str, token_count: int) 
     """给因子一个粗粒度复杂度标签，方便后续治理。"""
     if family == "basic":
         return "low"
-    if family in {"calendar", "macro_state"} and token_count <= 5:
+    if family in {"calendar", "macro_state", "external_daily"} and token_count <= 5:
         return "medium"
     if any(prefix in factor_name for prefix in ("omega_", "crossomega_", "hyper_", "crosshyper_")):
         return "high"
@@ -40,6 +40,9 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith("macro_"):
         family = "macro_state"
         source_file = "factor_builders/macro_state.py"
+    elif factor_name.startswith("external_"):
+        family = "external_daily"
+        source_file = "factor_builders/external_daily.py"
     elif factor_name.startswith(("cross_", "crossmega_", "crossultra_", "crosshyper_", "crossomega_")):
         family = "cross_asset"
         source_file = "factor_builders/cross_asset.py"
@@ -59,6 +62,7 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
         "来源文件": source_file,
         "是否跨品种": family == "cross_asset",
         "是否宏观": family == "macro_state",
+        "是否外部日频": family == "external_daily",
         "是否日历": family == "calendar",
         "是否基础因子": family == "basic",
         "估计窗口": window,

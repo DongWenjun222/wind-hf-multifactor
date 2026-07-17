@@ -7,6 +7,7 @@ from .cross_asset import (
     add_omega_cross_asset_factors,
     get_last_related_data_coverage,
 )
+from .external_daily import add_external_daily_factors
 from .macro_state import add_macro_state_factors
 from .non_cross import (
     add_complex_non_cross_factors,

@@ -447,6 +447,108 @@ def get_xgboost_target_neutral_threshold(config: BacktestConfig) -> float:
     return max(0.0, float(neutral_bps)) / 10000.0
 
 
+def calculate_xgboost_target_neutral_threshold(
+    data: pd.DataFrame,
+    index: pd.Index,
+    config: BacktestConfig,
+) -> pd.Series:
+    """计算每个时点的标签中性阈值，只使用当前及历史行情。"""
+    base_threshold = get_xgboost_target_neutral_threshold(config)
+    threshold = pd.Series(base_threshold, index=index, dtype="float64")
+    if not bool(getattr(config, "xgboost_target_use_dynamic_neutral_threshold", False)):
+        return threshold
+
+    window = max(
+        20,
+        int(getattr(config, "xgboost_target_dynamic_neutral_window", 240) or 240),
+    )
+    multiplier = max(
+        0.0,
+        float(getattr(config, "xgboost_target_dynamic_neutral_multiplier", 0.0) or 0.0),
+    )
+    if multiplier <= 0:
+        return threshold
+
+    intrabar_return = data["close"] / data["open"].replace(0, np.nan) - 1.0
+    min_periods = max(20, window // 3)
+    dynamic_threshold = (
+        intrabar_return.rolling(window=window, min_periods=min_periods).std()
+        * multiplier
+        * np.sqrt(get_xgboost_target_horizon(config))
+    )
+    dynamic_threshold = dynamic_threshold.reindex(index).replace([np.inf, -np.inf], np.nan)
+    return pd.concat([threshold, dynamic_threshold], axis=1).max(axis=1).astype("float64")
+
+
+def get_xgboost_target_label_mode(config: BacktestConfig) -> str:
+    """读取标签生成模式，并对未知值回退到旧版 threshold 模式。"""
+    mode = str(getattr(config, "xgboost_target_label_mode", "threshold") or "threshold").lower()
+    return mode if mode in {"threshold", "quantile"} else "threshold"
+
+
+def calculate_quantile_target_bounds(
+    data: pd.DataFrame,
+    index: pd.Index,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """用已经落地的历史 horizon 收益滚动分位数生成标签上下边界。"""
+    horizon = get_xgboost_target_horizon(config)
+    history_return = calculate_future_horizon_return(data, data.index, config).shift(horizon)
+    window = max(50, int(getattr(config, "xgboost_target_quantile_window", 1200) or 1200))
+    min_periods = max(30, window // 4)
+    lower_q = min(
+        0.49,
+        max(0.01, float(getattr(config, "xgboost_target_quantile_lower", 0.35) or 0.35)),
+    )
+    upper_q = max(
+        0.51,
+        min(0.99, float(getattr(config, "xgboost_target_quantile_upper", 0.65) or 0.65)),
+    )
+    if lower_q >= upper_q:
+        lower_q, upper_q = 0.35, 0.65
+
+    lower = history_return.rolling(window=window, min_periods=min_periods).quantile(lower_q)
+    upper = history_return.rolling(window=window, min_periods=min_periods).quantile(upper_q)
+    min_abs = max(
+        0.0,
+        float(getattr(config, "xgboost_target_quantile_min_abs_bps", 0.0) or 0.0) / 10000.0,
+    )
+    if min_abs > 0:
+        lower = pd.concat([lower, pd.Series(-min_abs, index=lower.index)], axis=1).min(axis=1)
+        upper = pd.concat([upper, pd.Series(min_abs, index=upper.index)], axis=1).max(axis=1)
+
+    bounds = pd.DataFrame(
+        {
+            "target_lower_threshold": lower.reindex(index),
+            "target_upper_threshold": upper.reindex(index),
+        },
+        index=index,
+    ).replace([np.inf, -np.inf], np.nan)
+    fallback_neutral = calculate_xgboost_target_neutral_threshold(data, index, config)
+    bounds["target_lower_threshold"] = bounds["target_lower_threshold"].fillna(-fallback_neutral)
+    bounds["target_upper_threshold"] = bounds["target_upper_threshold"].fillna(fallback_neutral)
+    return bounds.astype("float64")
+
+
+def calculate_xgboost_target_bounds(
+    data: pd.DataFrame,
+    index: pd.Index,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """计算 XGBoost 标签使用的上下边界。"""
+    if get_xgboost_target_label_mode(config) == "quantile":
+        return calculate_quantile_target_bounds(data, index, config)
+
+    neutral_threshold = calculate_xgboost_target_neutral_threshold(data, index, config)
+    return pd.DataFrame(
+        {
+            "target_lower_threshold": -neutral_threshold,
+            "target_upper_threshold": neutral_threshold,
+        },
+        index=index,
+    )
+
+
 def select_factors_in_window(
     signal_features: pd.DataFrame,
     train_target: pd.Series,
@@ -529,10 +631,10 @@ def calculate_next_bar_direction(
     落在中性区间：0
     """
     next_return = calculate_future_horizon_return(data, index, config)
-    neutral_threshold = get_xgboost_target_neutral_threshold(config)
+    target_bounds = calculate_xgboost_target_bounds(data, index, config)
     direction = pd.Series(0.0, index=index, dtype="float64")
-    direction[next_return > neutral_threshold] = 1.0
-    direction[next_return < -neutral_threshold] = -1.0
+    direction[next_return > target_bounds["target_upper_threshold"]] = 1.0
+    direction[next_return < target_bounds["target_lower_threshold"]] = -1.0
     direction[next_return.isna()] = np.nan
     return direction
 
@@ -600,6 +702,7 @@ def probabilities_to_trade_signal(
     """
     edge = probabilities["prob_up"] - probabilities["prob_down"]
     directional_probability = probabilities[["prob_up", "prob_down"]].max(axis=1)
+    flat_probability = probabilities["prob_flat"]
     min_edge = max(
         0.0,
         float(config.xgboost_trade_min_edge if min_edge is None else min_edge),
@@ -608,13 +711,25 @@ def probabilities_to_trade_signal(
         0.0,
         float(config.xgboost_trade_min_probability if min_probability is None else min_probability),
     )
+    max_flat_probability = min(
+        1.0,
+        max(0.0, float(getattr(config, "xgboost_trade_max_flat_probability", 1.0) or 1.0)),
+    )
+    min_directional_vs_flat_edge = max(
+        0.0,
+        float(getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0) or 0.0),
+    )
+    flat_allowed = (
+        (flat_probability <= max_flat_probability)
+        & ((directional_probability - flat_probability) >= min_directional_vs_flat_edge)
+    )
 
     signal = pd.Series(0.0, index=probabilities.index, dtype="float64")
-    long_mask = (edge >= min_edge) & (directional_probability >= min_probability)
-    short_mask = (edge <= -min_edge) & (directional_probability >= min_probability)
+    long_mask = (edge >= min_edge) & (directional_probability >= min_probability) & flat_allowed
+    short_mask = (edge <= -min_edge) & (directional_probability >= min_probability) & flat_allowed
     signal[long_mask] = 1.0
     signal[short_mask] = -1.0
-    signal[probabilities[["prob_up", "prob_down"]].isna().any(axis=1)] = np.nan
+    signal[probabilities[["prob_up", "prob_down", "prob_flat"]].isna().any(axis=1)] = np.nan
     return signal
 
 
@@ -723,6 +838,7 @@ def build_confidence_position_size(
     """把模型置信度映射到 0 到 max_size 之间的目标仓位。"""
     edge = (probabilities["prob_up"] - probabilities["prob_down"]).abs()
     directional_probability = probabilities[["prob_up", "prob_down"]].max(axis=1)
+    flat_probability = probabilities["prob_flat"]
     min_edge = min(
         0.999,
         max(0.0, float(config.xgboost_trade_min_edge if min_edge is None else min_edge)),
@@ -733,6 +849,18 @@ def build_confidence_position_size(
             0.0,
             float(config.xgboost_trade_min_probability if min_probability is None else min_probability),
         ),
+    )
+    max_flat_probability = min(
+        1.0,
+        max(0.0, float(getattr(config, "xgboost_trade_max_flat_probability", 1.0) or 1.0)),
+    )
+    min_directional_vs_flat_edge = max(
+        0.0,
+        float(getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0) or 0.0),
+    )
+    flat_allowed = (
+        (flat_probability <= max_flat_probability)
+        & ((directional_probability - flat_probability) >= min_directional_vs_flat_edge)
     )
     max_size = max(0.0, float(getattr(config, "xgboost_position_size_max", 1.0) or 1.0))
 
@@ -753,7 +881,8 @@ def build_confidence_position_size(
     else:
         size = (confidence > 0).astype("float64") * max_size
 
-    size[probabilities[["prob_up", "prob_down"]].isna().any(axis=1)] = np.nan
+    size = size.where(flat_allowed.fillna(False), 0.0)
+    size[probabilities[["prob_up", "prob_down", "prob_flat"]].isna().any(axis=1)] = np.nan
     return size.astype("float64")
 
 
@@ -766,9 +895,22 @@ def build_dynamic_confidence_position_size(
     """使用逐行校准阈值，把置信度映射为仓位大小。"""
     edge = (probabilities["prob_up"] - probabilities["prob_down"]).abs()
     directional_probability = probabilities[["prob_up", "prob_down"]].max(axis=1)
+    flat_probability = probabilities["prob_flat"]
     edge_threshold = min_edge.reindex(probabilities.index).fillna(float(config.xgboost_trade_min_edge))
     probability_threshold = min_probability.reindex(probabilities.index).fillna(
         float(config.xgboost_trade_min_probability)
+    )
+    max_flat_probability = min(
+        1.0,
+        max(0.0, float(getattr(config, "xgboost_trade_max_flat_probability", 1.0) or 1.0)),
+    )
+    min_directional_vs_flat_edge = max(
+        0.0,
+        float(getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0) or 0.0),
+    )
+    flat_allowed = (
+        (flat_probability <= max_flat_probability)
+        & ((directional_probability - flat_probability) >= min_directional_vs_flat_edge)
     )
     max_size = max(0.0, float(getattr(config, "xgboost_position_size_max", 1.0) or 1.0))
 
@@ -792,7 +934,8 @@ def build_dynamic_confidence_position_size(
     else:
         size = (confidence > 0).astype("float64") * max_size
 
-    size[probabilities[["prob_up", "prob_down"]].isna().any(axis=1)] = np.nan
+    size = size.where(flat_allowed.fillna(False), 0.0)
+    size[probabilities[["prob_up", "prob_down", "prob_flat"]].isna().any(axis=1)] = np.nan
     return size.astype("float64")
 
 
@@ -987,6 +1130,16 @@ def build_backtest_signal_from_columns(
         },
         index=signal.index,
     )
+
+
+def safe_corr(left: pd.Series, right: pd.Series, method: str = "pearson") -> float:
+    """安全计算相关系数，样本不足或常数序列时返回 NaN。"""
+    aligned = pd.concat([left, right], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(aligned) < 3:
+        return np.nan
+    if aligned.iloc[:, 0].std(ddof=0) == 0 or aligned.iloc[:, 1].std(ddof=0) == 0:
+        return np.nan
+    return float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1], method=method))
 
 
 def train_xgboost_classifier(
@@ -1549,6 +1702,14 @@ def build_xgboost_rolling_signal(
     signal["xgboost_predicted_direction"] = predicted_direction
     signal["target_direction"] = target
     signal["future_horizon_return"] = calculate_future_horizon_return(data, factors.index, config)
+    target_bounds = calculate_xgboost_target_bounds(data, factors.index, config)
+    signal = signal.join(target_bounds)
+    signal["target_neutral_threshold"] = (
+        target_bounds["target_upper_threshold"].abs()
+        .combine(target_bounds["target_lower_threshold"].abs(), max)
+        .astype("float64")
+    )
+    signal["target_label_mode"] = get_xgboost_target_label_mode(config)
     signal = signal.join(probabilities)
     signal["prob_edge"] = signal["prob_up"] - signal["prob_down"]
     signal["directional_probability"] = signal[["prob_up", "prob_down"]].max(axis=1)
@@ -1574,14 +1735,29 @@ def build_xgboost_rolling_signal(
     probability_threshold = signal["calibrated_min_probability"].fillna(
         float(config.xgboost_trade_min_probability)
     )
+    max_flat_probability = min(
+        1.0,
+        max(0.0, float(getattr(config, "xgboost_trade_max_flat_probability", 1.0) or 1.0)),
+    )
+    min_directional_vs_flat_edge = max(
+        0.0,
+        float(getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0) or 0.0),
+    )
+    signal["directional_vs_flat_edge"] = signal["directional_probability"] - signal["prob_flat"]
+    signal["flat_trade_allowed"] = (
+        (signal["prob_flat"] <= max_flat_probability)
+        & (signal["directional_vs_flat_edge"] >= min_directional_vs_flat_edge)
+    ).astype("float64")
     raw_signal = pd.Series(0.0, index=signal.index, dtype="float64")
     raw_signal[
         (signal["prob_edge"] >= edge_threshold)
         & (signal["directional_probability"] >= probability_threshold)
+        & (signal["flat_trade_allowed"].fillna(0.0) > 0)
     ] = 1.0
     raw_signal[
         (signal["prob_edge"] <= -edge_threshold)
         & (signal["directional_probability"] >= probability_threshold)
+        & (signal["flat_trade_allowed"].fillna(0.0) > 0)
     ] = -1.0
     signal["raw_signal"] = (raw_signal * signal["xgboost_signal_direction"]).fillna(0.0)
     signal["raw_signal"] = signal["raw_signal"].where(signal["trade_allowed"].fillna(0.0) > 0, 0.0)
@@ -2276,6 +2452,15 @@ def save_composite_outputs(
         if config.xgboost_target_neutral_bps is not None
         else config.commission_bps + config.slippage_bps
     )
+    summary.loc["启用动态目标中性区间"] = bool(
+        getattr(config, "xgboost_target_use_dynamic_neutral_threshold", False)
+    )
+    summary.loc["动态目标中性区间窗口"] = int(
+        getattr(config, "xgboost_target_dynamic_neutral_window", 0) or 0
+    )
+    summary.loc["动态目标中性区间波动率倍率"] = float(
+        getattr(config, "xgboost_target_dynamic_neutral_multiplier", 0.0) or 0.0
+    )
     summary.loc["手续费bps"] = config.commission_bps
     summary.loc["滑点bps"] = config.slippage_bps
     summary.loc["候选池来源"] = (
@@ -2307,6 +2492,12 @@ def save_composite_outputs(
     summary.loc["EarlyStopping轮数"] = config.xgboost_early_stopping_rounds
     summary.loc["交易最小概率差"] = config.xgboost_trade_min_edge
     summary.loc["交易最小方向概率"] = config.xgboost_trade_min_probability
+    summary.loc["交易最大中性概率"] = float(
+        getattr(config, "xgboost_trade_max_flat_probability", 1.0) or 1.0
+    )
+    summary.loc["交易最小方向相对中性优势"] = float(
+        getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0) or 0.0
+    )
     summary.loc["自动校准交易阈值"] = config.xgboost_auto_calibrate_trade_thresholds
     summary.loc["阈值校准最少交易数"] = config.xgboost_threshold_min_trades
     summary.loc["启用市场状态过滤"] = config.xgboost_trade_use_market_filters
@@ -2367,6 +2558,10 @@ def save_composite_outputs(
         summary.loc["平均绝对校准概率差"] = float(backtest_df["calibrated_prob_edge"].abs().mean())
     if "trade_allowed" in backtest_df.columns:
         summary.loc["过滤后可交易覆盖率"] = float(backtest_df["trade_allowed"].fillna(0.0).mean())
+    if "flat_trade_allowed" in backtest_df.columns:
+        summary.loc["中性概率过滤后覆盖率"] = float(backtest_df["flat_trade_allowed"].fillna(0.0).mean())
+    if "directional_vs_flat_edge" in backtest_df.columns:
+        summary.loc["平均方向相对中性优势"] = float(backtest_df["directional_vs_flat_edge"].mean())
     if "position_size" in backtest_df.columns:
         summary.loc["平均目标仓位大小"] = float(backtest_df["position_size"].fillna(0.0).mean())
     if {"target_position", "target_position_before_rules"}.issubset(backtest_df.columns):

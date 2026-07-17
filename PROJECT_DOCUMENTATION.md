@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | `cli.py` | 是，推荐入口 | 统一命令行入口。支持运行单因子、综合因子、多品种流程，并可通过命令行参数或 JSON 覆盖 `config.py`。 |
 | `config.py` | 否 | 全局配置中心。控制数据源、品种、时间区间、因子库门槛、XGBoost/模型参数、图表、实验目录、多品种组合风控等。 |
-| `data_loader.py` | 否 | 数据读取层。负责本地 CSV 缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据读取与缓存。 |
+| `data_loader.py` | 否 | 数据读取层。负责本地 CSV 缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
 | `data_quality_report.py` | 是，回测前推荐 | 数据质量报告工具。检查主品种、相关品种、宏观数据的缺失、重复时间戳、K线间隔异常、OHLC异常、零成交量和极端收益。 |
 | `factors.py` | 否 | 因子总装配入口。负责因子编号、按需构建、软淘汰过滤、因子矩阵拼装；同时兼容转导部分旧的数据读取函数。 |
 | `factor_library.py` | 否 | 因子库管理。根据单因子训练/验证表现、收益/夏普/胜率门槛和相关性去重，维护 `active/rejected/all` 三类因子库。 |
@@ -53,6 +53,7 @@
 | `factor_builders/cross_asset.py` | 否 | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动、成交活跃度差异等。 |
 | `factor_builders/calendar.py` | 否 | 交易日历/季节性因子，包括日内时段、周/月/季度/年度位置，以及时间状态与量价状态交互。 |
 | `factor_builders/macro_state.py` | 否 | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。默认日频数据滞后一日再对齐到分钟线。 |
+| `factor_builders/external_daily.py` | 否 | 通用外部日频数据因子。可把 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等日频序列滞后对齐到分钟线后构造成状态因子。 |
 | `factor_builders/common.py` | 否 | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
 
 ### 0.3 推荐运行顺序
@@ -63,7 +64,7 @@
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py
+python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
 ```
 
 日常单品种研究推荐顺序：
@@ -145,6 +146,7 @@ wind_hf_multifactor_output/
     calendar.py
     cross_asset.py
     macro_state.py
+    external_daily.py
     non_cross.py
     common.py
   factor_library.py
@@ -163,7 +165,7 @@ wind_hf_multifactor_output/
 | 文件 | 作用 |
 | --- | --- |
 | `config.py` | 全局配置中心，控制数据、因子库、单因子回测、XGBoost、图表、实验目录等参数。 |
-| `data_loader.py` | 数据读取层，负责本地行情缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据读取与缓存。 |
+| `data_loader.py` | 数据读取层，负责本地行情缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
 | `factors.py` | 因子编号、按需构建、因子总装配入口。为了兼容旧脚本，仍转导 `fetch_intraday_data`、`stop_wind` 等数据函数。具体数据读取已拆到 `data_loader.py`，具体因子公式已拆到 `factor_builders/`。 |
 | `runtime_utils.py` | 统一执行追踪工具，将控制台输出同步写入日志，并生成运行状态、耗时、配置哈希、错误堆栈和更新文件清单。 |
 | `cli.py` | 推荐的统一命令行入口，可在不修改 `config.py` 的情况下运行单因子、综合因子和多品种流程。 |
@@ -172,6 +174,7 @@ wind_hf_multifactor_output/
 | `factor_builders/calendar.py` | 交易日历、日内时段、周/月/季度/年度季节性及其与量价状态交互的因子。 |
 | `factor_builders/cross_asset.py` | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动和成交活跃度差异等。 |
 | `factor_builders/macro_state.py` | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。 |
+| `factor_builders/external_daily.py` | 通用外部日频数据因子，可接入 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等序列，并按滞后规则对齐到分钟线。 |
 | `factor_builders/non_cross.py` | 更复杂的非跨品种高阶因子，包括 `ultra_`、`hyper_`、`omega_` 系列。 |
 | `factor_builders/common.py` | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
 | `factor_library.py` | 因子库管理，负责 active/rejected/all 三类因子的入库、排序、门槛过滤和相关性去重。 |
@@ -206,6 +209,10 @@ wind_hf_multifactor_output/
 | `enable_macro_state_factors` | `True` | 启用资金利率、指数、汇率、债券等 Wind 日频宏观状态因子。 |
 | `macro_state_symbols` | `000300.SH, 000001.SH, 399006.SZ, USDCNY.IB, CBA00101.CS` | 默认宏观/市场状态代理代码，可按 Wind 权限和研究方向调整。 |
 | `macro_state_lag_daily_bars` | `1` | 宏观日频数据对齐到分钟线前整体滞后 1 个日频数据点，避免盘中使用当天收盘后才知道的数据。 |
+| `enable_external_daily_factors` | `False` | 是否启用通用外部日频数据因子。默认关闭，避免在没有配置外部数据源时额外访问 Wind。 |
+| `external_daily_sources` | `[]` | 外部日频数据源列表。每个元素建议包含 `name`、`symbol`、`field`，可选 `lag`；例如库存、现货价、期限结构、产业指数、利率或汇率代理。 |
+| `external_daily_windows` | `[3, 5, 10, 20, 40, 60]` | 外部日频因子的滚动窗口，用于生成变化均值、z-score、动量、冲击、相关性和 beta 等状态特征。 |
+| `external_daily_lag_daily_bars` | `1` | 外部日频数据默认滞后日频点数，避免在分钟级回测中使用尚不可获得的当日收盘后数据。 |
 | `single_factor_scope` | `"new"` | 默认只测试新增因子。 |
 | `single_factor_keep_top_n` | `200` | active 因子库最多保留 200 个因子。 |
 | `factor_library_enable_family_quota` | `True` | 是否启用 active 因子家族配额，防止同质因子过度集中。 |
@@ -273,7 +280,7 @@ wind_hf_multifactor_output/
 
 ```text
 data_loader.py
-  负责本地 CSV、Wind 分钟线、相关品种行情、Wind 日频宏观/利率/指数数据读取与缓存。
+  负责本地 CSV、Wind 分钟线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。
 
 factors.py
   负责因子编号、按需构建、软淘汰过滤和 build_factors 总装配。
@@ -315,6 +322,7 @@ factor_builders/
 + 20000 个 omega_ 非跨品种终极因子
 + 20093 个 calendar_ 交易日历/季节性因子
 + 390 个 macro_ 资金利率/宏观状态因子
++ 可选 external_ 外部日频状态因子，数量取决于 external_daily_sources 和 external_daily_windows
 + 可选跨品种因子，默认相关品种配置下约为 50480 个
 ```
 
@@ -384,6 +392,8 @@ Wind 日频指数、汇率、债券或利率代理序列
 ```
 
 宏观日频数据默认会先滞后 `macro_state_lag_daily_bars=1`，再 forward fill 对齐到 30 分钟 K 线。这样可以避免在盘中使用当天收盘后才知道的宏观/指数日频数据。
+
+通用外部日频数据因子通过 `external_daily_sources` 配置。典型用法是把 Wind 中可获取的库存、现货、仓单、产业指数、期限结构、利率、汇率等日频序列接进来，系统会优先读取本地缓存，缺失时再尝试 Wind，并统一转成 `value` 列。外部日频数据默认按 `external_daily_lag_daily_bars=1` 滞后一日后再对齐到分钟线，随后生成水平、变化、百分比变化、动量、冲击、与主品种收益相关性、beta、残差和量价交互等 `external_` 因子。
 
 ## 4. 因子编号与标签
 
@@ -1391,7 +1401,7 @@ python smoke_test.py
 python single_factor_backtest.py
 python composite_factor_backtest.py
 python multi_symbol_backtest.py
-python -m py_compile config.py data_loader.py factors.py factor_taxonomy.py runtime_utils.py cli.py factor_builders/__init__.py factor_builders/basic.py factor_builders/common.py factor_builders/parametric.py factor_builders/calendar.py factor_builders/cross_asset.py factor_builders/macro_state.py factor_builders/non_cross.py factor_library.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py smoke_test.py
+python -m py_compile config.py data_loader.py factors.py factor_taxonomy.py runtime_utils.py cli.py factor_builders/__init__.py factor_builders/basic.py factor_builders/common.py factor_builders/parametric.py factor_builders/calendar.py factor_builders/cross_asset.py factor_builders/macro_state.py factor_builders/external_daily.py factor_builders/non_cross.py factor_library.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py smoke_test.py
 ```
 
 ## 19. 总结

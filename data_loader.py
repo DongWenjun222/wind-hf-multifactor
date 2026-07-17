@@ -242,6 +242,129 @@ def save_local_macro_daily_data(data: pd.DataFrame, config: BacktestConfig, symb
     return cache_path
 
 
+def normalize_external_source(source: dict | str, default_lag: int) -> dict[str, str | int]:
+    """规范化外部日频数据源配置。"""
+    if isinstance(source, str):
+        source = {"name": source, "symbol": source, "field": "close"}
+    if not isinstance(source, dict):
+        raise ValueError(f"外部日频数据源配置必须是 dict 或字符串: {source}")
+
+    symbol = str(source.get("symbol", "")).strip()
+    if not symbol:
+        raise ValueError(f"外部日频数据源缺少 symbol: {source}")
+    name = str(source.get("name") or symbol).strip()
+    field = str(source.get("field") or "close").strip()
+    lag = int(source.get("lag", default_lag) or 0)
+    return {"name": name, "symbol": symbol, "field": field, "lag": max(0, lag)}
+
+
+def get_external_daily_cache_path(config: BacktestConfig, source: dict[str, str | int]) -> Path:
+    """根据外部数据源配置生成本地缓存路径。"""
+    safe_name = safe_symbol_name(str(source["name"]))
+    safe_symbol = safe_symbol_name(str(source["symbol"]))
+    safe_field = safe_symbol_name(str(source.get("field", "close")))
+    return Path(config.data_cache_dir) / f"external_{safe_name}_{safe_symbol}_{safe_field}_daily.csv"
+
+
+def normalize_external_daily_data(data: pd.DataFrame, field_name: str) -> pd.DataFrame:
+    """标准化 Wind 外部日频数据，统一输出 value 列。"""
+    data = data.copy()
+    data.index = pd.to_datetime(data.index)
+    data = data.sort_index()
+    data = data[~data.index.duplicated(keep="last")]
+    data.columns = [str(column).strip().lower() for column in data.columns]
+    lower_field = str(field_name).strip().lower()
+    if lower_field in data.columns:
+        value = data[lower_field]
+    elif "close" in data.columns:
+        value = data["close"]
+    elif len(data.columns):
+        value = data.iloc[:, 0]
+    else:
+        raise ValueError("外部日频数据没有可用字段")
+    result = pd.DataFrame({"value": pd.to_numeric(value, errors="coerce")}, index=data.index)
+    return result.replace([np.inf, -np.inf], np.nan).dropna(subset=["value"])
+
+
+def load_local_external_daily_data(
+    config: BacktestConfig,
+    source: dict[str, str | int],
+) -> pd.DataFrame:
+    """读取本地外部日频数据缓存。"""
+    cache_path = get_external_daily_cache_path(config, source)
+    if not cache_path.exists():
+        raise FileNotFoundError(f"没有找到外部日频缓存: {cache_path}")
+    data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+    return normalize_external_daily_data(data, str(source.get("field", "close")))
+
+
+def fetch_external_daily_data_from_wind(
+    config: BacktestConfig,
+    source: dict[str, str | int],
+) -> pd.DataFrame:
+    """通过 Wind wsd 拉取外部日频数据。"""
+    ensure_wind_started()
+    symbol = str(source["symbol"])
+    field_name = str(source.get("field", "close") or "close")
+    error_code, raw = w.wsd(
+        symbol,
+        field_name,
+        config.start_time,
+        config.end_time,
+        "",
+        usedf=True,
+    )
+    if error_code != 0:
+        raise RuntimeError(f"Wind 外部日频数据获取失败: {symbol}, 字段: {field_name}, 错误码: {error_code}")
+    return normalize_external_daily_data(raw, field_name)
+
+
+def save_local_external_daily_data(
+    data: pd.DataFrame,
+    config: BacktestConfig,
+    source: dict[str, str | int],
+) -> Path:
+    """保存外部日频数据缓存。"""
+    cache_path = get_external_daily_cache_path(config, source)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(cache_path, encoding="utf-8-sig")
+    return cache_path
+
+
+def fetch_external_daily_data(config: BacktestConfig) -> dict[str, pd.DataFrame]:
+    """读取或拉取配置中的全部外部日频数据。"""
+    external_data: dict[str, pd.DataFrame] = {}
+    raw_sources = list(getattr(config, "external_daily_sources", []) or [])
+    if not getattr(config, "enable_external_daily_factors", False) or not raw_sources:
+        return external_data
+
+    default_lag = max(0, int(getattr(config, "external_daily_lag_daily_bars", 1) or 0))
+    for raw_source in raw_sources:
+        try:
+            source = normalize_external_source(raw_source, default_lag)
+            source_name = str(source["name"])
+            if getattr(config, "prefer_local_data", True):
+                try:
+                    data = load_local_external_daily_data(config, source)
+                    data.attrs["lag_daily_bars"] = int(source.get("lag", default_lag) or 0)
+                    external_data[source_name] = data
+                    print(f"优先使用本地外部日频数据: {get_external_daily_cache_path(config, source)}")
+                    continue
+                except (FileNotFoundError, ValueError):
+                    pass
+            data = fetch_external_daily_data_from_wind(config, source)
+            data.attrs["lag_daily_bars"] = int(source.get("lag", default_lag) or 0)
+            saved_path = save_local_external_daily_data(data, config, source)
+            print(f"Wind 外部日频数据已保存到本地: {saved_path}")
+            external_data[source_name] = data
+        except Exception as exc:
+            message = f"外部日频数据已跳过: {raw_source}, 原因: {exc}"
+            if getattr(config, "external_daily_strict", False):
+                raise RuntimeError(message) from exc
+            print(message)
+    return external_data
+
+
 def fetch_macro_state_data(config: BacktestConfig) -> dict[str, pd.DataFrame]:
     """读取或拉取配置中的全部宏观状态数据。"""
     macro_data: dict[str, pd.DataFrame] = {}

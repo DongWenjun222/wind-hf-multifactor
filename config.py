@@ -426,6 +426,35 @@ class BacktestConfig:
     macro_state_strict: bool = False
 
     # ----------------------------
+    # Wind 外部商品基本面/期限结构数据设置
+    # ----------------------------
+
+    # 是否启用外部商品基本面/期限结构因子。
+    # 这类数据适合接入 Wind 中的库存、仓单、基差、期限结构、行业指数等日频或低频序列。
+    enable_external_daily_factors: bool = False
+
+    # 外部日频数据源配置列表。
+    # 每个元素支持：
+    # - name：数据源名称，会进入因子名，建议只用英文/数字/下划线。
+    # - symbol：Wind 代码。
+    # - field：Wind 字段，默认 close。
+    # - lag：对齐到分钟线前滞后几个日频点，默认使用 external_daily_lag_daily_bars。
+    # 示例：
+    # {"name": "cu_inventory", "symbol": "S0031528", "field": "close", "lag": 1}
+    external_daily_sources: list[dict[str, str | int]] = field(default_factory=list)
+
+    # 外部日频数据的滚动窗口，单位为日频数据点。
+    external_daily_windows: list[int] = field(default_factory=lambda: [3, 5, 10, 20, 40, 60])
+
+    # 外部日频数据默认滞后天数。
+    # 对库存、仓单、基差这类通常盘后更新的数据，建议至少设为 1，避免未来数据。
+    external_daily_lag_daily_bars: int = 1
+
+    # 外部日频数据读取失败时是否中断。
+    # False 表示跳过失败数据源；True 表示任一外部数据失败就报错。
+    external_daily_strict: bool = False
+
+    # ----------------------------
     # 单因子测试与因子库设置
     # ----------------------------
 
@@ -460,6 +489,7 @@ class BacktestConfig:
             "cross_asset": 45,
             "calendar": 25,
             "macro_state": 15,
+            "external_daily": 15,
         }
     )
 
@@ -526,6 +556,26 @@ class BacktestConfig:
     # 因子入库的最低初筛分组单调性要求。
     # None 表示不强制过滤；越接近 1，代表 Q1 到 Q5 的未来收益越接近严格单调递增。
     factor_library_min_selection_monotonicity: Optional[float] = None
+
+    # 因子入库综合科研评分中，单因子交易表现的权重。
+    # 交易表现主要来自训练/验证较弱一侧的夏普和累计收益。
+    factor_library_score_weight_performance: float = 0.40
+
+    # 因子入库综合科研评分中，预测能力的权重。
+    # 预测能力主要来自 RankIC、ICIR、IC胜率、分组单调性和分组收益差。
+    factor_library_score_weight_predictive: float = 0.30
+
+    # 因子入库综合科研评分中，训练/验证一致性的权重。
+    # 一致性越高，说明因子不太像只在某一段样本偶然有效。
+    factor_library_score_weight_consistency: float = 0.20
+
+    # 因子入库综合科研评分中，月度稳定性的权重。
+    # 稳定性参考盈利月份占比和月度收益集中度，避免只靠少数月份贡献。
+    factor_library_score_weight_stability: float = 0.10
+
+    # 因子入库最低综合科研评分要求。
+    # None 表示只用综合科研评分排序，不作为硬门槛；例如设为 0.55 可过滤综合质量偏低的因子。
+    factor_library_min_research_score: Optional[float] = None
 
     # 因子入库允许的最大测试回撤。
     # None 表示不限制；例如 -0.10 表示测试最大回撤低于 -10% 的因子会被拒绝。
@@ -953,10 +1003,51 @@ class BacktestConfig:
     # 1 表示预测下一根 K 线从开盘到收盘的收益方向；3/5 通常比单根方向有更高信噪比。
     xgboost_target_horizon: int = 1
 
+    # XGBoost 标签生成模式。
+    # "threshold"：使用固定/动态中性收益阈值，未来收益超过阈值标为 1，低于负阈值标为 -1，否则标为 0。
+    # "quantile"：使用已经落地的历史 horizon 收益滚动分位数作为上下边界，更适合波动状态变化明显的品种。
+    xgboost_target_label_mode: str = "threshold"
+
     # XGBoost 分类目标中的中性区间，单位 bps。
     # 留空表示使用手续费和滑点之和作为涨跌中性阈值；
     # 设为 0 则只按未来 horizon 根累计收益正负号分类为 -1/0/1。
     xgboost_target_neutral_bps: Optional[float] = 3.0  # 留空表示使用手续费和滑点之和
+
+    # 是否为 XGBoost 标签启用动态中性区间。
+    # 开启后，中性阈值会取“固定 bps 阈值”和“近期波动率阈值”的较大者，
+    # 避免在高波动阶段把大量随机噪声误标成可交易方向。
+    xgboost_target_use_dynamic_neutral_threshold: bool = True
+
+    # 动态中性阈值使用的历史波动率窗口，单位为 K线根数。
+    # 只使用当前及过去 K 线信息，不会使用未来收益。
+    xgboost_target_dynamic_neutral_window: int = 240
+
+    # 动态中性阈值 = 近期 open-to-close 收益波动率 * 该倍率。
+    # 值越大，标签中 0 类越多，模型更保守；值越小，方向样本更多但噪声更大。
+    xgboost_target_dynamic_neutral_multiplier: float = 0.25
+
+    # quantile 标签模式使用的历史窗口，单位为 K线根数。
+    # 只使用已经完整落地的历史 horizon 收益，不使用未来数据。
+    xgboost_target_quantile_window: int = 1200
+
+    # quantile 标签模式下的下分位和上分位。
+    # 例如 0.35/0.65 表示历史收益最低 35% 标为空，最高 35% 标为多，中间 30% 标为中性。
+    xgboost_target_quantile_lower: float = 0.35
+    xgboost_target_quantile_upper: float = 0.65
+
+    # quantile 标签模式下，分位阈值还会和该最小绝对收益阈值取更保守的一侧。
+    # 例如 2 表示即使分位阈值很接近 0，也至少要求未来收益绝对值超过 2 bps 才标成方向类。
+    xgboost_target_quantile_min_abs_bps: float = 0.0
+
+    # 交易时允许的最大中性类别概率。
+    # 如果 prob_flat 太高，说明模型认为“没有明确方向”的概率较大，即使多空概率略有差异也不交易。
+    # 设为 1 表示关闭该过滤。
+    xgboost_trade_max_flat_probability: float = 0.60
+
+    # 交易时方向概率相对中性概率的最小优势。
+    # 例如 0.02 表示 max(prob_up, prob_down) 至少要比 prob_flat 高 2 个百分点。
+    # 设为 0 表示只使用 max_flat_probability，不额外要求方向概率超过中性概率。
+    xgboost_trade_min_directional_vs_flat_edge: float = 0.02
 
     # ----------------------------
     # qcut 分组检验设置
