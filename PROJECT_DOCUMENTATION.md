@@ -33,14 +33,15 @@
 | `composite_factor_backtest.py` | 可以 | 综合因子回测入口。只在 active 因子池内选因，使用 XGBoost/逻辑回归/随机森林等模型滚动训练预测，并输出综合策略效果。 |
 | `multi_symbol_backtest.py` | 可以 | 多品种批量入口。对多个期货品种独立运行单因子和综合因子流程，并生成多品种组合层汇总、图表和风控组合结果。 |
 | `pooled_model_backtest.py` | 可以 | 多品种共享信息模型入口。读取各品种 active 因子库，按板块或全市场拼接 long-format 样本，训练共享模型并回落到单品种回测。 |
-| `trading_signal.py` | 可以 | 最新交易信号导出入口。读取已经生成的 `composite_detail.csv`，输出单品种或多品种下一根 K 线目标仓位和调仓指令。 |
+| `trading_signal.py` | 可以 | 最新交易信号导出入口。默认 compute 模式读取 active 因子并现场合成最新信号；detail 模式才读取已有 `composite_detail.csv` 做快速对照。 |
 | `runtime_utils.py` | 否 | 运行追踪工具。把控制台输出同步写入日志，并生成 `execution_manifest.json`，记录运行状态、耗时、配置哈希、错误堆栈和输出文件。 |
 | `project_fingerprint.py` | 否 | 源码指纹工具。计算影响因子构建的源码哈希，用于让因子矩阵缓存随公式变更自动失效。 |
+| `consistency_check.py` | 是，改配置/文档后推荐 | 配置、CLI 和文档一致性检查工具，用于发现默认值、命令行参数和说明文档之间的漂移。 |
 | `experiment_utils.py` | 否 | 实验快照工具。负责创建 `runs/` 实验目录、保存配置、复制关键输出、快照 active 因子库和因子数量。 |
 | `factor_metadata.py` | 可以 | 因子元数据导出工具。生成 `factor_metadata.csv` 和因子家族汇总，用于解释、聚类、治理和 AI 因子管理。 |
 | `leakage_audit.py` | 是，改代码后推荐 | 未来函数/数据泄露静态审计工具。扫描 `shift(-n)`、`bfill`、全样本统计等高风险写法并输出审计报告。 |
 | `hard_prune_factors.py` | 谨慎运行 | 因子硬删除工具。读取淘汰池，扫描 `factor_builders/*.py` 中可安全定位的公式行，预演或执行源码级删除。默认先预演，不加 `--apply` 不会改代码。 |
-| `cleanup_outputs.py` | ???? | ??????/???????????????? `runs/` ??????????????? `output_cleanup_report.csv`?? `--apply` ????????? |
+| `cleanup_outputs.py` | 可以 | 清理/归档历史实验输出目录。默认只生成预演报告 `output_cleanup_report.csv`；确认后加 `--apply` 才会执行。 |
 | `smoke_test.py` | 是，改代码后推荐 | 轻量冒烟测试。用于快速检查数据读取、因子构建、active 因子池和小规模综合模型是否能跑通。 |
 
 ### 0.2 因子构造文件作用
@@ -65,7 +66,9 @@
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py pooled_model_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
+python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py consistency_check.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py pooled_model_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
+python consistency_check.py --strict
+python cli.py single --symbol C.DCE --scope range --range-start 1 --range-end 100 --dry-run --print-config
 ```
 
 日常单品种研究推荐顺序：
@@ -74,29 +77,33 @@ python -m py_compile config.py data_loader.py data_quality_report.py factors.py 
 # 1. 测试新增单因子，并更新 active/rejected/all 因子库
 python data_quality_report.py --symbol C.DCE
 python cli.py single --symbol C.DCE --scope new --start-index 126978
+python cli.py single --symbol C.DCE --scope range --range-start 1 --range-end 100
 
 # 2. 导出因子元数据，便于解释、治理和聚类
 python factor_metadata.py
 
 # 3. 只使用 active 因子池做综合模型滚动预测与回测
 python cli.py composite --symbol C.DCE --models xgboost,logistic_regression
+python cli.py composite --symbol C.DCE --feature-scope selected --selected-factors factor_a,factor_b
+python cli.py composite --symbol C.DCE --train-window 2400 --save-config wind_hf_multifactor_output/last_composite_config.json --dry-run
 
-# 4. 从已有综合回测结果中导出最新交易信号，不重新训练模型
+# 4. 导出最新交易信号。默认 compute 模式现场合成；detail 模式读取已有明细。
 python cli.py signal --symbol C.DCE --source auto
 python cli.py signal --symbols C.DCE,M.DCE,Y.DCE,P.DCE --source multi
+python cli.py signal --symbol C.DCE --mode detail --source auto
 ```
 
 多品种研究推荐顺序：
 
 ```bash
 # 1. 覆盖中国商品期货中流动性较好的主力连续品种，并生成多品种组合汇总
-python cli.py multi --symbols liquid_commodity
+python cli.py multi --symbols liquid_commodity --run-single-factor --run-composite
 
 # 也可以手工指定少量品种做快速实验
-python cli.py multi --symbols C.DCE,M.DCE,Y.DCE,P.DCE
+python cli.py multi --symbols C.DCE,M.DCE,Y.DCE,P.DCE --run-single-factor --no-run-composite
 
 # 2. 在已有各品种 active 因子库基础上，运行板块共享 pooled 模型
-python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE --pooled-scope sector
+python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE --pooled-scope sector --pooled-train-time-window 1200
 
 # 3. 预演低质量因子硬删除，不修改源码
 python hard_prune_factors.py
@@ -104,10 +111,10 @@ python hard_prune_factors.py
 # 4. 检查 factor_hard_delete_report.csv 后，如确认无误再真正删除
 python hard_prune_factors.py --apply
 
-# 4. ?????? runs ???????? output_cleanup_report.csv
+# 5. 预演清理历史 runs，只生成 output_cleanup_report.csv
 python cleanup_outputs.py --keep-runs 5 --mode archive
 
-# 5. ?? output_cleanup_report.csv ?????????? runs
+# 6. 确认 output_cleanup_report.csv 后再真正归档旧 runs
 python cleanup_outputs.py --keep-runs 5 --mode archive --apply
 ```
 
@@ -186,9 +193,10 @@ wind_hf_multifactor_output/
 | `composite_factor_backtest.py` | 综合因子回测，使用 active 因子池内的因子做 XGBoost 滚动训练、滚动选因、滚动预测。 |
 | `multi_symbol_backtest.py` | 多品种批量入口，为每个品种创建独立输出目录，依次运行单因子和综合因子流程，并生成跨品种汇总。 |
 | `pooled_model_backtest.py` | 多品种共享信息模型入口，把同一板块或全市场多个品种的样本拼成 long-format 训练集，训练共享模型并输出每个品种的回测结果。 |
-| `trading_signal.py` | 最新交易信号导出工具，从单品种或多品种 `composite_detail.csv` 中提取最新信号、下一根目标仓位和调仓量。 |
+| `trading_signal.py` | 最新交易信号导出工具。默认 compute 模式基于 active 因子库和最新因子值现场合成信号；detail 模式从 `composite_detail.csv` 提取最后一根信号。 |
 | `hard_prune_factors.py` | 因子硬删除工具，把多品种淘汰池中的低质量因子结构真正从因子构造源码中删除。模块化后重点面向 `factor_builders/`。 |
 | `experiment_utils.py` | 实验运行目录、配置快照、输出快照、因子数量快照等工程辅助函数。 |
+| `consistency_check.py` | 配置、CLI 和文档一致性检查工具，适合修改默认参数、命令行入口或说明文档后运行。 |
 | `smoke_test.py` | 轻量冒烟测试，快速检查数据读取、因子构建、active 因子池和小规模 XGBoost 是否能跑通。 |
 | `AI_FACTOR_GENERATION_PROMPT.md` | 给后续 AI 自动生成新因子的工作提示词和约束说明。 |
 
@@ -202,8 +210,9 @@ wind_hf_multifactor_output/
 | `symbols` | `LIQUID_COMMODITY_MAIN_SYMBOLS` | 多品种批量回测时依次运行的主预测品种。默认覆盖中国商品期货中流动性较好的主力连续品种，可用 `--symbols liquid_commodity` 显式指定同一品种池。 |
 | `bar_size` | `30` | 30 分钟 K 线。 |
 | `prefer_local_data` | `True` | 优先读取本地缓存行情，失败后再尝试 Wind。 |
-| `commission_bps` | `0.5` | 单边手续费，单位 bps。 |
+| `commission_bps` | `0` | 单边手续费，单位 bps；正式评估应按品种设置真实成本。 |
 | `slippage_bps` | `0` | 当前不计滑点。 |
+| `backtest_return_mode` | `"next_open_continuous"` | 下一根开盘调仓；旧仓位承担跳空，新仓位承担开盘到收盘损益。 |
 | `cost_stress_bps_list` | `0, 0.5, 1, 2, 3` | 综合回测成本压力测试档位，表示手续费+滑点的单边总成本。 |
 | `signal_threshold` | `0.7` | 因子 z-score 转多空信号阈值。 |
 | `zscore_window` | `120` | 因子滚动标准化窗口。 |
@@ -218,7 +227,7 @@ wind_hf_multifactor_output/
 | `external_daily_sources` | `[]` | 外部日频数据源列表。每个元素建议包含 `name`、`symbol`、`field`，可选 `lag`；例如库存、现货价、期限结构、产业指数、利率或汇率代理。 |
 | `external_daily_windows` | `[3, 5, 10, 20, 40, 60]` | 外部日频因子的滚动窗口，用于生成变化均值、z-score、动量、冲击、相关性和 beta 等状态特征。 |
 | `external_daily_lag_daily_bars` | `1` | 外部日频数据默认滞后日频点数，避免在分钟级回测中使用尚不可获得的当日收盘后数据。 |
-| `single_factor_scope` | `"new"` | 默认只测试新增因子。 |
+| `single_factor_scope` | `"range"` | 默认只测试 `single_factor_range` 指定编号区间；可切换为 `new/all/selected`。 |
 | `single_factor_keep_top_n` | `200` | active 因子库最多保留 200 个因子。 |
 | `factor_library_enable_family_quota` | `True` | 是否启用 active 因子家族配额，防止同质因子过度集中。 |
 | `factor_library_family_max_counts` | 见 `config.py` | 各因子家族的 active 数量上限，例如 parametric、cross_asset、calendar、macro_state 等。 |
@@ -254,7 +263,7 @@ wind_hf_multifactor_output/
 | `composite_gap_warn_sharpe_retention` | `0.5` | 测试夏普低于验证夏普该比例时触发衰减预警。 |
 | `composite_gap_warn_return_retention` | `0.5` | 测试累计收益低于验证累计收益该比例时触发衰减预警。 |
 | `xgboost_feature_scope` | `"best"` | 综合模型在 active 池内滚动选择表现较好的因子。 |
-| `selected_factors` | `None` | ?? `xgboost_feature_scope="selected"` ????best/all ????????????????? active ?????? |
+| `selected_factors` | `None` | 仅当 `xgboost_feature_scope="selected"` 时生效；`best/all` 模式会忽略该列表，且所有选择都必须落在 active 因子池内。 |
 | `xgboost_best_top_n` | `50` | 每次重训最多选 50 个基础因子。 |
 | `xgboost_train_window` | `1200` | 每次 XGBoost 训练最多使用过去 1200 根 K 线。 |
 | `xgboost_min_train_samples` | `600` | 训练样本少于 600 时跳过预测。 |
@@ -1148,8 +1157,9 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 | `pooled_model_feature_source` | `active_union` 使用各品种 active 因子并集；`active_intersection` 只使用所有品种 active 因子交集。 |
 | `pooled_model_max_features` | 共享模型最多使用多少个基础因子，用于控制内存和训练速度。 |
 | `pooled_model_max_bars_per_symbol` | 每个品种最多使用最近多少根 K 线构建 pooled 数据集。 |
+| `pooled_model_train_time_window` | pooled 滚动训练每次最多回看多少个历史时间点；为空时沿用 `xgboost_train_window`。 |
 | `pooled_model_min_symbols_per_group` | 每个共享组至少需要多少个品种才训练。 |
-| `pooled_model_max_train_rows` | 每次滚动训练最多使用多少条 long-format 样本。 |
+| `pooled_model_max_train_rows` | 每次滚动训练最多使用多少条 long-format 样本，用作内存和速度上限。 |
 | `pooled_model_include_symbol_features` | 是否加入品种 one-hot 特征，让共享模型学习品种专属修正。 |
 | `pooled_model_include_group_features` | 是否加入板块 one-hot 特征，`market` 模式下更有用。 |
 | `pooled_model_name` | pooled 分类器，支持 `xgboost`、`logistic_regression`、`random_forest`、`extra_trees`。 |
@@ -1165,6 +1175,8 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 | `pooled_symbol_detail.csv` | 预测落回单品种后的逐 K 线回测明细。 |
 | `pooled_symbol_summary.csv` | 每个品种的 pooled 模型回测绩效和预测诊断。 |
 | `pooled_group_summary.csv` | 每个共享组的平均收益、平均夏普、平均回撤和预测准确率。 |
+| `pooled_vs_independent_symbol_comparison.csv` | pooled 共享模型与逐品种独立综合模型的品种级对比，包含收益、夏普、回撤、胜率和预测准确率差异。 |
+| `pooled_vs_independent_group_comparison.csv` | pooled 共享模型与逐品种独立综合模型的板块级平均对比。 |
 | `pooled_portfolio_detail.csv` | pooled 单品种结果合成后的多品种组合逐 K 线明细，包含各组合方法净值、回撤、风险乘数和仓位。 |
 | `pooled_portfolio_summary.csv` | pooled 组合层绩效摘要，对比等权、波动率倒数加权和正夏普加权。 |
 | `pooled_portfolio_weights.csv` | pooled 组合层逐 K 线品种权重。 |
@@ -1194,6 +1206,7 @@ positive_sharpe：夏普正向加权
 第一，默认保持每个品种独立输出，避免不同品种的 active 因子库互相覆盖。
 第二，如果只想批量跑综合模型，可以先手动准备好各品种的 active_factors.csv，再把 multi_symbol_run_single_factor 设为 False。
 第三，如果只想批量刷新单因子库，可以把 multi_symbol_run_composite 设为 False。
+这两个开关也可以直接通过 CLI 覆盖：`--run-single-factor/--no-run-single-factor` 和 `--run-composite/--no-run-composite`。
 第四，related_symbols 仍然是跨品种因子的数据源；symbols 是要被预测和回测的主品种列表，两者含义不同。全市场批量跑时，不建议无脑把 `related_symbols` 也扩成全市场，否则跨品种因子计算量会明显膨胀。
 第五，多品种批量目前是“逐品种独立模型 + 多方法组合汇总”，后续总风险预算和跨品种仓位约束可以在此基础上继续扩展。
 ```

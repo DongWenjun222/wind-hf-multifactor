@@ -394,16 +394,41 @@ def run_backtest(data: pd.DataFrame, signal: pd.DataFrame, config: Any):
 
     df = df.dropna(subset=["position", "composite_score", "bar_return_oc"])
 
-    turnover = df["position"].diff().abs().fillna(df["position"].abs())
+    previous_position = df["position"].shift(1).fillna(0.0)
+    turnover = (df["position"] - previous_position).abs()
     trading_cost = turnover * (config.commission_bps + config.slippage_bps) / 10000.0
 
-    # 策略收益仍使用 open-to-close，因为信号在上一根K线结束后、下一根K线开盘执行。
-    # 基准净值用于展示标的自身走势，使用 close-to-close 更直观，也避免长期排除隔夜跳空导致基准曲线失真。
+    # 信号在上一根 K 线结束后生成，并在当前 K 线开盘调仓：
+    # 旧仓位承担上一收盘到当前开盘的跳空，新仓位承担当前开盘到收盘的价格变化。
     if "close" in df.columns:
         df["benchmark_return"] = df["close"].replace(0, np.nan).pct_change().fillna(0.0)
     else:
         df["benchmark_return"] = df["bar_return_oc"].fillna(0.0)
-    df["strategy_gross_return"] = df["position"] * df["bar_return_oc"].fillna(0.0)
+    return_mode = str(
+        getattr(config, "backtest_return_mode", "next_open_continuous") or "next_open_continuous"
+    ).lower()
+    if return_mode == "intrabar_only":
+        df["gap_return"] = 0.0
+        df["intrabar_pnl_return"] = df["bar_return_oc"].fillna(0.0)
+        df["strategy_gross_return"] = df["position"] * df["intrabar_pnl_return"]
+    elif return_mode == "next_open_continuous":
+        previous_close = df["close"].shift(1).replace(0, np.nan)
+        capital_base = previous_close.fillna(df["open"].replace(0, np.nan))
+        df["gap_return"] = (df["open"] - previous_close) / previous_close
+        df["gap_return"] = df["gap_return"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df["intrabar_pnl_return"] = (df["close"] - df["open"]) / capital_base
+        df["intrabar_pnl_return"] = (
+            df["intrabar_pnl_return"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+        df["strategy_gross_return"] = (
+            previous_position * df["gap_return"]
+            + df["position"] * df["intrabar_pnl_return"]
+        )
+    else:
+        raise ValueError(
+            "backtest_return_mode 只能是 'next_open_continuous' 或 'intrabar_only'。"
+        )
+    df["previous_position"] = previous_position
     df["strategy_net_return"] = df["strategy_gross_return"] - trading_cost
     df["turnover"] = turnover
     df["trading_cost"] = trading_cost
@@ -1139,10 +1164,25 @@ def run_single_factor_backtests(
     summary_rows = []
     qcut_summary_rows = []
     factor_id_map = factors.attrs.get("factor_id_map") or get_factor_id_map(factors)
+    missing_factor_ids = [
+        factor_name for factor_name in factors.columns if factor_name not in factor_id_map
+    ]
+    next_factor_id = max(factor_id_map.values(), default=0) + 1
+    for factor_name in missing_factor_ids:
+        factor_id_map[factor_name] = next_factor_id
+        next_factor_id += 1
     factor_label_map = factors.attrs.get("factor_label_map") or get_factor_label_map(factors)
+    factor_label_map.update(
+        {
+            factor_name: f"{factor_id_map[factor_name]}_{factor_name}"
+            for factor_name in factors.columns
+            if factor_name not in factor_label_map
+        }
+    )
     scope = str(getattr(config, "single_factor_scope", "")).lower()
-    if scope in {"new", "range"} and factors.attrs.get("factor_id_map"):
-        factor_columns = list(factors.columns)
+    requested_backtest_columns = factors.attrs.get("backtest_factor_columns")
+    if requested_backtest_columns is not None:
+        factor_columns = list(requested_backtest_columns)
     else:
         factor_columns = select_single_factor_columns(factors, config)
     progress_factor_columns = list(factor_columns)

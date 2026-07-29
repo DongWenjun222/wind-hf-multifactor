@@ -671,34 +671,88 @@ def resolve_single_factor_requested_factors(
     return requested, factor_id_map
 
 
+def load_existing_active_factor_metadata(config: Any) -> pd.DataFrame:
+    """读取已有 active 因子的名称和稳定编号，供增量相关性复核使用。"""
+    library_dir = Path(getattr(config, "factor_library_dir", "factor_library"))
+    if not library_dir.is_absolute():
+        library_dir = Path(getattr(config, "output_dir", ".")) / library_dir
+    active_path = library_dir / "active_factors.csv"
+    if not active_path.exists():
+        return pd.DataFrame(columns=["因子", "因子编号"])
+    try:
+        active = pd.read_csv(active_path)
+    except Exception as exc:
+        print(f"已有 active 因子库读取失败，暂不作为相关性参照: {active_path}, 原因: {exc}")
+        return pd.DataFrame(columns=["因子", "因子编号"])
+    if "因子" not in active.columns:
+        return pd.DataFrame(columns=["因子", "因子编号"])
+    columns = ["因子"] + (["因子编号"] if "因子编号" in active.columns else [])
+    active = active[columns].copy()
+    active["因子"] = active["因子"].dropna().astype(str).str.strip()
+    active = active[active["因子"] != ""].drop_duplicates("因子", keep="last")
+    if "因子编号" not in active.columns:
+        active["因子编号"] = np.nan
+    return active.reset_index(drop=True)
+
+
 def build_single_factor_matrix(data: pd.DataFrame, config: Any) -> pd.DataFrame:
-    """为单因子回测构建因子矩阵，new/selected 模式下只计算本轮需要测试的因子。"""
+    """构建单因子矩阵，并在部分测试模式下带上旧 active 因子作为相关性参照。"""
     requested_factors, catalog_factor_id_map = resolve_single_factor_requested_factors(data, config)
+    scope = str(getattr(config, "single_factor_scope", "all")).lower()
+    backtest_factors = list(requested_factors or [])
+    existing_active = pd.DataFrame(columns=["因子", "因子编号"])
+    construction_factors = requested_factors
+    if requested_factors is not None and scope in {"new", "range", "selected"}:
+        existing_active = load_existing_active_factor_metadata(config)
+        active_names = existing_active["因子"].dropna().astype(str).tolist()
+        construction_factors = list(dict.fromkeys([*requested_factors, *active_names]))
+
     if requested_factors is None:
         factors = build_factors(data, config)
     else:
-        scope = str(getattr(config, "single_factor_scope", "all")).lower()
         extra = ""
         if scope == "range":
             start_factor_id, end_factor_id = get_single_factor_range(config)
             extra = f"，编号区间=[{start_factor_id}, {end_factor_id}]"
-        print(f"单因子按需构建: scope={scope}{extra}，因子数量={len(requested_factors)}")
-        if not requested_factors:
+        active_reference_count = max(0, len(construction_factors or []) - len(requested_factors))
+        print(
+            f"单因子按需构建: scope={scope}{extra}，"
+            f"本轮回测因子={len(requested_factors)}，旧active相关性参照={active_reference_count}"
+        )
+        if not construction_factors:
             factors = pd.DataFrame(index=data.index)
         else:
-            factors = build_factors(data, config, requested_factors=requested_factors)
+            factors = build_factors(data, config, requested_factors=construction_factors)
 
+    scoped_factor_id_map: dict[str, int] = {}
     if catalog_factor_id_map:
-        scoped_factor_id_map = {
+        scoped_factor_id_map.update(
+            {
             factor_name: catalog_factor_id_map[factor_name]
             for factor_name in factors.columns
             if factor_name in catalog_factor_id_map
-        }
+            }
+        )
+    if not existing_active.empty:
+        existing_ids = pd.to_numeric(existing_active["因子编号"], errors="coerce")
+        for factor_name, factor_id in zip(existing_active["因子"], existing_ids):
+            if factor_name in factors.columns and pd.notna(factor_id):
+                scoped_factor_id_map.setdefault(str(factor_name), int(factor_id))
+    if scoped_factor_id_map:
         factors.attrs["factor_id_map"] = scoped_factor_id_map
         factors.attrs["factor_label_map"] = {
             factor_name: format_factor_label(factor_name, factor_id)
             for factor_name, factor_id in scoped_factor_id_map.items()
         }
+    if requested_factors is not None:
+        factors.attrs["backtest_factor_columns"] = [
+            factor_name for factor_name in backtest_factors if factor_name in factors.columns
+        ]
+        factors.attrs["existing_active_factor_columns"] = [
+            factor_name
+            for factor_name in existing_active["因子"].astype(str)
+            if factor_name in factors.columns
+        ]
     return factors
 
 

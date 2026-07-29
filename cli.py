@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,26 @@ def apply_json_config(config: BacktestConfig, config_path: str | None) -> None:
         setattr(config, name, value)
 
 
+def config_to_serializable_dict(config: BacktestConfig) -> dict[str, Any]:
+    """把最终配置转换成可写入 JSON 的字典。"""
+    return asdict(config)
+
+
+def emit_final_config(config: BacktestConfig, args: argparse.Namespace) -> None:
+    """按命令行要求打印或保存最终配置。"""
+    config_dict = config_to_serializable_dict(config)
+    if bool(getattr(args, "print_config", False)):
+        print(json.dumps(config_dict, ensure_ascii=False, indent=2, sort_keys=True))
+
+    save_path = getattr(args, "save_config", None)
+    if save_path:
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(config_dict, file, ensure_ascii=False, indent=2, sort_keys=True)
+        print(f"最终配置已保存: {path}")
+
+
 def apply_common_overrides(config: BacktestConfig, args: argparse.Namespace) -> None:
     """应用各任务共享的常用参数覆盖。"""
     for arg_name, config_name in (
@@ -71,6 +92,20 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
     if getattr(args, "start_index", None) is not None:
         config.single_factor_new_factor_start_index = args.start_index
         config.single_factor_new_factor_start_index_by_symbol = {}
+    range_start = getattr(args, "range_start", None)
+    range_end = getattr(args, "range_end", None)
+    if range_start is not None or range_end is not None:
+        current_start, current_end = getattr(config, "single_factor_range", (1, 1))
+        config.single_factor_range = (
+            int(range_start if range_start is not None else current_start),
+            int(range_end if range_end is not None else current_end),
+        )
+    selected_factors = parse_csv_values(getattr(args, "selected_factors", None))
+    if selected_factors is not None:
+        if getattr(args, "command", "") == "single":
+            config.single_factor_selected_factors = selected_factors
+        elif getattr(args, "command", "") == "composite":
+            config.selected_factors = selected_factors
     if getattr(args, "feature_scope", None) is not None:
         config.xgboost_feature_scope = args.feature_scope
     if getattr(args, "models", None) is not None:
@@ -91,10 +126,18 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
         config.pooled_model_feature_source = args.pooled_feature_source
     if getattr(args, "pooled_max_features", None) is not None:
         config.pooled_model_max_features = args.pooled_max_features
+    if getattr(args, "pooled_train_time_window", None) is not None:
+        config.pooled_model_train_time_window = args.pooled_train_time_window
+    if getattr(args, "pooled_max_train_rows", None) is not None:
+        config.pooled_model_max_train_rows = args.pooled_max_train_rows
     if getattr(args, "pooled_model", None) is not None:
         config.pooled_model_name = args.pooled_model
     if getattr(args, "skip_existing", None) is not None:
         config.multi_symbol_skip_existing = args.skip_existing
+    if getattr(args, "run_single_factor", None) is not None:
+        config.multi_symbol_run_single_factor = args.run_single_factor
+    if getattr(args, "run_composite", None) is not None:
+        config.multi_symbol_run_composite = args.run_composite
     return config
 
 
@@ -155,6 +198,9 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", help="结果输出目录。")
     parser.add_argument("--data-cache-dir", help="行情数据缓存目录。")
     parser.add_argument("--run-id", help="实验编号；不填则自动生成。")
+    parser.add_argument("--print-config", action="store_true", help="运行前打印命令行覆盖后的最终配置。")
+    parser.add_argument("--save-config", help="把命令行覆盖后的最终配置保存为 JSON。")
+    parser.add_argument("--dry-run", action="store_true", help="只解析并输出最终配置，不执行回测或信号导出。")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,8 +210,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     single = subparsers.add_parser("single", help="运行单因子回测与因子入库。")
     add_common_arguments(single)
-    single.add_argument("--scope", choices=["all", "new", "selected"], help="单因子构建范围。")
+    single.add_argument("--scope", choices=["all", "new", "range", "selected"], help="单因子构建范围。")
     single.add_argument("--start-index", type=int, help="new 模式下新增因子的起始编号。")
+    single.add_argument("--range-start", type=int, help="range 模式下因子编号区间起点。")
+    single.add_argument("--range-end", type=int, help="range 模式下因子编号区间终点。")
+    single.add_argument("--selected-factors", help="selected 模式下逗号分隔的单因子名称列表。")
 
     composite = subparsers.add_parser("composite", help="运行综合因子滚动训练回测。")
     add_common_arguments(composite)
@@ -175,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="综合模型在 active 池内的因子选择方式。",
     )
     composite.add_argument("--models", help="逗号分隔的模型列表。")
+    composite.add_argument("--selected-factors", help="selected 模式下逗号分隔的 active 因子名称列表。")
     composite.add_argument("--train-window", type=int, help="滚动训练窗口长度。")
     composite.add_argument("--min-train-samples", type=int, help="最少训练样本数。")
     composite.add_argument("--retrain-every", type=int, help="每隔多少根 K 线重新训练。")
@@ -187,6 +237,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="是否跳过已经存在结果的品种。",
+    )
+    multi.add_argument(
+        "--run-single-factor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否为每个品种运行单因子流程并更新 active 因子库。",
+    )
+    multi.add_argument(
+        "--run-composite",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否为每个品种运行综合因子模型和单品种回测。",
     )
 
     pooled = subparsers.add_parser("pooled", help="运行多品种共享信息 pooled 模型。")
@@ -203,6 +265,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="共享特征来源：active_union 使用 active 并集；active_intersection 使用交集。",
     )
     pooled.add_argument("--pooled-max-features", type=int, help="共享模型最多使用的基础因子数。")
+    pooled.add_argument("--pooled-train-time-window", type=int, help="共享模型每次滚动训练最多回看的历史时间点数量。")
+    pooled.add_argument("--pooled-max-train-rows", type=int, help="共享模型每次滚动训练最多使用的 long-format 样本行数。")
     pooled.add_argument(
         "--pooled-model",
         choices=["xgboost", "logistic_regression", "random_forest", "extra_trees"],
@@ -233,6 +297,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     config = create_config(args)
+    emit_final_config(config, args)
+    if bool(getattr(args, "dry_run", False)):
+        print("dry-run 模式：已跳过实际运行。")
+        return
     runners = {
         "single": run_single,
         "composite": run_composite,

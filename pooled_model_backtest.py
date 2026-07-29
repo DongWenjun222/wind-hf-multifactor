@@ -198,9 +198,12 @@ def build_symbol_pooled_dataset(
     )
     target = calculate_next_bar_direction(data, features.index, symbol_config)
     future_return = calculate_future_horizon_return(data, features.index, symbol_config)
+    horizon = get_xgboost_target_horizon(symbol_config)
+    label_available_time = pd.Series(data.index, index=data.index).shift(-horizon).reindex(features.index)
     dataset = features.copy()
     dataset["target"] = target
     dataset["future_horizon_return"] = future_return
+    dataset["label_available_time"] = label_available_time
     dataset["timestamp"] = dataset.index
     dataset["symbol"] = symbol
     dataset["group"] = group_name
@@ -226,11 +229,16 @@ def fit_predict_pooled_group(
 ) -> pd.DataFrame:
     """对一个共享组做滚动训练和逐时点预测。"""
     model_name = str(getattr(config, "pooled_model_name", "xgboost") or "xgboost")
-    horizon = get_xgboost_target_horizon(config)
-    purge_delta = pd.Timedelta(minutes=int(config.bar_size) * horizon)
     retrain_every = max(1, int(getattr(config, "xgboost_retrain_every", 25) or 25))
     min_train_samples = max(1, int(getattr(config, "xgboost_min_train_samples", 600) or 600))
-    train_window = max(1, int(getattr(config, "xgboost_train_window", 1200) or 1200))
+    train_time_window = max(
+        1,
+        int(
+            getattr(config, "pooled_model_train_time_window", None)
+            or getattr(config, "xgboost_train_window", 1200)
+            or 1200
+        ),
+    )
     max_train_rows = max(0, int(getattr(config, "pooled_model_max_train_rows", 60000) or 0))
 
     dataset = group_dataset.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
@@ -250,23 +258,33 @@ def fit_predict_pooled_group(
         if not current_mask.any():
             continue
 
-        train_cutoff = pd.Timestamp(timestamp) - purge_delta
+        train_start_time = pd.Timestamp(unique_times[max(0, step - train_time_window)])
         train_frame = dataset.loc[
-            dataset["timestamp"] <= train_cutoff,
-            feature_columns + ["target", "timestamp"],
+            (dataset["timestamp"] >= train_start_time)
+            & (dataset["timestamp"] < timestamp)
+            & (dataset["label_available_time"] <= timestamp),
+            feature_columns + ["target", "timestamp", "label_available_time"],
         ].replace([np.inf, -np.inf], np.nan)
         train_frame = train_frame.dropna(subset=["target"])
-        if len(train_frame) > train_window:
-            train_frame = train_frame.tail(train_window)
         if max_train_rows > 0 and len(train_frame) > max_train_rows:
-            train_frame = train_frame.tail(max_train_rows)
+            timestamp_counts = train_frame.groupby("timestamp", sort=True).size().sort_index(ascending=False)
+            cumulative_rows = timestamp_counts.cumsum()
+            keep_times = cumulative_rows[cumulative_rows <= max_train_rows].index
+            if len(keep_times) == 0 and len(timestamp_counts):
+                keep_times = timestamp_counts.index[:1]
+            train_frame = train_frame[train_frame["timestamp"].isin(keep_times)]
+            train_frame = train_frame.sort_values(["timestamp"])
         if len(train_frame) < min_train_samples or train_frame["target"].nunique(dropna=True) < 2:
             continue
 
         if model is None or step - last_train_step >= retrain_every:
             train_target = train_frame["target"].astype("float64")
             train_features = train_frame[feature_columns]
-            sample_weight = build_training_sample_weights(train_target, config)
+            sample_weight = build_training_sample_weights(
+                train_target,
+                config,
+                timestamps=train_frame["timestamp"],
+            )
             model = train_composite_classifier(
                 model_name,
                 train_features,
@@ -274,6 +292,7 @@ def fit_predict_pooled_group(
                 feature_columns,
                 config,
                 sample_weight=sample_weight,
+                validation_groups=train_frame["timestamp"],
             )
             last_train_step = step
             train_rows_used = len(train_frame)
@@ -286,9 +305,19 @@ def fit_predict_pooled_group(
             CLASS_TO_TARGET[int(class_id)] for class_id in np.argmax(probability, axis=1)
         ]
 
-    result = dataset[["timestamp", "symbol", "group", "target", "future_horizon_return"]].copy()
+    result = dataset[
+        [
+            "timestamp",
+            "symbol",
+            "group",
+            "target",
+            "future_horizon_return",
+            "label_available_time",
+        ]
+    ].copy()
     result = result.join(predictions)
     result["train_rows_used_last"] = train_rows_used
+    result["train_time_window"] = train_time_window
     return result
 
 
@@ -556,6 +585,78 @@ def save_pooled_portfolio_outputs(
     print(f"pooled 组合层图表已保存: {plot_path}")
 
 
+def read_independent_composite_summary(symbol_config: BacktestConfig) -> dict[str, float | str]:
+    """读取逐品种独立综合模型摘要；缺失时返回空字典。"""
+    summary_path = Path(symbol_config.output_dir) / "composite_factor" / "composite_summary.csv"
+    if not summary_path.exists():
+        return {}
+    try:
+        raw = pd.read_csv(summary_path)
+    except Exception:
+        return {}
+    if raw.empty:
+        return {}
+
+    if "value" in raw.columns and len(raw.columns) >= 2:
+        key_column = raw.columns[0]
+        return {
+            str(row[key_column]): row["value"]
+            for _, row in raw.iterrows()
+            if str(row.get(key_column, "")).strip()
+        }
+    if len(raw) == 1:
+        return raw.iloc[0].to_dict()
+    return raw.tail(1).iloc[0].to_dict()
+
+
+def save_pooled_vs_independent_comparison(
+    pooled_summary: pd.DataFrame,
+    symbol_configs: dict[str, BacktestConfig],
+    output_dir: Path,
+) -> None:
+    """保存 pooled 共享模型与逐品种独立综合模型的横向对比。"""
+    if pooled_summary.empty:
+        return
+
+    comparable_metrics = ["累计收益", "年化收益", "夏普比率", "最大回撤", "胜率", "交易次数"]
+    rows = []
+    for _, row in pooled_summary.iterrows():
+        symbol = str(row.get("symbol", ""))
+        independent = read_independent_composite_summary(symbol_configs[symbol]) if symbol in symbol_configs else {}
+        output_row: dict[str, float | str | bool] = {
+            "symbol": symbol,
+            "group": row.get("group", ""),
+            "independent_summary_exists": bool(independent),
+        }
+        for metric in comparable_metrics:
+            pooled_value = pd.to_numeric(row.get(metric), errors="coerce")
+            independent_value = pd.to_numeric(independent.get(metric), errors="coerce")
+            output_row[f"pooled_{metric}"] = pooled_value
+            output_row[f"independent_{metric}"] = independent_value
+            output_row[f"delta_{metric}"] = pooled_value - independent_value
+        pooled_accuracy = pd.to_numeric(row.get("预测_方向目标准确率"), errors="coerce")
+        independent_accuracy = pd.to_numeric(independent.get("方向目标准确率"), errors="coerce")
+        output_row["pooled_预测方向准确率"] = pooled_accuracy
+        output_row["independent_预测方向准确率"] = independent_accuracy
+        output_row["delta_预测方向准确率"] = pooled_accuracy - independent_accuracy
+        rows.append(output_row)
+
+    comparison = pd.DataFrame(rows)
+    comparison_path = output_dir / "pooled_vs_independent_symbol_comparison.csv"
+    comparison.to_csv(comparison_path, index=False, encoding="utf-8-sig")
+
+    if "group" in comparison.columns and not comparison.empty:
+        numeric_columns = [column for column in comparison.columns if column.startswith(("pooled_", "independent_", "delta_"))]
+        group_comparison = comparison.groupby("group", dropna=False)[numeric_columns].mean(numeric_only=True).reset_index()
+        group_comparison["品种数"] = comparison.groupby("group", dropna=False)["symbol"].nunique().values
+        group_comparison.to_csv(
+            output_dir / "pooled_vs_independent_group_comparison.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    print(f"pooled/独立模型对比已保存: {comparison_path}")
+
+
 def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
     """运行多品种共享信息模型，并保存结果。"""
     output_dir = get_pooled_output_dir(config)
@@ -636,7 +737,15 @@ def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
         if len(usable_symbols) < min_symbols:
             continue
         group_dataset = pd.concat([symbol_datasets[symbol] for symbol in usable_symbols], axis=0, ignore_index=True)
-        metadata_columns = {"target", "future_horizon_return", "timestamp", "symbol", "group", "row_position"}
+        metadata_columns = {
+            "target",
+            "future_horizon_return",
+            "label_available_time",
+            "timestamp",
+            "symbol",
+            "group",
+            "row_position",
+        }
         feature_columns = [column for column in group_dataset.columns if column not in metadata_columns]
         print(f"训练 pooled 组 {group_name}: 品种数={len(usable_symbols)}, 样本数={len(group_dataset)}, 特征数={len(feature_columns)}")
         group_prediction = fit_predict_pooled_group(group_name, group_dataset, feature_columns, config)
@@ -679,6 +788,7 @@ def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
     summary = pd.DataFrame(summary_rows)
     if not summary.empty:
         summary.to_csv(output_dir / "pooled_symbol_summary.csv", index=False, encoding="utf-8-sig")
+        save_pooled_vs_independent_comparison(summary, symbol_configs, output_dir)
         group_summary = (
             summary.groupby("group", dropna=False)
             .agg(

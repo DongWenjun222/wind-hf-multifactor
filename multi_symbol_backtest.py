@@ -19,7 +19,8 @@ import pandas as pd
 
 from composite_factor_backtest import run_composite_backtest
 from config import BacktestConfig
-from factors import get_factor_prune_list_path, safe_symbol_name, stop_wind
+from factors import get_data_cache_path, get_factor_prune_list_path, safe_symbol_name, stop_wind
+from project_fingerprint import build_source_fingerprint_hash
 from single_factor_backtest import calculate_metrics, infer_annual_periods, run_single_factor_pipeline
 from runtime_utils import run_tracked
 
@@ -28,6 +29,29 @@ PORTFOLIO_METHODS = {
     "equal_weight": "等权组合",
     "inverse_vol": "波动率倒数加权",
     "positive_sharpe": "夏普正向加权",
+}
+
+PIPELINE_SOURCE_FILES = {
+    "single": [
+        Path("config.py"),
+        Path("data_loader.py"),
+        Path("factors.py"),
+        Path("single_factor_backtest.py"),
+        Path("factor_library.py"),
+        Path("factor_metadata.py"),
+        Path("factor_taxonomy.py"),
+        *sorted(Path("factor_builders").glob("*.py")),
+    ],
+    "composite": [
+        Path("config.py"),
+        Path("data_loader.py"),
+        Path("factors.py"),
+        Path("single_factor_backtest.py"),
+        Path("factor_library.py"),
+        Path("composite_factor_backtest.py"),
+        Path("project_fingerprint.py"),
+        *sorted(Path("factor_builders").glob("*.py")),
+    ],
 }
 
 
@@ -66,6 +90,67 @@ def get_symbol_composite_detail_path(config: BacktestConfig) -> Path:
     return Path(config.output_dir) / "composite_factor" / "composite_detail.csv"
 
 
+def build_pipeline_state(config: BacktestConfig, stage: str) -> dict[str, Any]:
+    """构造可用于判断断点结果是否仍有效的轻量状态。"""
+    config_snapshot = asdict(config)
+    config_snapshot.pop("run_id", None)
+    try:
+        configured_end = pd.Timestamp(config_snapshot.get("end_time"))
+        if abs((pd.Timestamp.now() - configured_end).total_seconds()) <= 3600:
+            config_snapshot["end_time"] = "__AUTO_NOW__"
+    except Exception:
+        pass
+    config_snapshot = json.loads(
+        json.dumps(config_snapshot, ensure_ascii=False, sort_keys=True, default=str)
+    )
+    data_path = get_data_cache_path(config)
+    data_state: dict[str, Any] = {"path": str(data_path)}
+    if data_path.exists():
+        stat = data_path.stat()
+        data_state.update(
+            {
+                "size_bytes": int(stat.st_size),
+                "modified_ns": int(stat.st_mtime_ns),
+            }
+        )
+    source_paths = PIPELINE_SOURCE_FILES.get(stage, [])
+    return {
+        "stage": stage,
+        "symbol": config.symbol,
+        "config": config_snapshot,
+        "source_hash": build_source_fingerprint_hash(source_paths),
+        "data": data_state,
+    }
+
+
+def get_pipeline_state_path(config: BacktestConfig, stage: str) -> Path:
+    """返回某品种某阶段的断点状态文件。"""
+    return Path(config.output_dir) / f".{stage}_pipeline_state.json"
+
+
+def pipeline_state_matches(config: BacktestConfig, stage: str) -> bool:
+    """检查已有结果是否由同一配置、源码和行情状态生成。"""
+    state_path = get_pipeline_state_path(config, stage)
+    if not state_path.exists():
+        return False
+    try:
+        saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return saved_state == build_pipeline_state(config, stage)
+
+
+def save_pipeline_state(config: BacktestConfig, stage: str) -> Path:
+    """在阶段成功完成后保存断点状态。"""
+    state_path = get_pipeline_state_path(config, stage)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(build_pipeline_state(config, stage), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return state_path
+
+
 def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
     """判断是否可以复用已存在的单因子库结果。"""
     if bool(getattr(config, "multi_symbol_always_update_active_library", True)):
@@ -79,7 +164,7 @@ def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
     if str(getattr(config, "single_factor_scope", "")).lower() == "new":
         return False
 
-    if not get_symbol_active_library_path(config).exists():
+    if not get_symbol_active_library_path(config).exists() or not pipeline_state_matches(config, "single"):
         return False
     if bool(getattr(config, "multi_symbol_rerun_empty_active_library", True)):
         return active_library_has_factors(config)
@@ -88,9 +173,11 @@ def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
 
 def should_skip_composite_pipeline(config: BacktestConfig) -> bool:
     """判断是否可以复用已存在的综合因子结果。"""
-    return bool(getattr(config, "multi_symbol_skip_existing", False)) and get_symbol_composite_detail_path(
-        config
-    ).exists()
+    return (
+        bool(getattr(config, "multi_symbol_skip_existing", False))
+        and get_symbol_composite_detail_path(config).exists()
+        and pipeline_state_matches(config, "composite")
+    )
 
 
 def load_existing_active_library(config: BacktestConfig) -> pd.DataFrame | None:
@@ -168,11 +255,13 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
             print(f"\n========== {config.symbol} 单因子流程 ==========")
             max_bars = int(getattr(config, "multi_symbol_single_factor_max_bars", 0) or 0)
             active_library = run_single_factor_pipeline(config, max_bars=max_bars)
+            save_pipeline_state(config, "single")
             single_factor_reran = True
             row["单因子状态"] = "完成"
         row.update(summarize_active_library(active_library))
     else:
-        row.update(summarize_active_library(None))
+        active_library = load_existing_active_library(config)
+        row.update(summarize_active_library(active_library))
 
     if config.multi_symbol_run_composite:
         if not single_factor_reran and should_skip_composite_pipeline(config):
@@ -182,6 +271,7 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
         else:
             print(f"\n========== {config.symbol} 综合因子流程 ==========")
             metrics = run_composite_backtest(config)
+            save_pipeline_state(config, "composite")
             row["综合因子状态"] = "完成"
         for key, value in metrics.items():
             row[f"综合_{key}"] = value
@@ -1206,12 +1296,12 @@ def run_multi_symbol_backtest(config: BacktestConfig) -> pd.DataFrame:
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / "multi_symbol_summary.csv"
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
-    if error_rows:
-        pd.DataFrame(error_rows).to_csv(
-            summary_dir / "multi_symbol_errors.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
+    error_columns = ["品种", "输出目录", "错误", "错误堆栈"]
+    pd.DataFrame(error_rows, columns=error_columns).to_csv(
+        summary_dir / "multi_symbol_errors.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     print(f"\n多品种汇总已保存: {summary_path}")
     update_factor_prune_list(config, summary, summary_dir)
     save_multi_symbol_portfolio(summary, config, summary_dir)

@@ -154,7 +154,7 @@ class BacktestConfig:
     multi_symbol_run_single_factor: bool = True
 
     # 多品种批量回测时是否为每个品种运行 XGBoost 综合因子流程。
-    multi_symbol_run_composite: bool = False#True
+    multi_symbol_run_composite: bool = False
 
     # 多品种批量回测时，每个品种是否使用独立输出目录。
     # 开启后输出目录形如 output_dir/by_symbol/C_DCE/，避免不同品种的因子库和结果互相覆盖。
@@ -338,6 +338,11 @@ class BacktestConfig:
     # 每个品种构建 pooled 数据集时最多使用最近多少根 K 线；0 表示不截断。
     pooled_model_max_bars_per_symbol: int = 12000
 
+    # pooled 共享模型滚动训练时，每次最多回看多少个历史时间点。
+    # None 表示沿用 xgboost_train_window。注意 pooled 数据是多品种 long-format，
+    # 因此这里用“时间点”而不是“long-format 行数”，避免品种越多时每个品种有效历史越短。
+    pooled_model_train_time_window: Optional[int] = None
+
     # 每个共享组至少需要多少个品种才训练；低于该值会跳过该组。
     pooled_model_min_symbols_per_group: int = 2
 
@@ -376,10 +381,15 @@ class BacktestConfig:
     zscore_window: int = 120
 
     # 单边手续费，单位 bps。1 bps = 0.01%。当前设为 0，表示不考虑手续费。
-    commission_bps: float = 0#0.5#0.5
+    commission_bps: float = 0.0
 
     # 单边滑点，单位 bps。当前设为 0，表示不考虑滑点。
-    slippage_bps: float = 0#0.5
+    slippage_bps: float = 0.0
+
+    # 策略收益的执行口径。
+    # "next_open_continuous"：信号在下一根开盘调仓，旧仓位承担跳空，新仓位承担开盘到收盘收益。
+    # "intrabar_only"：旧版兼容口径，只计算当前仓位的开盘到收盘收益，不计跨 K 线跳空。
+    backtest_return_mode: str = "next_open_continuous"
 
     # 综合回测成本压力测试档位，单位 bps。
     # 每个值表示“手续费+滑点”的单边总成本，用于在不重新训练模型的情况下重算策略表现。
@@ -503,7 +513,7 @@ class BacktestConfig:
     # 单因子测试范围。
     # "all"：测试全部因子；"new"：只测试编号 >= single_factor_new_factor_start_index 的新因子；
     # "range"：只测试指定编号区间；"selected"：只测试 single_factor_selected_factors 中指定的因子。
-    single_factor_scope: str = "range" # new # 可选："all"、"new"、"range"、"selected"
+    single_factor_scope: str = "range"  # 可选："all"、"new"、"range"、"selected"
 
     # 当 single_factor_scope="range" 时使用的因子编号区间，起止都包含。
     # 因子编号从 1 开始；如果写成 [0, 10000]，程序会自动按 [1, 10000] 处理。
@@ -725,14 +735,6 @@ class BacktestConfig:
     # 开启：训练集表现正向则顺用，反向更好则乘以 -1；关闭：全部按原始方向使用。
     auto_detect_factor_direction: bool = True
 
-    # 兼容旧配置：早期综合 best 选因使用的最低夏普要求。
-    # 新逻辑统一使用 factor_library_min_sharpe；该字段只保留给旧配置文件读取，不再作为独立门槛。
-    min_select_sharpe: float = 1
-
-    # 兼容旧配置：早期综合 best 选因使用的最低累计收益要求。
-    # 新逻辑统一使用 factor_library_min_total_return；该字段只保留给旧配置文件读取，不再作为独立门槛。
-    min_select_total_return: float = 0.0
-
     # 单因子训练/测试切分比例。0.7 表示前 70% 样本用于判断方向和训练内表现，后 30% 用于样本外测试。
     auto_select_train_ratio: float = 0.7
 
@@ -851,18 +853,18 @@ class BacktestConfig:
     # "signal"：只使用每个因子的 -1/0/1 多空信号；
     # "continuous"：只使用因子连续值；
     # "both"：同时使用信号和连续值。
-    xgboost_feature_mode: str = "both" #"both"  # 可选："signal"、"continuous"、"both"
+    xgboost_feature_mode: str = "both"  # 可选："signal"、"continuous"、"both"
 
     # 是否为 XGBoost 增加因子状态特征。
     # 状态特征包括因子变化量、上一期值、上一期信号、信号变化和连续同向信号长度。
-    xgboost_include_factor_state_features: bool = False#True
+    xgboost_include_factor_state_features: bool = False
 
     # 当 xgboost_feature_scope="best" 时，候选因子数量上限。
     xgboost_best_top_n: int = 50
 
     # 是否在每个滚动训练窗口内重新做特征选择。
     # 开启更符合样本外逻辑，也能适应阶段变化；关闭更快，但特征集合更静态。
-    xgboost_walk_forward_feature_selection: bool = False#True
+    xgboost_walk_forward_feature_selection: bool = False
 
     # 滚动特征选择时，先取 best_top_n 的多少倍作为候选池，再做相关性去重。
     # 例如 best_top_n=50 且候选倍数=5，则先看前 250 个候选。
@@ -878,10 +880,10 @@ class BacktestConfig:
 
     # XGBoost 交易信号的最低类别概率阈值。
     # 设为 0 表示不额外限制；调高后只有模型足够自信才开仓。
-    xgboost_trade_min_probability: float = 0 #0.55
+    xgboost_trade_min_probability: float = 0.0
 
     # 是否让每个滚动 XGBoost 模型在训练窗口内自动校准交易阈值。
-    xgboost_auto_calibrate_trade_thresholds: bool = False#True
+    xgboost_auto_calibrate_trade_thresholds: bool = False
 
     # 滚动阈值校准使用的候选概率差阈值。
     xgboost_trade_edge_grid: list[float] = field(
@@ -894,10 +896,10 @@ class BacktestConfig:
     )
 
     # 每组候选阈值至少需要产生的窗口内交易次数。
-    xgboost_threshold_min_trades: int = 0#5#10
+    xgboost_threshold_min_trades: int = 0
 
     # 是否在开仓前应用简单的市场状态过滤。
-    xgboost_trade_use_market_filters: bool = False#True
+    xgboost_trade_use_market_filters: bool = False
 
     # 用于估计波动率和流动性状态分位的滚动窗口。
     xgboost_trade_filter_window: int = 120
@@ -919,10 +921,10 @@ class BacktestConfig:
     allowed_market_state_regimes: list[str] = field(default_factory=list)
 
     # 允许交易所需的日内绝对收益滚动分位下限。
-    xgboost_trade_min_volatility_rank: float = 0#0.05#0.10
+    xgboost_trade_min_volatility_rank: float = 0.0
 
     # 允许交易所需的成交额或成交量滚动分位下限。
-    xgboost_trade_min_liquidity_rank: float = 0#0.05#0.10
+    xgboost_trade_min_liquidity_rank: float = 0.0
 
     # 是否按模型置信度动态调整仓位，而不是信号通过后总是满仓。
     xgboost_use_dynamic_position_sizing: bool = False
@@ -1002,7 +1004,7 @@ class BacktestConfig:
     xgboost_trade_confidence_rank_window: int = 240
 
     # 允许开仓所需的绝对置信度滚动分位下限。
-    xgboost_trade_min_confidence_rank: float = 0.3#0.50
+    xgboost_trade_min_confidence_rank: float = 0.30
 
     # 是否对模型训练样本应用同样的市场状态过滤。
     # 开启后模型会更关注更容易预测、也更适合交易的 K 线。

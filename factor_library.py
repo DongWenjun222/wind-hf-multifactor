@@ -399,12 +399,13 @@ def build_factor_library(
     ).reset_index(drop=True)
 
     available = set(factors.columns)
-    preserve_existing_active = (
-        str(getattr(config, "single_factor_scope", "")).lower() == "new"
-        and bool(getattr(factors, "attrs", {}).get("factor_id_map"))
-    )
+    partial_scope = str(getattr(config, "single_factor_scope", "")).lower() in {
+        "new",
+        "range",
+        "selected",
+    }
     existing_active_factors: set[str] = set()
-    if preserve_existing_active and not existing.empty and {"因子", "因子库状态"}.issubset(existing.columns):
+    if partial_scope and not existing.empty and {"因子", "因子库状态"}.issubset(existing.columns):
         existing_active_factors = set(
             existing.loc[existing["因子库状态"] == "active", "因子"].dropna().astype(str)
         )
@@ -493,17 +494,7 @@ def build_factor_library(
         family_quota_limit = get_family_quota_limit(config, family)
         family_count = selected_family_counts.get(family, 0)
 
-        if factor_name not in available and factor_name in existing_active_factors and len(selected) < keep_top_n:
-            if family_quota_limit is not None and family_count >= family_quota_limit:
-                status = "retired"
-                reject_reason = "family_quota_exceeded"
-            else:
-                status = "active"
-                reject_reason = "preserved_existing_active_incremental_run"
-                selected.append(factor_name)
-                selected_set.add(factor_name)
-                selected_family_counts[family] = family_count + 1
-        elif factor_name not in available:
+        if factor_name not in available:
             reject_reason = "factor_not_available"
         elif not bool(row.get("初筛有效", False)):
             reject_reason = "invalid_score"

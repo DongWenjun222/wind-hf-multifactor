@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import hashlib
 import warnings
 
 import matplotlib.pyplot as plt
@@ -89,19 +90,39 @@ def build_factor_cache_meta(
     config: BacktestConfig,
 ) -> dict[str, Any]:
     """生成 active 因子矩阵缓存的轻量校验信息。"""
+    hash_columns = [
+        column
+        for column in ["open", "high", "low", "close", "volume", "amt", "amount"]
+        if column in data.columns
+    ]
+    hash_frame = data[hash_columns] if hash_columns else data
+    data_hash_values = pd.util.hash_pandas_object(hash_frame, index=True).to_numpy()
+    data_content_hash = hashlib.sha256(data_hash_values.tobytes()).hexdigest()
     return {
         "symbol": config.symbol,
         "bar_size": int(config.bar_size),
         "start": str(data.index.min()) if len(data.index) else "",
         "end": str(data.index.max()) if len(data.index) else "",
         "rows": int(len(data.index)),
+        "data_columns": hash_columns,
+        "data_content_hash": data_content_hash,
         "requested_factors": list(requested_factors),
         "zscore_window": int(config.zscore_window),
         "signal_threshold": float(config.signal_threshold),
         "enable_cross_asset_factors": bool(getattr(config, "enable_cross_asset_factors", False)),
         "enable_macro_state_factors": bool(getattr(config, "enable_macro_state_factors", False)),
+        "enable_external_daily_factors": bool(getattr(config, "enable_external_daily_factors", False)),
         "related_symbols": list(getattr(config, "related_symbols", []) or []),
+        "cross_asset_factor_windows": list(getattr(config, "cross_asset_factor_windows", []) or []),
+        "cross_asset_max_ffill_bars": int(getattr(config, "cross_asset_max_ffill_bars", 0) or 0),
+        "cross_asset_max_factors": getattr(config, "cross_asset_max_factors", None),
         "macro_state_symbols": list(getattr(config, "macro_state_symbols", []) or []),
+        "macro_state_field": str(getattr(config, "macro_state_field", "close") or "close"),
+        "macro_state_windows": list(getattr(config, "macro_state_windows", []) or []),
+        "macro_state_lag_daily_bars": int(getattr(config, "macro_state_lag_daily_bars", 0) or 0),
+        "external_daily_sources": list(getattr(config, "external_daily_sources", []) or []),
+        "external_daily_windows": list(getattr(config, "external_daily_windows", []) or []),
+        "external_daily_lag_daily_bars": int(getattr(config, "external_daily_lag_daily_bars", 0) or 0),
         "factor_source_hash": build_source_fingerprint_hash(),
     }
 
@@ -1148,6 +1169,7 @@ def train_xgboost_classifier(
     feature_columns: list[str],
     config: BacktestConfig,
     sample_weight: pd.Series | None = None,
+    validation_groups: pd.Series | None = None,
 ) -> Any:
     """训练单个 XGBoost 三分类模型。
 
@@ -1167,10 +1189,17 @@ def train_xgboost_classifier(
         validation_size = min(validation_size, max(0, len(train_features) - 50))
 
     if validation_size > 0:
-        fit_features = train_features.iloc[:-validation_size]
+        validation_start = len(train_features) - validation_size
+        if validation_groups is not None:
+            aligned_groups = validation_groups.reindex(train_features.index)
+            boundary_group = aligned_groups.iloc[validation_start]
+            group_positions = np.flatnonzero(aligned_groups.eq(boundary_group).to_numpy())
+            if len(group_positions):
+                validation_start = int(group_positions[0])
+        fit_features = train_features.iloc[:validation_start]
         fit_target = train_target.reindex(fit_features.index)
         fit_weight = sample_weight.reindex(fit_features.index).fillna(1.0) if sample_weight is not None else None
-        validation_features = train_features.iloc[-validation_size:]
+        validation_features = train_features.iloc[validation_start:]
         validation_target = train_target.reindex(validation_features.index)
         validation_weight = (
             sample_weight.reindex(validation_features.index).fillna(1.0)
@@ -1353,6 +1382,7 @@ def train_composite_classifier(
     feature_columns: list[str],
     config: BacktestConfig,
     sample_weight: pd.Series | None = None,
+    validation_groups: pd.Series | None = None,
 ) -> Any:
     """按模型名称训练综合三分类模型。"""
     if model_name == "xgboost":
@@ -1362,6 +1392,7 @@ def train_composite_classifier(
             feature_columns,
             config,
             sample_weight=sample_weight,
+            validation_groups=validation_groups,
         )
     return train_sklearn_classifier(
         model_name,
@@ -1428,6 +1459,7 @@ def get_model_feature_importance(
 def build_training_sample_weights(
     train_target: pd.Series,
     config: BacktestConfig,
+    timestamps: pd.Series | None = None,
 ) -> pd.Series:
     """构造逐样本权重，同时支持类别权重和时间衰减权重。"""
     neutral_weight = max(
@@ -1449,7 +1481,25 @@ def build_training_sample_weights(
                 0.0,
                 min(1.0, float(getattr(config, "xgboost_train_time_decay_min_weight", 0.0) or 0.0)),
             )
-            age_from_window_end = len(weights) - 1 - np.arange(len(weights), dtype="float64")
+            if timestamps is not None:
+                aligned_timestamps = pd.to_datetime(
+                    timestamps.reindex(train_target.index),
+                    errors="coerce",
+                )
+                ordered_times = pd.Index(aligned_timestamps.dropna().unique()).sort_values()
+                time_rank = pd.Series(
+                    np.arange(len(ordered_times), dtype="float64"),
+                    index=ordered_times,
+                )
+                sample_rank = aligned_timestamps.map(time_rank)
+                fallback_rank = pd.Series(
+                    np.arange(len(weights), dtype="float64"),
+                    index=weights.index,
+                )
+                sample_rank = sample_rank.fillna(fallback_rank)
+                age_from_window_end = float(sample_rank.max()) - sample_rank.to_numpy(dtype="float64")
+            else:
+                age_from_window_end = len(weights) - 1 - np.arange(len(weights), dtype="float64")
             time_weight = np.power(0.5, age_from_window_end / half_life)
             time_weight = np.maximum(time_weight, min_time_weight)
             if bool(getattr(config, "xgboost_train_time_decay_normalize", True)):
@@ -2592,6 +2642,7 @@ def save_composite_outputs(
     split_time: pd.Timestamp,
     validation_end_time: pd.Timestamp,
     config: BacktestConfig,
+    primary_model_name: str = "xgboost",
     selection_summary: pd.DataFrame | None = None,
     segment_backtests: dict[str, pd.DataFrame] | None = None,
 ) -> None:
@@ -2608,7 +2659,7 @@ def save_composite_outputs(
     backtest_df.to_csv(output_dir / "composite_detail.csv", encoding="utf-8-sig")
 
     summary = pd.Series(metrics, name="value")
-    summary.loc["模型"] = "xgboost_rolling_multiclass"
+    summary.loc["模型"] = f"{primary_model_name}_rolling_multiclass"
     summary.loc["训练验证切分时间"] = str(split_time)
     summary.loc["验证测试切分时间"] = str(validation_end_time)
     summary.loc["预测目标"] = "future_horizon_return_direction(-1,0,1)"
@@ -2979,6 +3030,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                     split_time,
                     validation_end_time,
                     config,
+                    primary_model_name=model_name,
                     selection_summary=(
                         rolling_selection_summary
                         if rolling_selection_summary is not None
