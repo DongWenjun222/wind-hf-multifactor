@@ -8,16 +8,16 @@ from pathlib import Path
 
 CORE_FINGERPRINT_FILES = [
     Path("config.py"),
-    Path("data_loader.py"),
-    Path("factors.py"),
+    Path("framework/data_loader.py"),
+    Path("framework/factors.py"),
     Path("factor_metadata.py"),
-    Path("factor_taxonomy.py"),
+    Path("framework/factor_taxonomy.py"),
 ]
 
 
 def get_default_fingerprint_files() -> list[Path]:
     """自动收集所有会影响因子值或因子分类的源码文件。"""
-    builder_files = sorted(Path("factor_builders").glob("*.py"))
+    builder_files = sorted(Path("framework/factor_builders").glob("*.py"))
     return list(dict.fromkeys([*CORE_FINGERPRINT_FILES, *builder_files]))
 
 

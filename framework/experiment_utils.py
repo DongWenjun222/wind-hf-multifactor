@@ -16,7 +16,7 @@ from typing import Iterable
 import pandas as pd
 
 from config import BacktestConfig
-from factor_library import get_factor_library_dir
+from .factor_library import get_factor_library_dir
 
 
 def get_run_id(config: BacktestConfig, run_type: str) -> str:
@@ -37,10 +37,14 @@ def get_experiment_run_dir(config: BacktestConfig, run_type: str) -> Path | None
     return run_dir
 
 
-def write_run_config(config: BacktestConfig, output_dir: Path) -> None:
+def write_run_config(
+    config: BacktestConfig,
+    output_dir: Path,
+    filename: str = "run_config.json",
+) -> None:
     """保存本次运行实际使用的完整配置。"""
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "run_config.json").open("w", encoding="utf-8") as config_file:
+    with (output_dir / filename).open("w", encoding="utf-8") as config_file:
         json.dump(asdict(config), config_file, ensure_ascii=False, indent=2, default=str)
 
 

@@ -16,6 +16,7 @@ from .common import (
 def add_complex_non_cross_factors(
     df: pd.DataFrame,
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成更复杂的主品种自身因子。
 
@@ -63,6 +64,7 @@ def add_complex_non_cross_factors(
 
     windows = [2, 3, 4, 5, 6, 8, 10, 13, 16, 21, 26, 34, 42, 55, 68, 89, 110, 144, 178, 233]
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
 
     ultra_inputs = {
         "bar_return": bar_return,
@@ -95,6 +97,11 @@ def add_complex_non_cross_factors(
     for window in windows:
         half_window = max(2, window // 2)
         for input_name, input_value in ultra_inputs.items():
+            if requested_set and not any(
+                name.startswith("ultra_") and name.endswith(f"_{input_name}_{window}")
+                for name in requested_set
+            ):
+                continue
             rolling_mean = input_value.rolling(window).mean()
             rolling_std = input_value.rolling(window).std().replace(0, np.nan)
             rolling_abs = input_value.abs()
@@ -130,6 +137,8 @@ def add_complex_non_cross_factors(
             )
 
     factor_specs = factor_specs[:10000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
     return pd.DataFrame(
         {
             factor_name: rolling_zscore(raw_factor, config.zscore_window)
@@ -141,6 +150,7 @@ def add_complex_non_cross_factors(
 def add_hyper_non_cross_factors(
     df: pd.DataFrame,
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成更高阶的主品种自身交互因子。"""
     close = df["close"].replace(0, np.nan)
@@ -184,6 +194,7 @@ def add_hyper_non_cross_factors(
 
     windows = [2, 3, 4, 5, 6, 8, 10, 13, 16, 21, 26, 34, 42, 55, 68, 89, 110, 144, 178, 233]
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
     hyper_inputs = {
         "ret_x_vol": bar_return * volume_change,
         "ret_x_amt": bar_return * amount_change,
@@ -216,6 +227,11 @@ def add_hyper_non_cross_factors(
         half_window = max(2, window // 2)
         double_window = min(240, max(window + 1, window * 2))
         for input_name, input_value in hyper_inputs.items():
+            if requested_set and not any(
+                name.startswith("hyper_") and name.endswith(f"_{input_name}_{window}")
+                for name in requested_set
+            ):
+                continue
             rolling_mean = input_value.rolling(window).mean()
             rolling_std = input_value.rolling(window).std().replace(0, np.nan)
             slow_mean = input_value.rolling(double_window).mean()
@@ -250,6 +266,8 @@ def add_hyper_non_cross_factors(
             )
 
     factor_specs = factor_specs[:10000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
     return pd.DataFrame(
         {
             factor_name: rolling_zscore(raw_factor, config.zscore_window)
@@ -261,6 +279,7 @@ def add_hyper_non_cross_factors(
 def add_omega_non_cross_factors(
     df: pd.DataFrame,
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成第四批主品种复杂因子，覆盖更高阶的量价形态交互。"""
     close = df["close"].replace(0, np.nan)
@@ -307,6 +326,7 @@ def add_omega_non_cross_factors(
 
     windows = [2, 3, 4, 5, 6, 8, 10, 13, 16, 21, 26, 34, 42, 55, 68, 89, 110, 144, 178, 233]
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
     omega_inputs = {
         "ret_pressure": bar_return * price_pressure,
         "intrabar_pressure": intrabar_return * price_pressure,
@@ -382,15 +402,23 @@ def add_omega_non_cross_factors(
         half_window = max(2, window // 2)
         double_window = min(240, max(window + 1, window * 2))
         for input_name, input_value in omega_inputs.items():
+            if requested_set and not any(
+                name.startswith("omega_") and name.endswith(f"_{input_name}_{window}")
+                for name in requested_set
+            ):
+                continue
             rolling_mean = input_value.rolling(window).mean()
             rolling_std = input_value.rolling(window).std().replace(0, np.nan)
             slow_mean = input_value.rolling(double_window).mean()
             slow_std = input_value.rolling(double_window).std().replace(0, np.nan)
             abs_sum = input_value.abs().rolling(window).sum().replace(0, np.nan)
             for transform_name, transform_func in transforms:
+                factor_name = f"omega_{transform_name}_{input_name}_{window}"
+                if requested_set and factor_name not in requested_set:
+                    continue
                 factor_specs.append(
                     (
-                        f"omega_{transform_name}_{input_name}_{window}",
+                        factor_name,
                         transform_func(
                             input_value,
                             window,

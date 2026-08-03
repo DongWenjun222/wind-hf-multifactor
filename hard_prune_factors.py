@@ -4,7 +4,7 @@ from __future__ import annotations
 
 这个脚本用于把多品种回测形成的淘汰池真正落到因子构造源码层面：
 1. 读取 factor_prune_list.csv，把候选淘汰因子合并进 factor_hard_delete_pool.csv。
-2. 扫描 factors.py 和 factor_builders/*.py 中形如 (f"factor_name_{window}", formula), 的一行公式。
+2. 扫描 framework/factors.py 和 framework/factor_builders/*.py 中的单行公式。
 3. 若硬删池中的因子能匹配到某条公式模板，则删除该公式行。
 4. 执行 --apply 前会自动备份实际修改的源码文件；不带 --apply 时只生成报告，不改代码。
 
@@ -24,8 +24,8 @@ from pathlib import Path
 
 
 DEFAULT_OUTPUT_DIR = Path("wind_hf_multifactor_output")
-DEFAULT_FACTORS_FILE = Path("factors.py")
-DEFAULT_FACTOR_BUILDERS_DIR = Path("factor_builders")
+DEFAULT_FACTORS_FILE = Path("framework/factors.py")
+DEFAULT_FACTOR_BUILDERS_DIR = Path("framework/factor_builders")
 DEFAULT_PRUNE_LIST = DEFAULT_OUTPUT_DIR / "factor_prune_list.csv"
 DEFAULT_HARD_DELETE_POOL = DEFAULT_OUTPUT_DIR / "factor_hard_delete_pool.csv"
 DEFAULT_REPORT = DEFAULT_OUTPUT_DIR / "factor_hard_delete_report.csv"
@@ -196,7 +196,7 @@ def main() -> None:
     parser.add_argument(
         "--factors-file",
         default=None,
-        help="兼容旧用法：只扫描指定的单个源码文件；默认扫描 factors.py 和 factor_builders/*.py。",
+        help="兼容旧用法：只扫描指定源码；默认扫描 framework/factors.py 和 framework/factor_builders/*.py。",
     )
     parser.add_argument("--prune-list", default=str(DEFAULT_PRUNE_LIST), help="软淘汰清单 CSV。")
     parser.add_argument("--pool", default=str(DEFAULT_HARD_DELETE_POOL), help="硬删除池 CSV。")

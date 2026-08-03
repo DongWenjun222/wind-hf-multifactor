@@ -17,12 +17,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from composite_factor_backtest import run_composite_backtest
-from config import BacktestConfig
-from factors import get_data_cache_path, get_factor_prune_list_path, safe_symbol_name, stop_wind
-from project_fingerprint import build_source_fingerprint_hash
+from composite_factor_backtest import (
+    get_active_factor_library_path,
+    get_composite_artifact_manifest_path,
+    load_composite_artifact_manifest,
+    run_composite_backtest,
+)
+from config import BacktestConfig, report_config_validation
+from framework.factor_library import conservative_pair
+from framework.factors import get_data_cache_path, get_factor_prune_list_path, safe_symbol_name, stop_wind
+from framework.project_fingerprint import build_source_fingerprint_hash, hash_file
 from single_factor_backtest import calculate_metrics, infer_annual_periods, run_single_factor_pipeline
-from runtime_utils import run_tracked
+from framework.runtime_utils import run_tracked, write_json_atomic
 
 
 PORTFOLIO_METHODS = {
@@ -31,26 +37,39 @@ PORTFOLIO_METHODS = {
     "positive_sharpe": "夏普正向加权",
 }
 
+MULTI_SYMBOL_PORTFOLIO_OUTPUT_FILES = [
+    "multi_symbol_portfolio_detail.csv",
+    "multi_symbol_portfolio_summary.csv",
+    "multi_symbol_portfolio_weights.csv",
+    "multi_symbol_opportunity_scores.csv",
+    "multi_symbol_opportunity_selection.csv",
+    "multi_symbol_portfolio_contribution.csv",
+    "multi_symbol_group_weights.csv",
+    "multi_symbol_group_contribution.csv",
+    "multi_symbol_strategy_return_corr.csv",
+    "multi_symbol_portfolio_report.png",
+]
+
 PIPELINE_SOURCE_FILES = {
     "single": [
         Path("config.py"),
-        Path("data_loader.py"),
-        Path("factors.py"),
+        Path("framework/data_loader.py"),
+        Path("framework/factors.py"),
         Path("single_factor_backtest.py"),
-        Path("factor_library.py"),
+        Path("framework/factor_library.py"),
         Path("factor_metadata.py"),
-        Path("factor_taxonomy.py"),
-        *sorted(Path("factor_builders").glob("*.py")),
+        Path("framework/factor_taxonomy.py"),
+        *sorted(Path("framework/factor_builders").glob("*.py")),
     ],
     "composite": [
         Path("config.py"),
-        Path("data_loader.py"),
-        Path("factors.py"),
+        Path("framework/data_loader.py"),
+        Path("framework/factors.py"),
         Path("single_factor_backtest.py"),
-        Path("factor_library.py"),
+        Path("framework/factor_library.py"),
         Path("composite_factor_backtest.py"),
-        Path("project_fingerprint.py"),
-        *sorted(Path("factor_builders").glob("*.py")),
+        Path("framework/project_fingerprint.py"),
+        *sorted(Path("framework/factor_builders").glob("*.py")),
     ],
 }
 
@@ -90,6 +109,22 @@ def get_symbol_composite_detail_path(config: BacktestConfig) -> Path:
     return Path(config.output_dir) / "composite_factor" / "composite_detail.csv"
 
 
+def build_input_file_state(path: Path) -> dict[str, Any]:
+    """记录关键输入文件状态和内容哈希，避免同尺寸文件变化后误用旧断点。"""
+    state: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if not path.exists() or not path.is_file():
+        return state
+    stat = path.stat()
+    state.update(
+        {
+            "size_bytes": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+            "sha256": hash_file(path),
+        }
+    )
+    return state
+
+
 def build_pipeline_state(config: BacktestConfig, stage: str) -> dict[str, Any]:
     """构造可用于判断断点结果是否仍有效的轻量状态。"""
     config_snapshot = asdict(config)
@@ -114,12 +149,22 @@ def build_pipeline_state(config: BacktestConfig, stage: str) -> dict[str, Any]:
             }
         )
     source_paths = PIPELINE_SOURCE_FILES.get(stage, [])
+    input_files: dict[str, Any] = {}
+    if stage == "single":
+        input_files["factor_prune_list"] = build_input_file_state(
+            get_factor_prune_list_path(config)
+        )
+    elif stage == "composite":
+        input_files["active_factor_library"] = build_input_file_state(
+            get_active_factor_library_path(config)
+        )
     return {
         "stage": stage,
         "symbol": config.symbol,
         "config": config_snapshot,
         "source_hash": build_source_fingerprint_hash(source_paths),
         "data": data_state,
+        "input_files": input_files,
     }
 
 
@@ -143,12 +188,7 @@ def pipeline_state_matches(config: BacktestConfig, stage: str) -> bool:
 def save_pipeline_state(config: BacktestConfig, stage: str) -> Path:
     """在阶段成功完成后保存断点状态。"""
     state_path = get_pipeline_state_path(config, stage)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps(build_pipeline_state(config, stage), ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-    return state_path
+    return write_json_atomic(state_path, build_pipeline_state(config, stage))
 
 
 def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
@@ -173,11 +213,24 @@ def should_skip_single_factor_pipeline(config: BacktestConfig) -> bool:
 
 def should_skip_composite_pipeline(config: BacktestConfig) -> bool:
     """判断是否可以复用已存在的综合因子结果。"""
-    return (
+    state_reusable = (
         bool(getattr(config, "multi_symbol_skip_existing", False))
         and get_symbol_composite_detail_path(config).exists()
         and pipeline_state_matches(config, "composite")
     )
+    if not state_reusable:
+        return False
+    if not bool(
+        getattr(config, "multi_symbol_require_composite_artifact_manifest", True)
+    ):
+        return True
+    artifact_dir = Path(config.output_dir) / "composite_factor"
+    artifact, _ = load_composite_artifact_manifest(
+        artifact_dir,
+        expected_symbol=config.symbol,
+        verify_outputs=True,
+    )
+    return artifact is not None
 
 
 def load_existing_active_library(config: BacktestConfig) -> pd.DataFrame | None:
@@ -194,6 +247,8 @@ def load_existing_active_library(config: BacktestConfig) -> pd.DataFrame | None:
 def build_symbol_config(base_config: BacktestConfig, symbol: str) -> BacktestConfig:
     """基于全局配置创建单个品种的配置副本。"""
     symbol_config = replace(base_config, symbol=symbol)
+    if bool(getattr(base_config, "_validation_reported", False)):
+        setattr(symbol_config, "_validation_reported", True)
     prune_path = Path(getattr(base_config, "factor_prune_list_path", "factor_prune_list.csv"))
     if not prune_path.is_absolute():
         symbol_config.factor_prune_list_path = str(Path(base_config.output_dir) / prune_path)
@@ -226,8 +281,11 @@ def summarize_active_library(active_library: pd.DataFrame | None) -> dict[str, A
         }
     sharpe = pd.to_numeric(active_library.get("初筛夏普"), errors="coerce")
     if sharpe.isna().all():
-        fallback_column = "验证夏普比率" if "验证夏普比率" in active_library.columns else "测试夏普比率"
-        sharpe = pd.to_numeric(active_library.get(fallback_column), errors="coerce")
+        sharpe = conservative_pair(
+            active_library,
+            "训练夏普比率",
+            "验证夏普比率",
+        )
     return {
         "active因子数": int(len(active_library)),
         "active平均入库夏普": float(sharpe.mean()) if sharpe.notna().any() else np.nan,
@@ -275,6 +333,23 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
             row["综合因子状态"] = "完成"
         for key, value in metrics.items():
             row[f"综合_{key}"] = value
+        artifact_dir = Path(config.output_dir) / "composite_factor"
+        artifact, artifact_error = load_composite_artifact_manifest(
+            artifact_dir,
+            expected_symbol=config.symbol,
+            verify_outputs=True,
+        )
+        row["综合产物清单"] = str(get_composite_artifact_manifest_path(artifact_dir))
+        row["综合产物有效"] = artifact is not None
+        row["综合产物错误"] = artifact_error
+        if artifact is not None:
+            row["综合产物运行编号"] = artifact.get("run_id", "")
+            row["综合产物配置哈希"] = artifact.get("config_sha256", "")
+            row["综合明细哈希"] = (
+                artifact.get("outputs", {})
+                .get("composite_detail", {})
+                .get("sha256", "")
+            )
 
     return row
 
@@ -338,10 +413,19 @@ def read_single_factor_summary_for_pruning(symbol: str, output_dir: str) -> pd.D
     if "因子" not in summary.columns:
         return pd.DataFrame()
 
-    sharpe_column = "初筛夏普" if "初筛夏普" in summary.columns else "测试夏普比率"
-    return_column = "初筛累计收益" if "初筛累计收益" in summary.columns else "测试累计收益"
-    summary = summary[["因子", sharpe_column, return_column]].copy()
-    summary.columns = ["因子", "初筛夏普", "初筛累计收益"]
+    summary = summary.copy()
+    summary["初筛夏普"] = conservative_pair(
+        summary,
+        "训练夏普比率",
+        "验证夏普比率",
+    )
+    summary["初筛累计收益"] = conservative_pair(
+        summary,
+        "训练累计收益",
+        "验证累计收益",
+    )
+    summary = summary[["因子", "初筛夏普", "初筛累计收益"]].copy()
+    summary = summary.dropna(subset=["初筛夏普", "初筛累计收益"], how="all")
     summary["品种"] = symbol
     summary["初筛夏普"] = pd.to_numeric(summary["初筛夏普"], errors="coerce")
     summary["初筛累计收益"] = pd.to_numeric(summary["初筛累计收益"], errors="coerce")
@@ -933,16 +1017,87 @@ def save_multi_symbol_portfolio(
 ) -> None:
     """基于各品种最终测试集收益生成多种组合明细、摘要和图表。"""
     detail_frames = []
+    input_rows: list[dict[str, Any]] = []
+    require_manifest = bool(
+        getattr(config, "multi_symbol_require_composite_artifact_manifest", True)
+    )
     for _, row in summary.iterrows():
-        if row.get("综合因子状态") not in {"完成", "复用已有结果"}:
-            continue
         symbol = str(row.get("品种", ""))
         output_dir = str(row.get("输出目录", ""))
+        composite_status = row.get("综合因子状态")
+        if composite_status not in {"完成", "复用已有结果"}:
+            input_rows.append(
+                {
+                    "品种": symbol,
+                    "输出目录": output_dir,
+                    "综合因子状态": composite_status,
+                    "产物清单": "",
+                    "产物有效": False,
+                    "进入组合": False,
+                    "拒绝原因": "本轮未完成或未复用综合因子流程",
+                }
+            )
+            continue
+        artifact_dir = Path(output_dir) / "composite_factor"
+        artifact, artifact_error = load_composite_artifact_manifest(
+            artifact_dir,
+            expected_symbol=symbol,
+            verify_outputs=True,
+        )
+        input_row: dict[str, Any] = {
+            "品种": symbol,
+            "输出目录": output_dir,
+            "综合因子状态": composite_status,
+            "产物清单": str(get_composite_artifact_manifest_path(artifact_dir)),
+            "产物有效": artifact is not None,
+            "进入组合": False,
+            "拒绝原因": artifact_error,
+        }
+        if artifact is not None:
+            input_row.update(
+                {
+                    "上游运行编号": artifact.get("run_id", ""),
+                    "上游模型": artifact.get("model_name", ""),
+                    "上游配置哈希": artifact.get("config_sha256", ""),
+                    "综合明细哈希": (
+                        artifact.get("outputs", {})
+                        .get("composite_detail", {})
+                        .get("sha256", "")
+                    ),
+                    "明细开始": artifact.get("detail_start", ""),
+                    "明细结束": artifact.get("detail_end", ""),
+                    "明细行数": artifact.get("detail_rows", 0),
+                }
+            )
+        input_rows.append(input_row)
+        if require_manifest and artifact is None:
+            print(f"组合层跳过 {symbol}: {artifact_error}")
+            continue
         detail = load_symbol_composite_detail(symbol, output_dir)
         if detail is not None and not detail.empty:
             detail_frames.append(detail)
+            input_row["进入组合"] = True
+            if artifact is None:
+                input_row["拒绝原因"] = "兼容模式：未验证产物清单"
+        else:
+            input_row["拒绝原因"] = "综合明细缺失、为空或字段不完整"
+
+    pd.DataFrame(input_rows).to_csv(
+        summary_dir / "multi_symbol_portfolio_inputs.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    clear_stale_outputs = bool(
+        getattr(config, "multi_symbol_clear_stale_portfolio_outputs", True)
+    )
+    if clear_stale_outputs:
+        for filename in MULTI_SYMBOL_PORTFOLIO_OUTPUT_FILES:
+            path = summary_dir / filename
+            if path.exists() and path.is_file():
+                path.unlink()
 
     if not detail_frames:
+        print("本轮没有通过产物校验的综合结果，未生成组合并已清理旧 latest 组合产物。")
         return
 
     portfolio = pd.concat(detail_frames, axis=1).sort_index()
@@ -1222,6 +1377,66 @@ def save_multi_symbol_portfolio(
     print(f"多品种组合图表已保存: {plot_path}")
 
 
+def build_manifest_output_entry(path: Path, summary_dir: Path) -> dict[str, Any]:
+    """构造轻量文件索引；只对较小的 JSON 状态文件计算内容哈希。"""
+    resolved_path = path.resolve()
+    resolved_summary_dir = summary_dir.resolve()
+    try:
+        display_path = str(resolved_path.relative_to(resolved_summary_dir))
+    except ValueError:
+        display_path = str(resolved_path)
+    stat = resolved_path.stat()
+    entry: dict[str, Any] = {
+        "path": display_path,
+        "size_bytes": int(stat.st_size),
+        "modified_time": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(
+            timespec="seconds"
+        ),
+    }
+    if resolved_path.suffix.lower() == ".json":
+        entry["sha256"] = hash_file(resolved_path)
+    return entry
+
+
+def collect_multi_symbol_manifest_outputs(
+    summary: pd.DataFrame,
+    summary_dir: Path,
+) -> list[dict[str, Any]]:
+    """仅索引本轮汇总和每个品种的关键状态，避免递归扫描全部历史输出。"""
+    root_names = {
+        "multi_symbol_summary.csv",
+        "multi_symbol_errors.csv",
+        "multi_symbol_portfolio_inputs.csv",
+        "factor_pruning_candidates.csv",
+        *MULTI_SYMBOL_PORTFOLIO_OUTPUT_FILES,
+    }
+    symbol_relative_paths = (
+        Path(".single_pipeline_state.json"),
+        Path(".composite_pipeline_state.json"),
+        Path("factor_library") / "active_factors.csv",
+        Path("single_factor") / "single_factor_all_summary.csv",
+        Path("composite_factor") / "active_library_oos_audit.json",
+        Path("composite_factor") / "composite_artifact_manifest.json",
+        Path("composite_factor") / "composite_detail.csv",
+        Path("composite_factor") / "composite_summary.csv",
+    )
+    candidates = [summary_dir / name for name in sorted(root_names)]
+    if "输出目录" in summary.columns:
+        for output_dir in summary["输出目录"].dropna().astype(str):
+            symbol_dir = Path(output_dir)
+            candidates.extend(symbol_dir / relative_path for relative_path in symbol_relative_paths)
+
+    entries = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved_path = path.resolve()
+        if resolved_path in seen or not resolved_path.is_file():
+            continue
+        seen.add(resolved_path)
+        entries.append(build_manifest_output_entry(resolved_path, summary_dir))
+    return sorted(entries, key=lambda item: str(item["path"]))
+
+
 def write_multi_symbol_run_manifest(
     summary: pd.DataFrame,
     config: BacktestConfig,
@@ -1229,18 +1444,8 @@ def write_multi_symbol_run_manifest(
     error_rows: list[dict[str, Any]],
 ) -> None:
     """保存多品种批量运行清单，方便复现、排错和生产化监控。"""
-    output_files = []
-    for path in sorted(summary_dir.rglob("*")):
-        if path.is_file():
-            output_files.append(
-                {
-                    "path": str(path.relative_to(summary_dir)),
-                    "size_bytes": int(path.stat().st_size),
-                    "modified_time": dt.datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
-                }
-            )
-
     manifest = {
+        "schema_version": 2,
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "symbols": [str(symbol) for symbol in config.symbols],
         "bar_size": int(config.bar_size),
@@ -1251,14 +1456,15 @@ def write_multi_symbol_run_manifest(
         "symbol_status": summary.to_dict("records"),
         "error_count": int(len(error_rows)),
         "errors": error_rows,
-        "output_files": output_files,
+        "output_index_scope": "current_root_and_symbol_key_artifacts",
+        "output_files": collect_multi_symbol_manifest_outputs(summary, summary_dir),
     }
-    with (summary_dir / "multi_symbol_run_manifest.json").open("w", encoding="utf-8") as file:
-        json.dump(manifest, file, ensure_ascii=False, indent=2, default=str)
+    write_json_atomic(summary_dir / "multi_symbol_run_manifest.json", manifest)
 
 
 def run_multi_symbol_backtest(config: BacktestConfig) -> pd.DataFrame:
     """按 symbols 批量运行多品种回测，并保存跨品种汇总。"""
+    report_config_validation(config, "multi")
     symbols = [str(symbol).strip() for symbol in config.symbols if str(symbol).strip()]
     if not symbols:
         raise ValueError("config.symbols 为空，无法运行多品种回测。")

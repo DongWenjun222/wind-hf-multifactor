@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
-from data_loader import (
+from .data_loader import (
     ensure_wind_started as data_ensure_wind_started,
     fetch_external_daily_data as data_fetch_external_daily_data,
     fetch_intraday_data as data_fetch_intraday_data,
@@ -34,7 +34,7 @@ from data_loader import (
     safe_symbol_name as data_safe_symbol_name,
     stop_wind as data_stop_wind,
 )
-from factor_builders import (
+from .factor_builders import (
     add_basic_factors,
     add_calendar_seasonality_factors,
     add_complex_cross_asset_factors,
@@ -48,7 +48,7 @@ from factor_builders import (
     add_omega_non_cross_factors,
     add_parametric_factors,
 )
-from factor_builders.cross_asset import get_last_related_data_coverage as get_cross_asset_data_coverage
+from .factor_builders.cross_asset import get_last_related_data_coverage as get_cross_asset_data_coverage
 
 
 LAST_RELATED_DATA_COVERAGE = pd.DataFrame()
@@ -56,7 +56,7 @@ CALENDAR_FACTOR_START_INDEX = 106885
 MACRO_FACTOR_START_INDEX = 126978
 
 
-# 数据读取逻辑已经拆到 data_loader.py；这里保留同名入口，兼容旧脚本导入。
+# 数据读取逻辑位于 framework/data_loader.py；这里转导常用入口供上层脚本使用。
 ensure_wind_started = data_ensure_wind_started
 stop_wind = data_stop_wind
 safe_symbol_name = data_safe_symbol_name
@@ -773,21 +773,26 @@ def build_factors(
     本函数也会补充 bar_return_cc / bar_return_oc 等内部计算字段，
     但最终只返回因子矩阵，不返回行情字段。
     """
+    requested_mode = requested_factors is not None
     requested_set = set(requested_factors or [])
+    if requested_mode and not requested_set:
+        raise ValueError(
+            "requested_factors 为空，已拒绝静默回退为全量因子构建。"
+        )
     pruned_factor_names = load_pruned_factor_names(config)
     if requested_set:
         requested_set = requested_set.difference(pruned_factor_names)
-    if pruned_factor_names and not requested_factors:
+    if pruned_factor_names and not requested_mode:
         print(f"已应用因子淘汰清单，排除因子数量: {len(pruned_factor_names)}")
 
     def need_any_factor() -> bool:
-        return not requested_set
+        return not requested_mode
 
     def filter_requested(frame: pd.DataFrame) -> pd.DataFrame:
         if pruned_factor_names:
             keep_not_pruned = [column for column in frame.columns if column not in pruned_factor_names]
             frame = frame[keep_not_pruned] if keep_not_pruned else pd.DataFrame(index=frame.index)
-        if not requested_set:
+        if not requested_mode:
             return frame
         keep_columns = [column for column in frame.columns if column in requested_set]
         return frame[keep_columns] if keep_columns else pd.DataFrame(index=frame.index)
@@ -827,7 +832,13 @@ def build_factors(
         )
     )
     if need_any_factor() or parametric_prefixes:
-        parametric_factors = filter_requested(add_parametric_factors(df, config))
+        parametric_factors = filter_requested(
+            add_parametric_factors(
+                df,
+                config,
+                requested_factors=set(parametric_prefixes) if requested_set else None,
+            )
+        )
         if not parametric_factors.empty:
             factor_parts.append(parametric_factors)
 
@@ -836,14 +847,27 @@ def build_factors(
         if need_any_factor() or has_requested_prefix(("cross_", "crossmega_")):
             if related_data_map is None:
                 related_data_map = fetch_related_intraday_data(config)
-            cross_asset_factors = filter_requested(add_cross_asset_factors(df, related_data_map, config))
+            cross_asset_factors = filter_requested(
+                add_cross_asset_factors(
+                    df,
+                    related_data_map,
+                    config,
+                    requested_factors=requested_set if requested_set else None,
+                )
+            )
         if not cross_asset_factors.empty:
             print(f"跨品种因子数量: {cross_asset_factors.shape[1]}")
             factor_parts.append(cross_asset_factors)
 
     complex_non_cross_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("ultra_",)):
-        complex_non_cross_factors = filter_requested(add_complex_non_cross_factors(df, config))
+        complex_non_cross_factors = filter_requested(
+            add_complex_non_cross_factors(
+                df,
+                config,
+                requested_factors=requested_set if requested_set else None,
+            )
+        )
     if not complex_non_cross_factors.empty:
         factor_parts.append(complex_non_cross_factors)
 
@@ -853,7 +877,12 @@ def build_factors(
             if related_data_map is None:
                 related_data_map = fetch_related_intraday_data(config)
             complex_cross_asset_factors = filter_requested(
-                add_complex_cross_asset_factors(df, related_data_map or {}, config)
+                add_complex_cross_asset_factors(
+                    df,
+                    related_data_map or {},
+                    config,
+                    requested_factors=requested_set if requested_set else None,
+                )
             )
         if not complex_cross_asset_factors.empty:
             print(f"复杂跨品种因子数量: {complex_cross_asset_factors.shape[1]}")
@@ -861,7 +890,13 @@ def build_factors(
 
     hyper_non_cross_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("hyper_",)):
-        hyper_non_cross_factors = filter_requested(add_hyper_non_cross_factors(df, config))
+        hyper_non_cross_factors = filter_requested(
+            add_hyper_non_cross_factors(
+                df,
+                config,
+                requested_factors=requested_set if requested_set else None,
+            )
+        )
     if not hyper_non_cross_factors.empty:
         factor_parts.append(hyper_non_cross_factors)
 
@@ -871,7 +906,12 @@ def build_factors(
             if related_data_map is None:
                 related_data_map = fetch_related_intraday_data(config)
             hyper_cross_asset_factors = filter_requested(
-                add_hyper_cross_asset_factors(df, related_data_map or {}, config)
+                add_hyper_cross_asset_factors(
+                    df,
+                    related_data_map or {},
+                    config,
+                    requested_factors=requested_set if requested_set else None,
+                )
             )
         if not hyper_cross_asset_factors.empty:
             print(f"高阶跨品种因子数量: {hyper_cross_asset_factors.shape[1]}")
@@ -879,7 +919,13 @@ def build_factors(
 
     omega_non_cross_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("omega_",)):
-        omega_non_cross_factors = filter_requested(add_omega_non_cross_factors(df, config))
+        omega_non_cross_factors = filter_requested(
+            add_omega_non_cross_factors(
+                df,
+                config,
+                requested_factors=requested_set if requested_set else None,
+            )
+        )
     if not omega_non_cross_factors.empty:
         factor_parts.append(omega_non_cross_factors)
 
@@ -889,7 +935,12 @@ def build_factors(
             if related_data_map is None:
                 related_data_map = fetch_related_intraday_data(config)
             omega_cross_asset_factors = filter_requested(
-                add_omega_cross_asset_factors(df, related_data_map or {}, config)
+                add_omega_cross_asset_factors(
+                    df,
+                    related_data_map or {},
+                    config,
+                    requested_factors=requested_set if requested_set else None,
+                )
             )
         if not omega_cross_asset_factors.empty:
             print(f"终极跨品种因子数量: {omega_cross_asset_factors.shape[1]}")
@@ -897,7 +948,13 @@ def build_factors(
 
     calendar_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("calendar_",)):
-        calendar_factors = filter_requested(add_calendar_seasonality_factors(df, config))
+        calendar_factors = filter_requested(
+            add_calendar_seasonality_factors(
+                df,
+                config,
+                requested_factors=requested_set if requested_set else None,
+            )
+        )
     if not calendar_factors.empty:
         factor_parts.append(calendar_factors)
 
@@ -929,9 +986,16 @@ def build_factors(
     if matrix_dtype in {"float32", "float64"}:
         # 先逐块降精度，再横向拼接，避免 concat 时先申请巨大的 float64 数组。
         factor_parts = [
-            part.astype(matrix_dtype, copy=False)
+            part.astype(matrix_dtype)
             for part in factor_parts
         ]
-    return pd.concat(factor_parts, axis=1).copy()
+    factors = pd.concat(factor_parts, axis=1).copy()
+    if requested_mode:
+        missing_count = len(requested_set.difference(factors.columns))
+        print(
+            "因子按需构建完成: "
+            f"请求={len(requested_set)}，生成={factors.shape[1]}，缺失={missing_count}"
+        )
+    return factors
 
 

@@ -19,44 +19,47 @@
 
 如果只是想快速使用项目，优先看本节即可。当前项目推荐通过 `cli.py` 统一运行，直接运行 `single_factor_backtest.py`、`composite_factor_backtest.py`、`multi_symbol_backtest.py` 也可以，但 CLI 更适合频繁切换品种、时间段、模型参数和实验编号。
 
-### 0.1 根目录 Python 文件作用
+根目录只保留可直接运行的入口脚本和需要经常编辑的 `config.py`；内部实现集中在 `framework/`，测试集中在 `tests/`。原有 `python cli.py ...`、`python single_factor_backtest.py` 等命令保持不变。
+
+### 0.1 根目录入口文件作用
 
 | 文件 | 是否建议直接运行 | 作用 |
 | --- | --- | --- |
 | `cli.py` | 是，推荐入口 | 统一命令行入口。支持运行单因子、综合因子、多品种、共享 pooled 模型和交易信号流程，并可通过命令行参数或 JSON 覆盖 `config.py`。 |
 | `config.py` | 否 | 全局配置中心。控制数据源、品种、时间区间、因子库门槛、XGBoost/模型参数、图表、实验目录、多品种组合风控等。 |
-| `data_loader.py` | 否 | 数据读取层。负责本地 CSV 缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
 | `data_quality_report.py` | 是，回测前推荐 | 数据质量报告工具。检查主品种、相关品种、宏观数据的缺失、重复时间戳、K线间隔异常、OHLC异常、零成交量和极端收益。 |
-| `factors.py` | 否 | 因子总装配入口。负责因子编号、按需构建、软淘汰过滤、因子矩阵拼装；同时兼容转导部分旧的数据读取函数。 |
-| `factor_library.py` | 否 | 因子库管理。根据单因子训练/验证表现、收益/夏普/胜率门槛和相关性去重，维护 `active/rejected/all` 三类因子库。 |
 | `single_factor_backtest.py` | 可以 | 单因子批量回测入口。读取数据、构建因子、训练/验证/测试分段回测、生成单因子报告并更新因子库。 |
 | `composite_factor_backtest.py` | 可以 | 综合因子回测入口。只在 active 因子池内选因，使用 XGBoost/逻辑回归/随机森林等模型滚动训练预测，并输出综合策略效果。 |
 | `multi_symbol_backtest.py` | 可以 | 多品种批量入口。对多个期货品种独立运行单因子和综合因子流程，并生成多品种组合层汇总、图表和风控组合结果。 |
 | `pooled_model_backtest.py` | 可以 | 多品种共享信息模型入口。读取各品种 active 因子库，按板块或全市场拼接 long-format 样本，训练共享模型并回落到单品种回测。 |
-| `trading_signal.py` | 可以 | 最新交易信号导出入口。默认 compute 模式读取 active 因子并现场合成最新信号；detail 模式才读取已有 `composite_detail.csv` 做快速对照。 |
-| `runtime_utils.py` | 否 | 运行追踪工具。把控制台输出同步写入日志，并生成 `execution_manifest.json`，记录运行状态、耗时、配置哈希、错误堆栈和输出文件。 |
-| `project_fingerprint.py` | 否 | 源码指纹工具。计算影响因子构建的源码哈希，用于让因子矩阵缓存随公式变更自动失效。 |
+| `trading_signal.py` | 可以 | 最新交易信号导出入口。默认 compute/model 模式复用综合回测滚动模型；vote 是 active 因子加权投票基准；detail 只读取已有 `composite_detail.csv`。 |
 | `consistency_check.py` | 是，改配置/文档后推荐 | 配置、CLI 和文档一致性检查工具，用于发现默认值、命令行参数和说明文档之间的漂移。 |
-| `experiment_utils.py` | 否 | 实验快照工具。负责创建 `runs/` 实验目录、保存配置、复制关键输出、快照 active 因子库和因子数量。 |
 | `factor_metadata.py` | 可以 | 因子元数据导出工具。生成 `factor_metadata.csv` 和因子家族汇总，用于解释、聚类、治理和 AI 因子管理。 |
 | `leakage_audit.py` | 是，改代码后推荐 | 未来函数/数据泄露静态审计工具。扫描 `shift(-n)`、`bfill`、全样本统计等高风险写法并输出审计报告。 |
-| `hard_prune_factors.py` | 谨慎运行 | 因子硬删除工具。读取淘汰池，扫描 `factor_builders/*.py` 中可安全定位的公式行，预演或执行源码级删除。默认先预演，不加 `--apply` 不会改代码。 |
+| `hard_prune_factors.py` | 谨慎运行 | 因子硬删除工具。读取淘汰池，扫描 `framework/factor_builders/*.py` 中可安全定位的公式行，预演或执行源码级删除。默认先预演，不加 `--apply` 不会改代码。 |
 | `cleanup_outputs.py` | 可以 | 清理/归档历史实验输出目录。默认只生成预演报告 `output_cleanup_report.csv`；确认后加 `--apply` 才会执行。 |
 | `smoke_test.py` | 是，改代码后推荐 | 轻量冒烟测试。用于快速检查数据读取、因子构建、active 因子池和小规模综合模型是否能跑通。 |
 
-### 0.2 因子构造文件作用
+### 0.2 内部实现文件作用
 
 | 文件 | 是否建议直接运行 | 作用 |
 | --- | --- | --- |
-| `factor_builders/__init__.py` | 否 | 因子构造模块导出入口，把各类 `add_*_factors` 函数统一暴露给 `factors.py`。 |
-| `factor_builders/basic.py` | 否 | 基础量价因子，例如 `momentum`、`reversal`、`breakout`、`volume_confirm`。 |
-| `factor_builders/parametric.py` | 否 | 主品种自身参数化量价因子，覆盖收益、波动、量价、K 线结构、流动性 proxy、资金流、gap 等。 |
-| `factor_builders/non_cross.py` | 否 | 非跨品种复杂因子，包括 `ultra_`、`hyper_`、`omega_` 等高阶量价结构。 |
-| `factor_builders/cross_asset.py` | 否 | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动、成交活跃度差异等。 |
-| `factor_builders/calendar.py` | 否 | 交易日历/季节性因子，包括日内时段、周/月/季度/年度位置，以及时间状态与量价状态交互。 |
-| `factor_builders/macro_state.py` | 否 | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。默认日频数据滞后一日再对齐到分钟线。 |
-| `factor_builders/external_daily.py` | 否 | 通用外部日频数据因子。可把 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等日频序列滞后对齐到分钟线后构造成状态因子。 |
-| `factor_builders/common.py` | 否 | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
+| `framework/data_loader.py` | 否 | 数据读取层。负责本地 CSV 缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及外部日频数据缓存。 |
+| `framework/factors.py` | 否 | 因子总装配入口。负责编号、按需构建、软淘汰过滤和因子矩阵拼装。 |
+| `framework/factor_library.py` | 否 | 因子库管理。维护 active/rejected/all 因子库并执行训练/验证筛选和相关性去重。 |
+| `framework/factor_taxonomy.py` | 否 | 因子家族、来源文件和复杂度分类。 |
+| `framework/experiment_utils.py` | 否 | 实验目录、配置与关键结果快照。 |
+| `framework/runtime_utils.py` | 否 | 日志、运行状态和 `execution_manifest.json` 追踪。 |
+| `framework/project_fingerprint.py` | 否 | 计算因子相关源码哈希，使公式变化后缓存自动失效。 |
+| `framework/factor_builders/__init__.py` | 否 | 因子构造模块导出入口，把各类 `add_*_factors` 函数统一暴露给 `framework/factors.py`。 |
+| `framework/factor_builders/basic.py` | 否 | 基础量价因子，例如 `momentum`、`reversal`、`breakout`、`volume_confirm`。 |
+| `framework/factor_builders/parametric.py` | 否 | 主品种自身参数化量价因子，覆盖收益、波动、量价、K 线结构、流动性 proxy、资金流、gap 等。 |
+| `framework/factor_builders/non_cross.py` | 否 | 非跨品种复杂因子，包括 `ultra_`、`hyper_`、`omega_` 等高阶量价结构。 |
+| `framework/factor_builders/cross_asset.py` | 否 | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动、成交活跃度差异等。 |
+| `framework/factor_builders/calendar.py` | 否 | 交易日历/季节性因子，包括日内时段、周/月/季度/年度位置，以及时间状态与量价状态交互。 |
+| `framework/factor_builders/macro_state.py` | 否 | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。默认日频数据滞后一日再对齐到分钟线。 |
+| `framework/factor_builders/external_daily.py` | 否 | 通用外部日频数据因子。可把 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等日频序列滞后对齐到分钟线后构造成状态因子。 |
+| `framework/factor_builders/common.py` | 否 | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
 
 ### 0.3 推荐运行顺序
 
@@ -66,7 +69,8 @@
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py data_quality_report.py factors.py factor_taxonomy.py runtime_utils.py project_fingerprint.py consistency_check.py cli.py factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py pooled_model_backtest.py experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py factor_builders/external_daily.py
+python -m py_compile config.py framework/data_loader.py data_quality_report.py framework/factors.py framework/factor_taxonomy.py framework/runtime_utils.py framework/project_fingerprint.py consistency_check.py cli.py framework/factor_library.py factor_metadata.py leakage_audit.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py pooled_model_backtest.py framework/experiment_utils.py hard_prune_factors.py cleanup_outputs.py smoke_test.py framework/factor_builders/external_daily.py
+python -m unittest -v tests.test_regressions
 python consistency_check.py --strict
 python cli.py single --symbol C.DCE --scope range --range-start 1 --range-end 100 --dry-run --print-config
 ```
@@ -87,11 +91,20 @@ python cli.py composite --symbol C.DCE --models xgboost,logistic_regression
 python cli.py composite --symbol C.DCE --feature-scope selected --selected-factors factor_a,factor_b
 python cli.py composite --symbol C.DCE --train-window 2400 --save-config wind_hf_multifactor_output/last_composite_config.json --dry-run
 
-# 4. 导出最新交易信号。默认 compute 模式现场合成；detail 模式读取已有明细。
+# 4. 导出最新交易信号。默认 compute 模式复用综合回测滚动模型。
 python cli.py signal --symbol C.DCE --source auto
 python cli.py signal --symbols C.DCE,M.DCE,Y.DCE,P.DCE --source multi
+python cli.py signal --symbol C.DCE --mode vote --source auto
 python cli.py signal --symbol C.DCE --mode detail --source auto
 ```
+
+交易信号模式说明：
+
+- `compute/model`：读取当前 active 因子库和最新因子矩阵，复用综合回测的特征构造、滚动选因、分类器训练、方向/阈值校准、市场过滤和持仓规则。程序会向前对齐到模型重训边界并回算置信度历史，因此比 `vote/detail` 慢，但研究与实时口径最一致。
+- `vote`：按 active 因子的历史表现加权投票，只作为简单基准或模型不可用时的人工显式选择；程序不会从模型模式静默降级到 vote。
+- `detail`：直接读取旧 `composite_detail.csv` 最后一行，速度最快，但不是现场重新预测。
+
+`compute/model` 使用当前 active 因子库重新训练最新模型，并不保证复现较早回测使用的旧 active 快照。若因子缓存早于最新行情，程序会拒绝输出旧信号；应先重新运行 `composite/multi`，或显式开启 `trading_signal_rebuild_missing_factors` 现场重建。
 
 多品种研究推荐顺序：
 
@@ -146,26 +159,41 @@ wind_hf_multifactor_output/
 ```text
 高频/
   config.py
-  data_loader.py
-  factors.py
-  runtime_utils.py
   cli.py
-  factor_builders/
-    __init__.py
-    basic.py
-    parametric.py
-    calendar.py
-    cross_asset.py
-    macro_state.py
-    external_daily.py
-    non_cross.py
-    common.py
-  factor_library.py
   single_factor_backtest.py
   composite_factor_backtest.py
-  experiment_utils.py
+  multi_symbol_backtest.py
+  pooled_model_backtest.py
+  trading_signal.py
+  data_quality_report.py
+  factor_metadata.py
+  leakage_audit.py
+  consistency_check.py
   hard_prune_factors.py
+  cleanup_outputs.py
   smoke_test.py
+  framework/
+    __init__.py
+    data_loader.py
+    factors.py
+    factor_library.py
+    factor_taxonomy.py
+    experiment_utils.py
+    runtime_utils.py
+    project_fingerprint.py
+    factor_builders/
+      __init__.py
+      basic.py
+      parametric.py
+      calendar.py
+      cross_asset.py
+      macro_state.py
+      external_daily.py
+      non_cross.py
+      common.py
+  tests/
+    __init__.py
+    test_regressions.py
   AI_FACTOR_GENERATION_PROMPT.md
   PROJECT_DOCUMENTATION.md
   wind_hf_multifactor_output/
@@ -176,26 +204,26 @@ wind_hf_multifactor_output/
 | 文件 | 作用 |
 | --- | --- |
 | `config.py` | 全局配置中心，控制数据、因子库、单因子回测、XGBoost、图表、实验目录等参数。 |
-| `data_loader.py` | 数据读取层，负责本地行情缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
-| `factors.py` | 因子编号、按需构建、因子总装配入口。为了兼容旧脚本，仍转导 `fetch_intraday_data`、`stop_wind` 等数据函数。具体数据读取已拆到 `data_loader.py`，具体因子公式已拆到 `factor_builders/`。 |
-| `runtime_utils.py` | 统一执行追踪工具，将控制台输出同步写入日志，并生成运行状态、耗时、配置哈希、错误堆栈和更新文件清单。 |
+| `framework/data_loader.py` | 数据读取层，负责本地行情缓存、Wind 分钟 K 线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。 |
+| `framework/factors.py` | 因子编号、按需构建、因子总装配入口。为了兼容旧脚本，仍转导 `fetch_intraday_data`、`stop_wind` 等数据函数。具体数据读取已拆到 `framework/data_loader.py`，具体因子公式已拆到 `framework/factor_builders/`。 |
+| `framework/runtime_utils.py` | 统一执行追踪工具，将控制台输出同步写入日志，并生成运行状态、耗时、配置哈希、错误堆栈和更新文件清单。 |
 | `cli.py` | 推荐的统一命令行入口，可在不修改 `config.py` 的情况下运行单因子、综合因子和多品种流程。 |
-| `factor_builders/basic.py` | 基础量价因子，例如 momentum、reversal、breakout、volume_confirm。 |
-| `factor_builders/parametric.py` | 主品种自身的参数化量价因子，包括收益、波动、量价、K线结构、流动性 proxy 等。 |
-| `factor_builders/calendar.py` | 交易日历、日内时段、周/月/季度/年度季节性及其与量价状态交互的因子。 |
-| `factor_builders/cross_asset.py` | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动和成交活跃度差异等。 |
-| `factor_builders/macro_state.py` | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。 |
-| `factor_builders/external_daily.py` | 通用外部日频数据因子，可接入 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等序列，并按滞后规则对齐到分钟线。 |
-| `factor_builders/non_cross.py` | 更复杂的非跨品种高阶因子，包括 `ultra_`、`hyper_`、`omega_` 系列。 |
-| `factor_builders/common.py` | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
-| `factor_library.py` | 因子库管理，负责 active/rejected/all 三类因子的入库、排序、门槛过滤和相关性去重。 |
+| `framework/factor_builders/basic.py` | 基础量价因子，例如 momentum、reversal、breakout、volume_confirm。 |
+| `framework/factor_builders/parametric.py` | 主品种自身的参数化量价因子，包括收益、波动、量价、K线结构、流动性 proxy 等。 |
+| `framework/factor_builders/calendar.py` | 交易日历、日内时段、周/月/季度/年度季节性及其与量价状态交互的因子。 |
+| `framework/factor_builders/cross_asset.py` | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动和成交活跃度差异等。 |
+| `framework/factor_builders/macro_state.py` | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。 |
+| `framework/factor_builders/external_daily.py` | 通用外部日频数据因子，可接入 Wind 中可取得的库存、现货、期限结构、指数、利率、汇率等序列，并按滞后规则对齐到分钟线。 |
+| `framework/factor_builders/non_cross.py` | 更复杂的非跨品种高阶因子，包括 `ultra_`、`hyper_`、`omega_` 系列。 |
+| `framework/factor_builders/common.py` | 因子构造共享工具，例如滚动 z-score、跨品种对齐、宏观日频对齐、代码名清洗等。 |
+| `framework/factor_library.py` | 因子库管理，负责 active/rejected/all 三类因子的入库、排序、门槛过滤和相关性去重。 |
 | `single_factor_backtest.py` | 单因子批量回测，输出训练集/验证集/测试集表现，并调用因子库逻辑更新 active 因子。 |
 | `composite_factor_backtest.py` | 综合因子回测，使用 active 因子池内的因子做 XGBoost 滚动训练、滚动选因、滚动预测。 |
 | `multi_symbol_backtest.py` | 多品种批量入口，为每个品种创建独立输出目录，依次运行单因子和综合因子流程，并生成跨品种汇总。 |
 | `pooled_model_backtest.py` | 多品种共享信息模型入口，把同一板块或全市场多个品种的样本拼成 long-format 训练集，训练共享模型并输出每个品种的回测结果。 |
-| `trading_signal.py` | 最新交易信号导出工具。默认 compute 模式基于 active 因子库和最新因子值现场合成信号；detail 模式从 `composite_detail.csv` 提取最后一根信号。 |
-| `hard_prune_factors.py` | 因子硬删除工具，把多品种淘汰池中的低质量因子结构真正从因子构造源码中删除。模块化后重点面向 `factor_builders/`。 |
-| `experiment_utils.py` | 实验运行目录、配置快照、输出快照、因子数量快照等工程辅助函数。 |
+| `trading_signal.py` | 最新交易信号导出工具。默认 compute/model 模式复用综合回测相同的模型、特征、校准与持仓规则；vote 显式运行 active 因子加权投票；detail 从 `composite_detail.csv` 提取最后一根信号。 |
+| `hard_prune_factors.py` | 因子硬删除工具，把多品种淘汰池中的低质量因子结构真正从因子构造源码中删除。模块化后重点面向 `framework/factor_builders/`。 |
+| `framework/experiment_utils.py` | 实验运行目录、配置快照、输出快照、因子数量快照等工程辅助函数。 |
 | `consistency_check.py` | 配置、CLI 和文档一致性检查工具，适合修改默认参数、命令行入口或说明文档后运行。 |
 | `smoke_test.py` | 轻量冒烟测试，快速检查数据读取、因子构建、active 因子池和小规模 XGBoost 是否能跑通。 |
 | `AI_FACTOR_GENERATION_PROMPT.md` | 给后续 AI 自动生成新因子的工作提示词和约束说明。 |
@@ -231,7 +259,9 @@ wind_hf_multifactor_output/
 | `single_factor_keep_top_n` | `200` | active 因子库最多保留 200 个因子。 |
 | `factor_library_enable_family_quota` | `True` | 是否启用 active 因子家族配额，防止同质因子过度集中。 |
 | `factor_library_family_max_counts` | 见 `config.py` | 各因子家族的 active 数量上限，例如 parametric、cross_asset、calendar、macro_state 等。 |
-| `use_frozen_active_library` | `False` | 综合回测是否读取冻结版 active 因子库快照。 |
+| `composite_auto_freeze_active_library` | `True` | 综合回测是否在构建因子前自动冻结本轮 active 因子库。缓存、选因、模型和产物清单全部引用该快照。 |
+| `composite_active_library_cutoff_policy` | `"auto"` | active 因子筛选截止审计。旧库缺元数据时警告；一旦明确检测到未来筛选则停止。严格研究可改为 error。 |
+| `use_frozen_active_library` | `False` | 是否把指定历史快照作为自动冻结的源文件，用于复现实验或严格样本外检验。 |
 | `frozen_active_library_path` | `None` | 冻结版 active 因子库路径，可用于严格样本外检验。 |
 | `single_factor_new_factor_start_index` | `126978` | 当前增量测试从第 126978 个因子开始，对应最新追加的 `macro_` 宏观状态因子。 |
 | `single_factor_auto_update_start_index` | `True` | 是否自动记录并读取新增因子测试进度，避免 `single_factor_scope="new"` 重复测试已经跑完的因子。 |
@@ -247,7 +277,10 @@ wind_hf_multifactor_output/
 | `factor_library_min_sharpe` | `1.0` | 入库初筛夏普至少大于等于 1。当前初筛会参考训练集和验证集的较弱表现。 |
 | `factor_library_min_train_sharpe` | `1.0` | 训练集夏普也至少大于等于 1 才能入库。 |
 | `factor_library_min_train_win_rate` | `0.5` | 训练集胜率必须严格大于 50% 才能入库。 |
-| `factor_library_min_test_win_rate` | `0.5` | 验证集存在时验证胜率必须严格大于 50%；否则测试胜率必须严格大于 50%。 |
+| `factor_library_min_selection_win_rate` | `0.5` | 入库选择样本的最低胜率；优先使用验证集，验证无有效数据时回退训练集，最终测试集不参与。 |
+| `factor_library_min_selection_trades` | `0` | 入库选择样本的最低交易次数；优先验证集、回退训练集。 |
+| `factor_library_min_selection_signal_coverage` | `0.0` | 入库选择样本的最低信号覆盖率；优先验证集、回退训练集。 |
+| `factor_library_max_selection_drawdown` | `None` | 入库选择样本允许的最大回撤上限；为空表示不启用该门槛。 |
 | `factor_library_max_corr` | `0.80` | 入库因子与已入库因子的最大相关性阈值。 |
 | `multi_symbol_use_opportunity_selection` | `True` | 多品种组合层是否启用横截面机会选择，只保留当前机会评分较强的品种参与组合。 |
 | `multi_symbol_opportunity_top_n` | `8` | 每根 K 线最多交易机会评分最高的 8 个品种；设为 0 表示不限制数量。 |
@@ -262,6 +295,7 @@ wind_hf_multifactor_output/
 | `composite_enable_validation_test_gap_report` | `True` | 是否输出验证集到最终测试集的表现衰减诊断，用于识别样本外失效和过拟合风险。 |
 | `composite_gap_warn_sharpe_retention` | `0.5` | 测试夏普低于验证夏普该比例时触发衰减预警。 |
 | `composite_gap_warn_return_retention` | `0.5` | 测试累计收益低于验证累计收益该比例时触发衰减预警。 |
+| `composite_build_active_only` | `True` | 只构建 active 库请求的因子。空 active 会直接报错，绝不回退计算全部因子；设为 `False` 才允许显式全量构建。 |
 | `xgboost_feature_scope` | `"best"` | 综合模型在 active 池内滚动选择表现较好的因子。 |
 | `selected_factors` | `None` | 仅当 `xgboost_feature_scope="selected"` 时生效；`best/all` 模式会忽略该列表，且所有选择都必须落在 active 因子池内。 |
 | `xgboost_best_top_n` | `50` | 每次重训最多选 50 个基础因子。 |
@@ -291,20 +325,20 @@ wind_hf_multifactor_output/
 
 ## 3. 数据读取与因子生成
 
-`data_loader.py` 是数据入口；`factors.py` 是因子总装配入口；具体因子公式放在 `factor_builders/` 子文件夹中。
+`framework/data_loader.py` 是数据入口；`framework/factors.py` 是因子总装配入口；具体因子公式放在 `framework/factor_builders/` 子文件夹中。
 
 当前拆分原则：
 
 ```text
-data_loader.py
+framework/data_loader.py
   负责本地 CSV、Wind 分钟线、相关品种行情、Wind 日频宏观/利率/指数数据，以及可配置外部日频数据读取与缓存。
 
-factors.py
+framework/factors.py
   负责因子编号、按需构建、软淘汰过滤和 build_factors 总装配。
   同时保留旧的数据函数导入入口，避免其他脚本大量改 import。
 
-factor_builders/
-  每一类因子一个文件，避免单个 factors.py 无限膨胀。
+framework/factor_builders/
+  每一类因子一个文件，避免单个 framework/factors.py 无限膨胀。
 ```
 
 数据读取逻辑：
@@ -453,8 +487,8 @@ python single_factor_backtest.py
 
 ```text
 读取行情
--> 构建所有因子
 -> 根据 single_factor_scope 选择本轮要测试的因子
+-> 只构建本轮待测因子，并补充构建已有 active 因子作为相关性参照
 -> 按 auto_select_train_ratio 和 auto_select_validation_ratio 切分训练集/验证集/最终测试集
 -> 每个因子在训练集上自动判断正向/反向
 -> 固定该方向后分别回测训练集、验证集和最终测试集
@@ -464,6 +498,8 @@ python single_factor_backtest.py
 -> 为 Top 因子生成图表
 ```
 
+`range/new/selected` 属于按需模式：参数化因子会先从请求名称解析所需滚动窗口，再进入构建和标准化，不再为了测试少量编号而计算全部参数窗口。已有 active 因子只作为相关性去重参照，不会被重复回测。
+
 三段式样本用途：
 
 ```text
@@ -472,7 +508,11 @@ python single_factor_backtest.py
 最终测试集：只用于留存评估，不直接参与 active 因子入库。
 ```
 
-这样做的目的是降低“用最终测试集筛因子”的研究污染风险，同时避免只看训练集或只看验证集导致单段偶然表现过度影响入库。旧版历史结果如果没有验证列，因子库逻辑会回退使用训练列；如果训练列也不存在，再兼容旧测试列。
+这样做的目的是消除“用最终测试集筛因子”的研究污染风险，同时避免只看训练集或只看验证集导致单段偶然表现过度影响入库。没有有效验证数据时，因子库只回退训练列；如果训练列也不存在则拒绝建立 active 库，不再兼容使用旧测试列。
+
+每次更新因子库时，程序都会从训练/验证原始指标重新计算 `初筛夏普`、`初筛累计收益`、`初筛RankIC` 和 `初筛分组单调性`，不会直接信任旧 CSV 中已经保存的初筛值。缺少训练收益或训练夏普的历史记录会标记为 `missing_traceable_train_metrics`，需要重新运行对应单因子回测后才有资格进入 active。
+
+旧配置字段 `factor_library_min_test_win_rate`、`factor_library_min_test_trades`、`factor_library_min_test_signal_coverage` 和 `factor_library_max_test_drawdown` 仅作为迁移别名保留。旧字段显式设为非 `None` 时会覆盖对应的 `selection` 参数，但只改变门槛数值，不会改变指标来源，仍然不会读取最终测试集指标。
 
 单因子信号规则：
 
@@ -490,14 +530,19 @@ position = raw_signal.shift(1)
 
 原因是当前 K 线结束后才能得到因子信号，下一根 K 线才能执行交易。
 
-单因子回测收益使用每根 K 线的 open-to-close 收益：
+默认的 `next_open_continuous` 收益口径把相邻 K 线之间的跳空计入上一持仓，避免持仓跨 K 线时遗漏隔夜和开盘跳空：
 
 ```text
-bar_return_oc = close / open - 1
-strategy_gross_return = position * bar_return_oc
+gap_return = open[t] / close[t-1] - 1
+strategy_gross_return =
+    previous_position * gap_return
+    + current_position * (close[t] - open[t]) / close[t-1]
+turnover = abs(current_position - previous_position)
 trading_cost = turnover * (commission_bps + slippage_bps) / 10000
 strategy_net_return = strategy_gross_return - trading_cost
 ```
+
+若为复现旧实验而设置 `backtest_return_mode="intrabar_only"`，则只计算当前持仓乘本根开盘到收盘收益；该模式会忽略跨 K 线跳空，不建议用于最终实盘评估。
 
 单因子输出包括训练集、验证集和最终测试集指标：
 
@@ -561,7 +606,7 @@ IC胜率：月度 IC 大于 0 的月份占比。
 
 ## 6. 因子库机制
 
-因子库由 `factor_library.py` 管理。
+因子库由 `framework/factor_library.py` 管理。
 
 主要输出目录：
 
@@ -644,16 +689,24 @@ active 上限 = 200
 
 冻结 active 因子库：
 
+默认情况下，`composite_auto_freeze_active_library=True` 会在任何因子构建、缓存读取和选因之前，把当前 active 因子库复制到本次实验目录，并让本轮运行配置只引用该快照。源 `active_factors.csv` 即使在长任务期间被其他流程更新，也不会改变本轮候选池。
+
 ```text
 use_frozen_active_library = True
 frozen_active_library_path = "runs/某次实验/active_factors_snapshot.csv"
 ```
 
-开启后，综合因子回测不会读取当前最新的 `factor_library/active_factors.csv`，而是读取指定的历史快照。这样可以把“因子发现/入库阶段”和“后续综合模型样本外检验阶段”分开，减少反复更新 active 因子库带来的研究污染。
+手动开启后，指定历史快照会成为本轮自动冻结的源文件，而不是当前 latest 因子库。这样可以把“因子发现/入库阶段”和“后续综合模型样本外检验阶段”分开，减少反复更新 active 因子库带来的研究污染。
+
+新生成的 active 因子库会写入 `因子筛选训练截止` 和 `因子筛选验证截止`。综合回测把后者与本次最终测试起点比较，并输出 `active_library_oos_audit.json`。如果筛选截止晚于最终测试起点，说明使用了测试期之后才筛选出的因子；默认 `auto` 会立即终止，`warn` 模式只保留警告和审计报告。旧 active 库没有截止元数据时，`auto` 仅警告以便平滑升级。建议先重新运行一次单因子流程，正式冻结研究时再将策略设为：
+
+```text
+composite_active_library_cutoff_policy = "error"
+```
 
 ## 6.1 因子淘汰池与硬删除脚本
 
-随着 AI 自动生成因子和参数化扩展持续增加，因子构造源码很容易越来越臃肿。当前项目已经把公式拆到 `factor_builders/`，并支持两层淘汰：
+随着 AI 自动生成因子和参数化扩展持续增加，因子构造源码很容易越来越臃肿。当前项目已经把公式拆到 `framework/factor_builders/`，并支持两层淘汰：
 
 ```text
 第一层：软淘汰清单
@@ -690,13 +743,17 @@ wind_hf_multifactor_output/by_symbol/factor_pruning_candidates.csv
 
 这意味着“不要求每个好因子都对所有品种有效”。只要某个因子在任一品种有明显价值，默认就会保留，不进入淘汰池。
 
+跨品种淘汰使用的初筛夏普和累计收益同样由训练集与验证集重建：验证缺失时回退训练，训练缺失时忽略该条记录，最终测试集表现不会用于决定是否淘汰因子。
+
+`trading_signal.py` 的因子投票权重也遵守同一隔离规则：优先使用标记为可追溯的科研/预测评分，其次使用训练与验证的保守夏普或收益；最终测试指标不会参与实时权重，安全指标全部缺失时使用等权。
+
 ### 6.1.2 软淘汰和硬删除的区别
 
 软淘汰：
 
 ```text
-不改 factors.py 源码
-不改 factor_builders/ 中的因子公式源码
+不改 framework/factors.py 源码
+不改 framework/factor_builders/ 中的因子公式源码
 只是在 build_factors 阶段读取 factor_prune_list.csv 并过滤
 适合短期观察、可回滚、低风险
 ```
@@ -775,7 +832,7 @@ f"omega_{transform_name}_{input_name}_{window}"
 unsupported_dynamic_template
 ```
 
-如果后续确实要清理动态组合因子，建议先人工判断是删除整个 input、整个 transform，还是仅调整生成数量上限，然后再改对应的 `factor_builders/*.py`。
+如果后续确实要清理动态组合因子，建议先人工判断是删除整个 input、整个 transform，还是仅调整生成数量上限，然后再改对应的 `framework/factor_builders/*.py`。
 
 ### 6.1.5 安全注意事项
 
@@ -1023,7 +1080,9 @@ python cli.py multi --symbols liquid_commodity
 | `multi_symbol_run_composite` | 是否为每个品种运行 XGBoost 综合因子流程。 |
 | `multi_symbol_separate_output_dirs` | 是否为每个品种使用独立输出目录。建议保持开启。 |
 | `multi_symbol_output_subdir` | 多品种结果放在 `output_dir` 下的哪个子目录，默认是 `by_symbol`。 |
-| `multi_symbol_skip_existing` | 是否复用已经存在的单因子库和综合回测明细，用于长任务断点续跑。 |
+| `multi_symbol_skip_existing` | 是否复用有效的单因子库和综合回测明细。只有配置、源码指纹、本地行情及关键输入均未变化时才跳过；单因子阶段跟踪淘汰清单，综合阶段跟踪 active 因子库内容哈希。 |
+| `multi_symbol_require_composite_artifact_manifest` | 组合层是否强制校验每个品种的综合产物清单。建议保持开启，防止把旧配置、旧模型或被改动的明细混入当前组合。 |
+| `multi_symbol_clear_stale_portfolio_outputs` | 生成本轮组合前是否清除上一轮 latest 组合文件。建议保持开启，避免本轮未生成的可选报表残留并被误读。 |
 | `multi_symbol_use_rolling_portfolio_weights` | 多品种组合是否使用滚动历史权重；建议保持开启，避免组合层用完整测试集计算权重。 |
 | `multi_symbol_portfolio_weight_window` | 滚动组合权重的历史窗口长度，单位为 K 线根数。 |
 | `multi_symbol_portfolio_min_weight_samples` | 估计滚动组合权重所需的最少历史样本数，样本不足时退化为等权。 |
@@ -1054,6 +1113,8 @@ wind_hf_multifactor_output/
         active_factors.csv
         factor_library_all.csv
         rejected_factors.csv
+      .single_pipeline_state.json
+      .composite_pipeline_state.json
       single_factor/
         single_factor_summary.csv
         single_factor_all_summary.csv
@@ -1061,12 +1122,15 @@ wind_hf_multifactor_output/
       composite_factor/
         composite_detail.csv
         composite_summary.csv
+        active_library_oos_audit.json
+        composite_artifact_manifest.json
         composite_model_comparison.csv
         composite_report.png
         benchmark_vote_report.png
     M_DCE/
       ...
     multi_symbol_summary.csv
+    multi_symbol_portfolio_inputs.csv
     multi_symbol_portfolio_detail.csv
     multi_symbol_portfolio_summary.csv
     multi_symbol_portfolio_weights.csv
@@ -1106,6 +1170,8 @@ active最高入库夏普
 
 | 文件 | 含义 |
 | --- | --- |
+| `composite_artifact_manifest.json` | 单品种综合结果的可验证产物清单，记录品种、模型、运行编号、配置/源码/active 因子库哈希，以及明细和摘要文件哈希。 |
+| `multi_symbol_portfolio_inputs.csv` | 本轮组合输入审计表，逐品种记录上游产物是否有效、是否进入组合及拒绝原因。 |
 | `multi_symbol_portfolio_detail.csv` | 各品种最终测试集收益、仓位，不同组合方法的收益、净值、回撤和平均仓位。 |
 | `multi_symbol_portfolio_summary.csv` | 不同组合方法的累计收益、夏普、最大回撤、胜率、参与品种数、平均权重和权重参数。 |
 | `multi_symbol_portfolio_weights.csv` | 滚动组合权重明细，每一行是该时点各品种权重。 |
@@ -1115,12 +1181,14 @@ active最高入库夏普
 | `multi_symbol_group_contribution.csv` | 每个组合方法下，各板块/产业链对组合收益的贡献。 |
 | `multi_symbol_portfolio_contribution.csv` | 各品种按权重计算后的组合收益贡献。 |
 | `multi_symbol_strategy_return_corr.csv` | 各品种综合策略最终测试集收益相关矩阵。 |
-| `multi_symbol_run_manifest.json` | 多品种批量运行清单，包含配置快照、品种状态、错误信息和输出文件索引。 |
+| `multi_symbol_run_manifest.json` | 多品种批量运行清单，包含配置快照、品种状态、错误信息，以及本轮根级输出和各品种关键状态/产物的有界索引；不会递归收录全部历史 runs。 |
 | `multi_symbol_portfolio_report.png` | 多组合方法图表，对比净值、回撤、累计收益和平均绝对仓位。 |
 | `factor_pruning_candidates.csv` | 本轮多品种回测识别出的新增淘汰候选因子。 |
 | `factor_prune_list.csv` | 全局软淘汰清单，后续构建因子时可自动过滤。 |
 | `factor_hard_delete_pool.csv` | 硬删除池，由 `hard_prune_factors.py` 从软淘汰清单合并生成。 |
 | `factor_hard_delete_report.csv` | 硬删除预演/执行报告，记录每个因子是否能匹配到可安全删除的源码公式行。 |
+
+组合层默认只消费通过 `composite_artifact_manifest.json` 校验的当前综合结果。若明细或摘要在生成清单后被修改、清单品种不一致、清单缺失，当前品种会写入 `multi_symbol_portfolio_inputs.csv` 并被拒绝进入组合。生成新组合前会清理上一轮 latest 组合产物；因此当本轮没有有效输入时，不会继续保留看似可用但实际过期的组合 CSV/PNG。
 
 ### 10.1 多品种共享信息 pooled 模型
 
@@ -1144,7 +1212,9 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 逐品种构建相同特征列
 追加 symbol/group one-hot 特征
 把多个品种样本拼成 long-format 数据集
+为每条标签记录真实 label_available_time
 按时间滚动训练共享 XGBoost/分类器
+仅使用在当前预测时点已经完整实现的历史标签
 预测结果再回落到每个品种单独回测
 ```
 
@@ -1157,7 +1227,7 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 | `pooled_model_feature_source` | `active_union` 使用各品种 active 因子并集；`active_intersection` 只使用所有品种 active 因子交集。 |
 | `pooled_model_max_features` | 共享模型最多使用多少个基础因子，用于控制内存和训练速度。 |
 | `pooled_model_max_bars_per_symbol` | 每个品种最多使用最近多少根 K 线构建 pooled 数据集。 |
-| `pooled_model_train_time_window` | pooled 滚动训练每次最多回看多少个历史时间点；为空时沿用 `xgboost_train_window`。 |
+| `pooled_model_train_time_window` | pooled 滚动训练每次最多回看多少个唯一历史时间点；同一时点的所有品种样本保持为完整横截面，为空时沿用 `xgboost_train_window`。 |
 | `pooled_model_min_symbols_per_group` | 每个共享组至少需要多少个品种才训练。 |
 | `pooled_model_max_train_rows` | 每次滚动训练最多使用多少条 long-format 样本，用作内存和速度上限。 |
 | `pooled_model_include_symbol_features` | 是否加入品种 one-hot 特征，让共享模型学习品种专属修正。 |
@@ -1187,6 +1257,8 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 | `pooled_group_contribution.csv` | pooled 组合层板块/产业链收益贡献。 |
 | `pooled_strategy_return_corr.csv` | pooled 单品种策略收益相关性矩阵。 |
 | `pooled_portfolio_report.png` | pooled 组合层净值、回撤、累计收益和平均仓位图。 |
+
+pooled 的时间衰减按唯一时间戳计算，而不是按 long-format 行号计算，因此同一时点不同品种获得相同时间权重。`pooled_model_max_train_rows` 截断时也保留完整时间戳，不会把同一个横截面从中间切开。多周期标签通过每个品种实际交易索引生成 `label_available_time`；夜盘、午休和节假日不会再用固定分钟数近似。
 
 注意：pooled 模型依赖各品种已有 active 因子库，因此推荐先运行 `python cli.py multi --symbols ...` 或逐品种 `single` 流程更新 active 因子库，再运行 `python cli.py pooled ...`。
 
@@ -1256,7 +1328,7 @@ related_data_coverage.csv
 
 ### 12.1 统一日志与执行清单
 
-直接运行 `single_factor_backtest.py`、`composite_factor_backtest.py`、`multi_symbol_backtest.py`，或通过 `cli.py` 运行时，均会使用 `runtime_utils.py` 做执行追踪。
+直接运行 `single_factor_backtest.py`、`composite_factor_backtest.py`、`multi_symbol_backtest.py`，或通过 `cli.py` 运行时，均会使用 `framework/runtime_utils.py` 做执行追踪。
 
 新增产物：
 
@@ -1269,8 +1341,13 @@ wind_hf_multifactor_output/
   runs/
     {run_id}_{run_type}/
       run_config.json
+      effective_run_config.json
       execution_manifest.json
+      active_factors_snapshot.csv
+      active_factors_snapshot_manifest.json
 ```
+
+其中 `run_config.json` 记录用户提交给执行器的原始配置；综合回测启用自动冻结后，`effective_run_config.json` 记录实际建模配置，包括本轮冻结快照的绝对路径。两者分开保存，避免执行器收尾时覆盖真实建模口径。
 
 `execution_manifest.json` 记录：
 
@@ -1286,7 +1363,9 @@ Python 与操作系统版本
 本次运行期间更新的输出文件清单
 ```
 
-这样即使长时间批量任务中途失败，也能定位失败阶段、复用相同参数重新运行，并保留控制台输出作为审计轨迹。
+这样即使长时间批量任务中途失败，也能定位失败阶段、复用相同参数重新运行，并保留控制台输出作为审计轨迹。`execution_manifest.json`、`composite_artifact_manifest.json`、多品种断点状态和 `multi_symbol_run_manifest.json` 均采用同目录临时文件加原子替换写入，异常中断不会用半截 JSON 覆盖上一份完整状态。
+
+`multi_symbol_run_manifest.json` 的 `output_index_scope` 当前为 `current_root_and_symbol_key_artifacts`：只索引多品种根级汇总/组合文件，以及各品种的断点状态、active 因子库、单因子摘要和综合核心产物。这样可以避免随着历史 `runs/`、CSV 和图表增长而在任务收尾阶段递归扫描整个输出树。
 
 ### 12.2 因子元数据、泄露审计与缓存指纹
 
@@ -1308,8 +1387,8 @@ leakage_audit.py
   扫描 shift(-n)、bfill、expanding、全样本统计、fit_transform 等高风险写法。
   报告中的“白名单说明”不是自动放行，只表示该处有已知用途，仍建议人工复核。
 
-project_fingerprint.py
-  计算 config.py、data_loader.py、factors.py、factor_builders/*.py 的源码哈希。
+framework/project_fingerprint.py
+  计算 config.py、framework/data_loader.py、framework/factors.py、framework/factor_builders/*.py 的源码哈希。
   composite_factor_backtest.py 的 active 因子矩阵缓存会记录该哈希；
   一旦因子公式或关键构建代码变化，旧缓存会自动失效，避免读到过期因子矩阵。
 ```
@@ -1401,7 +1480,7 @@ wind_hf_multifactor_output/
 新增一批 AI 因子后的流程：
 
 ```text
-把新因子追加到 factor_builders/ 中对应类别文件的末尾
+把新因子追加到 framework/factor_builders/ 中对应类别文件的末尾
 确认 single_factor_new_factor_start_index 指向新一批因子的起始编号
 运行 python single_factor_backtest.py
 检查 active_factors.csv / rejected_factors.csv
@@ -1418,7 +1497,7 @@ wind_hf_multifactor_output/
 ```text
 AI 只生成候选因子公式
 人工或程序检查是否存在未来函数
-追加到 factor_builders/ 对应类别文件的末尾，保持旧编号稳定
+追加到 framework/factor_builders/ 对应类别文件的末尾，保持旧编号稳定
 只对新增因子跑单因子回测
 因子库自动根据训练/验证表现和相关性判断是否入库
 只允许 active 因子进入综合模型
@@ -1457,7 +1536,7 @@ AI 只生成候选因子公式
 工程层面：
 
 ```text
-继续细化 factor_builders/，例如把候选 AI 因子单独放入 candidate 或 experimental 模块
+继续细化 framework/factor_builders/，例如把候选 AI 因子单独放入 candidate 或 experimental 模块
 增加候选因子暂存层，避免 AI 因子直接污染正式因子文件
 增加更完整的单元测试
 增加命令行参数，减少频繁修改 config.py
@@ -1496,7 +1575,7 @@ python smoke_test.py
 python single_factor_backtest.py
 python composite_factor_backtest.py
 python multi_symbol_backtest.py
-python -m py_compile config.py data_loader.py factors.py factor_taxonomy.py runtime_utils.py cli.py factor_builders/__init__.py factor_builders/basic.py factor_builders/common.py factor_builders/parametric.py factor_builders/calendar.py factor_builders/cross_asset.py factor_builders/macro_state.py factor_builders/external_daily.py factor_builders/non_cross.py factor_library.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py experiment_utils.py hard_prune_factors.py smoke_test.py
+python -m py_compile config.py framework/data_loader.py framework/factors.py framework/factor_taxonomy.py framework/runtime_utils.py cli.py framework/factor_builders/__init__.py framework/factor_builders/basic.py framework/factor_builders/common.py framework/factor_builders/parametric.py framework/factor_builders/calendar.py framework/factor_builders/cross_asset.py framework/factor_builders/macro_state.py framework/factor_builders/external_daily.py framework/factor_builders/non_cross.py framework/factor_library.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py framework/experiment_utils.py hard_prune_factors.py smoke_test.py
 ```
 
 ## 19. 总结

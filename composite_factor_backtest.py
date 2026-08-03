@@ -12,25 +12,32 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from dataclasses import replace
+import datetime as dt
 import hashlib
+import json
 import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from config import BacktestConfig
-from experiment_utils import (
+from config import BacktestConfig, report_config_validation
+from framework.experiment_utils import (
     copy_existing_files,
     get_experiment_run_dir,
-    snapshot_active_factor_library,
     write_factor_count_snapshot,
     write_run_config,
 )
-from runtime_utils import run_tracked
-from project_fingerprint import build_source_fingerprint_hash
-from factor_library import get_factor_library_dir
-from factors import (
+from framework.runtime_utils import (
+    build_config_hash,
+    copy_file_atomic,
+    run_tracked,
+    write_json_atomic,
+)
+from framework.project_fingerprint import build_source_fingerprint_hash
+from framework.factor_library import get_factor_library_dir
+from framework.factors import (
     build_factors,
     fetch_intraday_data,
     get_factor_columns,
@@ -53,6 +60,150 @@ from single_factor_backtest import (
 )
 
 
+COMPOSITE_ARTIFACT_SCHEMA_VERSION = 1
+
+
+def build_file_identity(path: Path) -> dict[str, Any]:
+    """记录产物或输入文件的内容身份。"""
+    path = path.resolve()
+    identity: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if not path.exists() or not path.is_file():
+        return identity
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = path.stat()
+    identity.update(
+        {
+            "size_bytes": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+            "sha256": digest.hexdigest(),
+        }
+    )
+    return identity
+
+
+def get_composite_artifact_manifest_path(output_dir: Path | str) -> Path:
+    """返回综合模型 latest 产物清单路径。"""
+    return Path(output_dir) / "composite_artifact_manifest.json"
+
+
+def write_composite_artifact_manifest(
+    config: BacktestConfig,
+    output_dir: Path,
+    model_name: str,
+    split_time: pd.Timestamp,
+    validation_end_time: pd.Timestamp,
+) -> Path:
+    """写入综合回测产物身份，供组合层和实盘层校验。"""
+    detail_path = output_dir / "composite_detail.csv"
+    summary_path = output_dir / "composite_summary.csv"
+    active_path = get_active_factor_library_path(config)
+    detail = pd.read_csv(detail_path, index_col=0, parse_dates=True)
+    manifest = {
+        "schema_version": COMPOSITE_ARTIFACT_SCHEMA_VERSION,
+        "artifact_type": "composite_backtest",
+        "status": "complete",
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "run_id": str(getattr(config, "run_id", "") or ""),
+        "symbol": str(config.symbol),
+        "model_name": str(model_name),
+        "config_sha256": build_config_hash(config),
+        "source_sha256": build_source_fingerprint_hash(
+            [
+                Path("config.py"),
+                Path("framework/data_loader.py"),
+                Path("framework/factors.py"),
+                Path("framework/factor_library.py"),
+                Path("single_factor_backtest.py"),
+                Path("composite_factor_backtest.py"),
+                *sorted(Path("framework/factor_builders").glob("*.py")),
+            ]
+        ),
+        "split_time": str(split_time),
+        "validation_end_time": str(validation_end_time),
+        "detail_rows": int(len(detail)),
+        "detail_start": str(detail.index.min()) if not detail.empty else "",
+        "detail_end": str(detail.index.max()) if not detail.empty else "",
+        "inputs": {
+            "active_factor_library": build_file_identity(active_path),
+            "active_library_oos_audit": build_file_identity(
+                output_dir / "active_library_oos_audit.json"
+            ),
+        },
+        "outputs": {
+            "composite_detail": build_file_identity(detail_path),
+            "composite_summary": build_file_identity(summary_path),
+        },
+    }
+    path = get_composite_artifact_manifest_path(output_dir)
+    return write_json_atomic(path, manifest)
+
+
+def load_composite_artifact_manifest(
+    output_dir: Path | str,
+    expected_symbol: str | None = None,
+    verify_outputs: bool = True,
+    verify_inputs: bool = True,
+) -> tuple[dict[str, Any] | None, str]:
+    """读取并验证综合产物清单，返回清单和失败原因。"""
+    path = get_composite_artifact_manifest_path(output_dir)
+    if not path.exists():
+        return None, "缺少 composite_artifact_manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"产物清单无法解析: {exc}"
+    if int(manifest.get("schema_version", 0) or 0) != COMPOSITE_ARTIFACT_SCHEMA_VERSION:
+        return None, "产物清单版本不兼容"
+    if manifest.get("artifact_type") != "composite_backtest":
+        return None, "产物类型不是 composite_backtest"
+    if manifest.get("status") != "complete":
+        return None, "综合产物状态不是 complete"
+    if expected_symbol and str(manifest.get("symbol", "")).upper() != str(expected_symbol).upper():
+        return None, "产物品种与组合品种不一致"
+    if verify_inputs:
+        saved_inputs = manifest.get("inputs", {})
+        if not isinstance(saved_inputs, dict):
+            return None, "产物清单 inputs 字段无效"
+        saved_active = saved_inputs.get("active_factor_library")
+        if not isinstance(saved_active, dict):
+            return None, "产物清单缺少 active 因子库身份"
+        active_path = Path(str(saved_active.get("path", "")))
+        current_active = build_file_identity(active_path)
+        if not current_active.get("exists"):
+            return None, "综合回测使用的 active 因子库快照已缺失"
+        if current_active.get("sha256") != saved_active.get("sha256"):
+            return None, "综合回测使用的 active 因子库快照已变化"
+        saved_audit = saved_inputs.get("active_library_oos_audit")
+        if isinstance(saved_audit, dict) and saved_audit.get("exists"):
+            audit_path = Path(str(saved_audit.get("path", "")))
+            current_audit = build_file_identity(audit_path)
+            if not current_audit.get("exists"):
+                return None, "active 因子库样本外截止审计文件已缺失"
+            if current_audit.get("sha256") != saved_audit.get("sha256"):
+                return None, "active 因子库样本外截止审计文件已变化"
+    if verify_outputs:
+        expected_outputs = {
+            "composite_detail": Path(output_dir) / "composite_detail.csv",
+            "composite_summary": Path(output_dir) / "composite_summary.csv",
+        }
+        saved_outputs = manifest.get("outputs", {})
+        if not isinstance(saved_outputs, dict):
+            return None, "产物清单 outputs 字段无效"
+        for name, output_path in expected_outputs.items():
+            saved_identity = saved_outputs.get(name)
+            if not isinstance(saved_identity, dict):
+                return None, f"产物清单缺少必需文件身份: {name}"
+            current_identity = build_file_identity(output_path)
+            if not current_identity.get("exists"):
+                return None, f"产物文件缺失: {name}"
+            if current_identity.get("sha256") != saved_identity.get("sha256"):
+                return None, f"产物内容已变化: {name}"
+    return manifest, ""
+
+
 TARGET_TO_CLASS = {-1.0: 0, 0.0: 1, 1.0: 2}
 CLASS_TO_TARGET = {class_id: target for target, class_id in TARGET_TO_CLASS.items()}
 
@@ -70,6 +221,183 @@ def get_active_factor_library_path(config: BacktestConfig) -> Path:
     return get_factor_library_dir(config) / "active_factors.csv"
 
 
+def freeze_active_factor_library_for_run(
+    config: BacktestConfig,
+    output_dir: Path,
+    run_dir: Path | None,
+) -> tuple[BacktestConfig, Path]:
+    """在读取因子名之前冻结 active 库，并返回只引用该快照的运行配置。"""
+    source_path = get_active_factor_library_path(config).resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"没有找到 active 因子库: {source_path}。请先运行 single_factor_backtest.py 更新因子库。"
+        )
+    if not bool(getattr(config, "composite_auto_freeze_active_library", True)):
+        return config, source_path
+
+    snapshot_dir = run_dir if run_dir is not None else output_dir
+    snapshot_path = (snapshot_dir / "active_factors_snapshot.csv").resolve()
+    copy_file_atomic(source_path, snapshot_path)
+    active_library = pd.read_csv(snapshot_path)
+    if "因子" not in active_library.columns:
+        raise KeyError(f"active 因子库缺少 '因子' 列: {source_path}")
+
+    def unique_values(column: str) -> list[str]:
+        if column not in active_library.columns:
+            return []
+        return sorted(
+            {
+                str(value)
+                for value in active_library[column].dropna()
+                if str(value).strip()
+            }
+        )
+
+    snapshot_manifest = {
+        "schema_version": 1,
+        "artifact_type": "active_factor_library_snapshot",
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "run_id": str(getattr(config, "run_id", "") or ""),
+        "symbol": str(config.symbol),
+        "source": build_file_identity(source_path),
+        "snapshot": build_file_identity(snapshot_path),
+        "factor_count": int(active_library["因子"].notna().sum()),
+        "training_cutoffs": (
+            unique_values("因子筛选训练截止") or unique_values("训练截止")
+        ),
+        "validation_cutoffs": (
+            unique_values("因子筛选验证截止") or unique_values("验证截止")
+        ),
+    }
+    write_json_atomic(
+        snapshot_dir / "active_factors_snapshot_manifest.json",
+        snapshot_manifest,
+    )
+    runtime_config = replace(
+        config,
+        use_frozen_active_library=True,
+        frozen_active_library_path=str(snapshot_path),
+    )
+    print(
+        f"本轮 active 因子库已冻结: {snapshot_path}；"
+        f"因子数量={snapshot_manifest['factor_count']}"
+    )
+    return runtime_config, snapshot_path
+
+
+def audit_active_library_oos_cutoff(
+    config: BacktestConfig,
+    final_test_start: pd.Timestamp,
+    output_dir: Path,
+    run_dir: Path | None,
+) -> dict[str, Any]:
+    """确认 active 因子筛选使用的数据没有越过本次最终测试起点。"""
+    policy = str(
+        getattr(config, "composite_active_library_cutoff_policy", "auto")
+    ).lower()
+    active_path = get_active_factor_library_path(config).resolve()
+    active_library = pd.read_csv(active_path)
+    cutoff_column = ""
+    for candidate in (
+        "因子筛选验证截止",
+        "验证截止",
+        "因子筛选训练截止",
+        "训练截止",
+    ):
+        if candidate in active_library.columns:
+            cutoff_column = candidate
+            break
+
+    def comparable_timestamp(value: Any) -> pd.Timestamp | None:
+        try:
+            timestamp = pd.Timestamp(value)
+        except Exception:
+            return None
+        if pd.isna(timestamp):
+            return None
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert(None)
+        return timestamp
+
+    test_start = comparable_timestamp(final_test_start)
+    parsed_cutoffs = (
+        [
+            timestamp
+            for timestamp in (
+                comparable_timestamp(value)
+                for value in active_library[cutoff_column].dropna()
+            )
+            if timestamp is not None
+        ]
+        if cutoff_column
+        else []
+    )
+    latest_cutoff = max(parsed_cutoffs) if parsed_cutoffs else None
+    cutoff_valid = (
+        test_start is not None
+        and latest_cutoff is not None
+        and latest_cutoff <= test_start
+    )
+    if policy == "off":
+        status = "skipped"
+        reason = "配置关闭 active 因子库时间截止审计"
+    elif not cutoff_column:
+        status = "failed"
+        reason = "active 因子库缺少 验证截止/训练截止 元数据"
+    elif latest_cutoff is None:
+        status = "failed"
+        reason = f"active 因子库的 {cutoff_column} 无法解析"
+    elif not cutoff_valid:
+        status = "failed"
+        reason = (
+            f"active 因子库最新{cutoff_column}={latest_cutoff} "
+            f"晚于最终测试起点={test_start}"
+        )
+    else:
+        status = "passed"
+        reason = ""
+
+    audit = {
+        "schema_version": 1,
+        "artifact_type": "active_library_oos_cutoff_audit",
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "symbol": str(config.symbol),
+        "policy": policy,
+        "status": status,
+        "reason": reason,
+        "active_library": build_file_identity(active_path),
+        "cutoff_column": cutoff_column,
+        "latest_selection_cutoff": str(latest_cutoff) if latest_cutoff is not None else "",
+        "final_test_start": str(test_start) if test_start is not None else "",
+        "factor_count": int(active_library["因子"].notna().sum())
+        if "因子" in active_library.columns
+        else 0,
+    }
+    audit_path = write_json_atomic(
+        output_dir / "active_library_oos_audit.json",
+        audit,
+    )
+    if run_dir is not None:
+        write_json_atomic(run_dir / audit_path.name, audit)
+
+    if status == "failed":
+        message = f"active 因子库样本外截止审计失败: {reason}"
+        detected_future_selection = (
+            latest_cutoff is not None
+            and test_start is not None
+            and latest_cutoff > test_start
+        )
+        if policy == "error" or (policy == "auto" and detected_future_selection):
+            raise ValueError(message)
+        print(f"警告: {message}")
+    elif status == "passed":
+        print(
+            f"active 因子库样本外截止审计通过: "
+            f"{cutoff_column}={latest_cutoff} <= 最终测试起点={test_start}"
+        )
+    return audit
+
+
 def load_active_factor_names(config: BacktestConfig) -> list[str]:
     """先读取 active 因子名，用于综合回测按需构建因子矩阵。"""
     active_path = get_active_factor_library_path(config)
@@ -81,7 +409,17 @@ def load_active_factor_names(config: BacktestConfig) -> list[str]:
     active_library = pd.read_csv(active_path)
     if "因子" not in active_library.columns:
         raise KeyError(f"active 因子库缺少 '因子' 列: {active_path}")
-    return [str(factor_name) for factor_name in active_library["因子"].dropna().tolist()]
+    active_names = [
+        str(factor_name)
+        for factor_name in active_library["因子"].dropna().tolist()
+        if str(factor_name).strip()
+    ]
+    if not active_names:
+        raise ValueError(
+            f"active 因子库为空: {active_path}。综合回测已停止，"
+            "不会回退计算全部因子；请先运行单因子流程补充 active 因子。"
+        )
+    return list(dict.fromkeys(active_names))
 
 
 def build_factor_cache_meta(
@@ -203,7 +541,7 @@ def load_active_factor_pool(
     ]
     if not active_names:
         raise ValueError(
-            "active 因子库中没有任何因子能在当前 factors.py 生成。"
+            "active 因子库中没有任何因子能由 framework/factors.py 生成。"
             "请检查 active 因子库、related_symbols 或重新运行单因子回测。"
         )
 
@@ -345,6 +683,14 @@ def build_factor_signal_features(
     if missing:
         raise ValueError(f"因子数据缺少以下字段: {missing}")
 
+    if bool(factors.attrs.get("precomputed_factor_signals", False)):
+        return (
+            factors[selected_factors]
+            .replace([np.inf, -np.inf], np.nan)
+            .clip(lower=-1.0, upper=1.0)
+            .astype("float64")
+        )
+
     feature_data = {
         factor_name: score_to_raw_signal(
             factors[factor_name].replace([np.inf, -np.inf], np.nan),
@@ -435,7 +781,6 @@ def build_xgboost_features(
 ) -> pd.DataFrame:
     """构造 XGBoost 特征矩阵的便捷函数。"""
     signal_features = build_factor_signal_features(factors, selected_factors, config)
-    market_state = build_market_state_filter(data, config)
     return build_features_for_factors(factors, signal_features, selected_factors, config)
 
 
@@ -1580,17 +1925,22 @@ def build_xgboost_rolling_signal(
     min_train_samples = int(config.xgboost_min_train_samples)
     retrain_every = max(1, int(config.xgboost_retrain_every))
     target_horizon = get_xgboost_target_horizon(config)
+    progress_every = max(
+        1,
+        int(getattr(config, "xgboost_progress_every", 25) or 25),
+    )
 
     # 对每个样本外时点滚动预测；position 永远是当前预测点。
     # 多周期目标需要额外剔除训练窗口尾部尚未完全落地的标签，避免未来函数。
     for step, position in enumerate(predict_positions):
-        print(
-            f"{model_name}滚动预测进度: "
-            f"{step + 1}/{len(predict_positions)} 个K线时点；"
-            f"active候选因子={len(selected_factors)}；"
-            f"本轮最多选因={config.xgboost_best_top_n}",
-            end="\r",
-        )
+        if step == 0 or step + 1 == len(predict_positions) or (step + 1) % progress_every == 0:
+            print(
+                f"{model_name}滚动预测进度: "
+                f"{step + 1}/{len(predict_positions)} 个K线时点；"
+                f"active候选因子={len(selected_factors)}；"
+                f"本轮最多选因={config.xgboost_best_top_n}",
+                end="\r",
+            )
         train_start = max(0, position - train_window)
         train_end = position - target_horizon + 1
         if train_end <= train_start:
@@ -1628,7 +1978,8 @@ def build_xgboost_rolling_signal(
             else:
                 active_feature_columns = feature_columns
 
-            train_features = features.iloc[train_start:train_end]
+            # 合并逐列特征产生的内部碎片，避免 assign/fit 时反复复制内存。
+            train_features = features.iloc[train_start:train_end].copy()
             train_frame = train_features.assign(__target__=train_target).dropna(subset=["__target__"])
             if bool(getattr(config, "xgboost_train_use_market_filters", False)):
                 train_allowed_mask = (
@@ -2694,6 +3045,13 @@ def save_composite_outputs(
         else "active_factors.csv"
     )
     summary.loc["使用冻结因子库"] = bool(getattr(config, "use_frozen_active_library", False))
+    summary.loc["自动冻结active因子库"] = bool(
+        getattr(config, "composite_auto_freeze_active_library", True)
+    )
+    summary.loc["冻结因子库路径"] = str(get_active_factor_library_path(config))
+    summary.loc["因子库截止审计策略"] = str(
+        getattr(config, "composite_active_library_cutoff_policy", "auto")
+    )
     summary.loc["特征范围"] = config.xgboost_feature_scope
     summary.loc["特征模式"] = config.xgboost_feature_mode
     summary.loc["使用因子状态特征"] = config.xgboost_include_factor_state_features
@@ -2876,22 +3234,29 @@ def save_composite_outputs(
 
 def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
     """运行一次指定配置下的综合因子回测，并返回测试集绩效指标。"""
+    report_config_validation(config, "composite")
     output_dir = Path(config.output_dir) / "composite_factor"
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = get_experiment_run_dir(config, "composite")
+    config, _active_snapshot_path = freeze_active_factor_library_for_run(
+        config,
+        output_dir,
+        run_dir,
+    )
     write_run_config(config, output_dir)
     if run_dir is not None:
-        write_run_config(config, run_dir)
+        write_run_config(config, run_dir, filename="effective_run_config.json")
 
     try:
-        print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
-        data = fetch_intraday_data(config)
-
-        print("构建因子...")
         requested_factors = None
         if bool(getattr(config, "composite_build_active_only", True)):
             requested_factors = load_active_factor_names(config)
             print(f"综合回测按 active 因子按需构建: {len(requested_factors)} 个候选因子")
+
+        print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
+        data = fetch_intraday_data(config)
+
+        print("构建因子...")
         cache_path = output_dir / "active_factor_matrix_cache.pkl"
         factors = None
         if requested_factors is not None and bool(getattr(config, "composite_use_factor_cache", True)):
@@ -2905,7 +3270,6 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                 print(f"已保存 active 因子矩阵缓存: {cache_path}")
         if run_dir is not None:
             write_factor_count_snapshot(factors, run_dir)
-            snapshot_active_factor_library(config, run_dir)
             coverage = get_last_related_data_coverage()
             if not coverage.empty:
                 coverage.to_csv(
@@ -2922,6 +3286,12 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
             data.index,
             config.auto_select_train_ratio,
             getattr(config, "auto_select_validation_ratio", 0.0),
+        )
+        audit_active_library_oos_cutoff(
+            config,
+            validation_end_time,
+            output_dir,
+            run_dir,
         )
         selected_factors, selection_summary = get_selected_factors(
             data,
@@ -3042,6 +3412,13 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                         "最终测试集": backtest_df,
                     },
                 )
+                write_composite_artifact_manifest(
+                    config,
+                    output_dir,
+                    model_name,
+                    split_time,
+                    validation_end_time,
+                )
                 primary_metrics = metrics
 
             train_benchmark_vote_signal = build_backtest_signal_from_columns(
@@ -3121,6 +3498,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                     output_dir / "composite_cost_stress_report.csv",
                     output_dir / "composite_prediction_diagnostics.csv",
                     output_dir / "composite_prediction_confusion_matrix.csv",
+                    output_dir / "composite_artifact_manifest.json",
                     output_dir / "related_data_coverage.csv",
                     *generated_paths,
                 ],

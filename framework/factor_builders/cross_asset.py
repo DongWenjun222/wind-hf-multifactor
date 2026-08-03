@@ -15,6 +15,25 @@ from .common import (
 
 LAST_RELATED_DATA_COVERAGE = pd.DataFrame()
 
+
+def _has_requested_cross_group(
+    requested_set: set[str],
+    prefixes: tuple[str, ...],
+    symbol_key: str,
+    window: int,
+) -> bool:
+    """判断某个跨品种/窗口组合是否包含请求因子。"""
+    if not requested_set:
+        return True
+    symbol_token = f"_{symbol_key}_"
+    window_suffix = f"_{window}"
+    return any(
+        name.startswith(prefixes)
+        and symbol_token in name
+        and name.endswith(window_suffix)
+        for name in requested_set
+    )
+
 def get_last_related_data_coverage() -> pd.DataFrame:
     """返回最近一次跨品种因子构建产生的数据覆盖率诊断。"""
     return LAST_RELATED_DATA_COVERAGE.copy()
@@ -23,6 +42,7 @@ def add_cross_asset_factors(
     main_data: pd.DataFrame,
     related_data_map: dict[str, pd.DataFrame],
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """基于相关期货 OHLCV 行情生成跨品种因子。
 
@@ -45,6 +65,7 @@ def add_cross_asset_factors(
     factor_specs: list[tuple[str, pd.Series]] = []
     cross_expansion_specs: list[tuple[str, pd.Series]] = []
     coverage_rows = []
+    requested_set = set(requested_factors or [])
 
     for symbol, related_data in related_data_map.items():
         coverage_rows.append(
@@ -74,6 +95,13 @@ def add_cross_asset_factors(
         signed_related_volume = np.sign(related_return).fillna(0.0) * related_volume.fillna(0.0)
 
         for window in windows:
+            if not _has_requested_cross_group(
+                requested_set,
+                ("cross_", "crossmega_"),
+                symbol_key,
+                window,
+            ):
+                continue
             half_window = max(2, window // 2)
             related_vol = related_return.rolling(window).std().replace(0, np.nan)
             main_vol = main_return.rolling(window).std().replace(0, np.nan)
@@ -161,6 +189,8 @@ def add_cross_asset_factors(
                 )
 
     factor_specs = factor_specs + cross_expansion_specs[:10000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
 
     max_factors = getattr(config, "cross_asset_max_factors", None)
     if max_factors is not None:
@@ -177,6 +207,7 @@ def add_complex_cross_asset_factors(
     main_data: pd.DataFrame,
     related_data_map: dict[str, pd.DataFrame],
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成更复杂的跨品种结构因子。"""
     if not related_data_map:
@@ -197,6 +228,7 @@ def add_complex_cross_asset_factors(
     windows = list(getattr(config, "cross_asset_factor_windows", []) or [])
     max_ffill_bars = max(0, int(getattr(config, "cross_asset_max_ffill_bars", 0) or 0))
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
 
     for symbol, related_data in related_data_map.items():
         related = align_related_data_to_main(related_data, main_data.index, max_ffill_bars)
@@ -224,6 +256,13 @@ def add_complex_cross_asset_factors(
         amount_ratio = main_amount / related_amount
 
         for window in windows:
+            if not _has_requested_cross_group(
+                requested_set,
+                ("crossultra_",),
+                symbol_key,
+                window,
+            ):
+                continue
             half_window = max(2, window // 2)
             rolling_beta = (
                 main_return.rolling(window).cov(related_return)
@@ -283,6 +322,8 @@ def add_complex_cross_asset_factors(
                 )
 
     factor_specs = factor_specs[:10000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
     return pd.DataFrame(
         {
             factor_name: rolling_zscore(raw_factor, config.zscore_window)
@@ -295,6 +336,7 @@ def add_hyper_cross_asset_factors(
     main_data: pd.DataFrame,
     related_data_map: dict[str, pd.DataFrame],
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成更高阶的跨品种交互因子。"""
     if not related_data_map:
@@ -315,6 +357,7 @@ def add_hyper_cross_asset_factors(
     windows = list(getattr(config, "cross_asset_factor_windows", []) or [])
     max_ffill_bars = max(0, int(getattr(config, "cross_asset_max_ffill_bars", 0) or 0))
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
 
     for symbol, related_data in related_data_map.items():
         related = align_related_data_to_main(related_data, main_data.index, max_ffill_bars)
@@ -342,6 +385,13 @@ def add_hyper_cross_asset_factors(
         amount_ratio = main_amount / related_amount
 
         for window in windows:
+            if not _has_requested_cross_group(
+                requested_set,
+                ("crosshyper_",),
+                symbol_key,
+                window,
+            ):
+                continue
             half_window = max(2, window // 2)
             double_window = min(240, max(window + 1, window * 2))
             beta = main_return.rolling(window).cov(related_return) / related_return.rolling(window).var().replace(0, np.nan)
@@ -401,6 +451,8 @@ def add_hyper_cross_asset_factors(
                 )
 
     factor_specs = factor_specs[:10000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
     return pd.DataFrame(
         {
             factor_name: rolling_zscore(raw_factor, config.zscore_window)
@@ -413,6 +465,7 @@ def add_omega_cross_asset_factors(
     main_data: pd.DataFrame,
     related_data_map: dict[str, pd.DataFrame],
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """追加生成第四批跨品种复杂交互因子。"""
     if not related_data_map:
@@ -433,6 +486,7 @@ def add_omega_cross_asset_factors(
     windows = list(getattr(config, "cross_asset_factor_windows", []) or [])
     max_ffill_bars = max(0, int(getattr(config, "cross_asset_max_ffill_bars", 0) or 0))
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
 
     for symbol, related_data in related_data_map.items():
         related = align_related_data_to_main(related_data, main_data.index, max_ffill_bars)
@@ -460,6 +514,13 @@ def add_omega_cross_asset_factors(
         amount_ratio = main_amount / related_amount
 
         for window in windows:
+            if not _has_requested_cross_group(
+                requested_set,
+                ("crossomega_",),
+                symbol_key,
+                window,
+            ):
+                continue
             half_window = max(2, window // 2)
             beta = main_return.rolling(window).cov(related_return) / related_return.rolling(window).var().replace(0, np.nan)
             corr = main_return.rolling(window).corr(related_return)
@@ -527,6 +588,8 @@ def add_omega_cross_asset_factors(
                 )
 
     factor_specs = factor_specs[:20000]
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
     return pd.DataFrame(
         {
             factor_name: rolling_zscore(raw_factor, config.zscore_window)

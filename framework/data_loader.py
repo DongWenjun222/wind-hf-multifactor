@@ -7,7 +7,7 @@ from __future__ import annotations
 - 相关品种分钟 K 线读取。
 - 宏观/资金利率/指数等 Wind 日频数据读取与缓存。
 
-因子公式和因子矩阵拼装仍放在 factors.py 与 factor_builders/ 中。
+因子公式和因子矩阵拼装放在 framework/factors.py 与 framework/factor_builders/ 中。
 """
 
 from dataclasses import replace

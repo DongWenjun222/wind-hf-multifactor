@@ -13,18 +13,54 @@ from dataclasses import asdict
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
+import shutil
 import sys
 import traceback
 from typing import Any, Callable, TextIO, TypeVar
 import warnings
 
 from config import BacktestConfig
-from experiment_utils import get_experiment_run_dir, write_run_config
+from .experiment_utils import get_experiment_run_dir, write_run_config
 
 
 T = TypeVar("T")
+
+
+def write_json_atomic(path: Path | str, payload: Any) -> Path:
+    """在同一目录内原子写入 JSON，避免中断后留下不完整清单。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2, default=str)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, target)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return target
+
+
+def copy_file_atomic(source: Path | str, target: Path | str) -> Path:
+    """原子复制文件，确保消费者只会看到旧文件或完整的新文件。"""
+    source_path = Path(source)
+    target_path = Path(target)
+    if source_path.resolve() == target_path.resolve():
+        return target_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(source_path, temp_path)
+        os.replace(temp_path, target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return target_path
 
 
 def configure_warning_output(config: BacktestConfig) -> None:
@@ -150,9 +186,7 @@ def write_execution_manifest(
         "output_files_updated": collect_output_files(Path(config.output_dir), started_at),
     }
     manifest_path = manifest_dir / "execution_manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as file:
-        json.dump(manifest, file, ensure_ascii=False, indent=2, default=str)
-    return manifest_path
+    return write_json_atomic(manifest_path, manifest)
 
 
 def run_tracked(

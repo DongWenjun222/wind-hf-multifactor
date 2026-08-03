@@ -7,7 +7,7 @@ from __future__ import annotations
 - 在训练集上判断因子正反方向，在测试集上评估样本外表现。
 - 计算累计收益、年化收益、夏普、最大回撤、胜率、交易次数等指标。
 - 生成 qcut 分组检验，观察因子值与未来收益是否具有单调关系。
-- 调用 factor_library.py，把表现较好且低相关的因子沉淀到因子库。
+- 调用 framework/factor_library.py，把表现较好且低相关的因子沉淀到因子库。
 """
 
 from pathlib import Path
@@ -18,22 +18,22 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from config import BacktestConfig
-from experiment_utils import (
+from config import BacktestConfig, report_config_validation
+from framework.experiment_utils import (
     copy_existing_files,
     get_experiment_run_dir,
     snapshot_active_factor_library,
     write_factor_count_snapshot,
     write_run_config,
 )
-from runtime_utils import run_tracked
-from factor_library import (
+from framework.runtime_utils import run_tracked
+from framework.factor_library import (
     build_factor_library,
     get_factor_library_dir,
     rank_single_factor_summary,
     save_factor_library,
 )
-from factors import (
+from framework.factors import (
     build_factors,
     build_single_factor_matrix,
     fetch_intraday_data,
@@ -380,7 +380,7 @@ def run_backtest(data: pd.DataFrame, signal: pd.DataFrame, config: Any):
 
     核心假设：
     - position 已经向后移动一根K线，因此不会用未来信号交易当前K线。
-    - 单根收益使用 open 到 close 的收益 bar_return_oc。
+    - 默认使用连续持仓收益：旧仓位承担跨 K 线跳空，新仓位承担开盘到收盘损益。
     - 成本按仓位变化 turnover * (commission + slippage) 计算。
     """
     df = data.join(signal, how="inner").copy()
@@ -392,7 +392,13 @@ def run_backtest(data: pd.DataFrame, signal: pd.DataFrame, config: Any):
         else:
             raise KeyError("回测缺少 bar_return_oc，且原始数据中也没有 open/close 可用于重算。")
 
-    df = df.dropna(subset=["position", "composite_score", "bar_return_oc"])
+    df = df.dropna(subset=["position", "bar_return_oc"])
+    valid_score = df["composite_score"].replace([np.inf, -np.inf], np.nan).notna()
+    if not valid_score.any():
+        raise ValueError("回测结果为空，无法计算绩效指标。")
+    # 只去掉最前面的滚动预热期；中途缺失必须保留原始时间轴，并由信号逻辑保持空仓。
+    first_valid_position = int(np.flatnonzero(valid_score.to_numpy())[0])
+    df = df.iloc[first_valid_position:].copy()
 
     previous_position = df["position"].shift(1).fillna(0.0)
     turnover = (df["position"] - previous_position).abs()
@@ -412,6 +418,8 @@ def run_backtest(data: pd.DataFrame, signal: pd.DataFrame, config: Any):
         df["intrabar_pnl_return"] = df["bar_return_oc"].fillna(0.0)
         df["strategy_gross_return"] = df["position"] * df["intrabar_pnl_return"]
     elif return_mode == "next_open_continuous":
+        if not {"open", "close"}.issubset(df.columns):
+            raise KeyError("next_open_continuous 收益口径要求原始数据同时包含 open 和 close。")
         previous_close = df["close"].shift(1).replace(0, np.nan)
         capital_base = previous_close.fillna(df["open"].replace(0, np.nan))
         df["gap_return"] = (df["open"] - previous_close) / previous_close
@@ -1447,6 +1455,18 @@ def run_single_factor_backtests(
         factors,
         config,
     )
+    selection_metadata = {
+        "因子筛选训练截止": str(split_time),
+        "因子筛选验证截止": str(validation_end_time),
+    }
+    for frame in (
+        active_library,
+        library_all,
+        rejected_library,
+        full_summary,
+    ):
+        for column, value in selection_metadata.items():
+            frame[column] = value
     if not plot_all:
         plot_paths = generate_top_single_factor_plots(
             active_library,
@@ -1512,6 +1532,7 @@ def run_single_factor_pipeline(
     max_bars: int | None = None,
 ) -> pd.DataFrame:
     """运行单品种单因子完整流程，供单品种入口和多品种调度共同复用。"""
+    report_config_validation(config, "single")
     print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
     data = fetch_intraday_data(config)
 

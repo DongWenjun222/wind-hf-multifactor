@@ -16,6 +16,7 @@ from .common import (
 def add_parametric_factors(
     df: pd.DataFrame,
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """批量生成参数化因子。
 
@@ -80,8 +81,19 @@ def add_parametric_factors(
     body_volume_product = body_pct * volume_change
     wick_balance_pct = (lower_shadow - upper_shadow) / open_price
 
+    requested_set = set(requested_factors or [])
+
     # 多个窗口代表不同时间尺度：短窗口更敏感，长窗口更稳定。
     windows = [2, 3, 4, 5, 6, 8, 10, 13, 16, 21, 26, 34, 42, 55, 68, 89, 110, 144, 178, 233]
+    if requested_set:
+        requested_windows = {
+            int(factor_name.rsplit("_", 1)[-1])
+            for factor_name in requested_set
+            if factor_name.rsplit("_", 1)[-1].isdigit()
+        }
+        windows = [window for window in windows if window in requested_windows]
+        if not windows:
+            return pd.DataFrame(index=df.index)
     factor_specs = []
     additional_factor_specs = []
     new_factor_specs = []
@@ -429,6 +441,12 @@ def add_parametric_factors(
         + new_factor_specs[:3000]
         + expansion_factor_specs[:10000]
     )
+    if requested_set:
+        factor_specs = [
+            (factor_name, raw_factor)
+            for factor_name, raw_factor in factor_specs
+            if factor_name in requested_set
+        ]
     parametric_factors = {
         factor_name: rolling_zscore(raw_factor, config.zscore_window)
         for factor_name, raw_factor in factor_specs

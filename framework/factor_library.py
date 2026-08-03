@@ -10,13 +10,14 @@ from __future__ import annotations
 """
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
-from factor_taxonomy import get_factor_family
-from factors import score_to_raw_signal
+from .factor_taxonomy import get_factor_family
+from .factors import score_to_raw_signal
 
 
 def get_family_quota_limit(config: BacktestConfig, family: str) -> int | None:
@@ -43,9 +44,8 @@ def conservative_pair(
     frame: pd.DataFrame,
     train_column: str,
     validation_column: str,
-    fallback_column: str | None = None,
 ) -> pd.Series:
-    """优先取训练/验证两段的较弱值；没有验证时回退到训练，再回退到兼容列。"""
+    """取训练/验证较弱值；验证缺失时用训练，训练缺失时保持无效。"""
     train = (
         pd.to_numeric(frame[train_column], errors="coerce")
         if train_column in frame.columns
@@ -56,13 +56,14 @@ def conservative_pair(
         if validation_column in frame.columns
         else pd.Series(np.nan, index=frame.index, dtype="float64")
     )
-    if train is not None and validation is not None and (train.notna().any() or validation.notna().any()):
-        return pd.concat([train, validation], axis=1).min(axis=1)
-    if train is not None and train.notna().any():
-        return train
-    if fallback_column and fallback_column in frame.columns:
-        return pd.to_numeric(frame[fallback_column], errors="coerce")
-    return pd.Series(np.nan, index=frame.index, dtype="float64")
+    result = train.replace([np.inf, -np.inf], np.nan).copy()
+    validation = validation.replace([np.inf, -np.inf], np.nan)
+    both_valid = result.notna() & validation.notna()
+    result.loc[both_valid] = pd.concat(
+        [result.loc[both_valid], validation.loc[both_valid]],
+        axis=1,
+    ).min(axis=1)
+    return result.astype("float64")
 
 
 def consistency_score(frame: pd.DataFrame, train_column: str, validation_column: str) -> pd.Series:
@@ -85,16 +86,16 @@ def add_factor_research_scores(frame: pd.DataFrame, config: BacktestConfig) -> p
     scored = frame.copy()
 
     performance_score = (
-        0.65 * normalize_score_series(conservative_pair(scored, "训练夏普比率", "验证夏普比率", "初筛夏普"))
-        + 0.35 * normalize_score_series(conservative_pair(scored, "训练累计收益", "验证累计收益", "初筛累计收益"))
+        0.65 * normalize_score_series(conservative_pair(scored, "训练夏普比率", "验证夏普比率"))
+        + 0.35 * normalize_score_series(conservative_pair(scored, "训练累计收益", "验证累计收益"))
     )
 
     predictive_score = (
-        0.30 * normalize_score_series(conservative_pair(scored, "训练RankIC", "验证RankIC", "初筛RankIC"))
+        0.30 * normalize_score_series(conservative_pair(scored, "训练RankIC", "验证RankIC"))
         + 0.15 * normalize_score_series(conservative_pair(scored, "训练RankICIR", "验证RankICIR"))
         + 0.15 * normalize_score_series(conservative_pair(scored, "训练IC胜率", "验证IC胜率"))
         + 0.15 * normalize_score_series(conservative_pair(scored, "训练方向命中率", "验证方向命中率"))
-        + 0.15 * normalize_score_series(conservative_pair(scored, "训练分组单调性", "验证分组单调性", "初筛分组单调性"))
+        + 0.15 * normalize_score_series(conservative_pair(scored, "训练分组单调性", "验证分组单调性"))
         + 0.10 * normalize_score_series(conservative_pair(scored, "训练分组收益差", "验证分组收益差"))
     )
 
@@ -146,55 +147,65 @@ def rank_single_factor_summary(
 
     排序逻辑：
     1. 优先使用验证集与训练集表现的较弱值排序，避免单段偶然表现决定入库。
-    2. 如果没有验证列，则只使用训练集；如果训练列也不存在，再回退使用旧测试列。
+    2. 如果没有有效验证数据，则只使用训练集；最终测试集永不参与排序。
     3. 仅把前 single_factor_keep_top_n 个标记为 active，其余先标记为 rejected。
 
     这里还没有做相关性去重，相关性过滤会在 build_factor_library 中完成。
     """
     ranked = summary.copy()
-    has_train = {"训练夏普比率", "训练累计收益"}.issubset(ranked.columns)
-    has_validation = {"验证夏普比率", "验证累计收益"}.issubset(ranked.columns)
-    has_test = {"测试夏普比率", "测试累计收益"}.issubset(ranked.columns)
-    has_train_validation_rank_ic = {"训练RankIC", "验证RankIC"}.issubset(ranked.columns)
-    has_train_validation_monotonicity = {"训练分组单调性", "验证分组单调性"}.issubset(ranked.columns)
-    if has_train and has_validation:
-        train_sharpe = ranked["训练夏普比率"].replace([np.inf, -np.inf], np.nan)
-        validation_sharpe = ranked["验证夏普比率"].replace([np.inf, -np.inf], np.nan)
-        train_return = ranked["训练累计收益"].replace([np.inf, -np.inf], np.nan)
-        validation_return = ranked["验证累计收益"].replace([np.inf, -np.inf], np.nan)
-        sharpe = pd.concat([train_sharpe, validation_sharpe], axis=1).min(axis=1)
-        total_return = pd.concat([train_return, validation_return], axis=1).min(axis=1)
-        selection_sample = "训练+验证"
-    elif has_train:
-        sharpe = ranked["训练夏普比率"].replace([np.inf, -np.inf], np.nan)
-        total_return = ranked["训练累计收益"].replace([np.inf, -np.inf], np.nan)
-        selection_sample = "训练"
-    elif has_test:
-        sharpe = ranked["测试夏普比率"].replace([np.inf, -np.inf], np.nan)
-        total_return = ranked["测试累计收益"].replace([np.inf, -np.inf], np.nan)
-        selection_sample = "测试"
-    else:
-        raise KeyError("单因子汇总缺少初筛排序字段，需要训练、验证或测试收益/夏普列。")
+    has_train = (
+        {"训练夏普比率", "训练累计收益"}.issubset(ranked.columns)
+        and pd.to_numeric(ranked["训练夏普比率"], errors="coerce").notna().any()
+        and pd.to_numeric(ranked["训练累计收益"], errors="coerce").notna().any()
+    )
+    has_validation = (
+        {"验证夏普比率", "验证累计收益"}.issubset(ranked.columns)
+        and pd.to_numeric(ranked["验证夏普比率"], errors="coerce").notna().any()
+        and pd.to_numeric(ranked["验证累计收益"], errors="coerce").notna().any()
+    )
+    has_train_validation_rank_ic = (
+        {"训练RankIC", "验证RankIC"}.issubset(ranked.columns)
+        and pd.to_numeric(ranked["验证RankIC"], errors="coerce").notna().any()
+    )
+    has_train_validation_monotonicity = (
+        {"训练分组单调性", "验证分组单调性"}.issubset(ranked.columns)
+        and pd.to_numeric(ranked["验证分组单调性"], errors="coerce").notna().any()
+    )
+    if not has_train:
+        raise KeyError("单因子汇总缺少训练收益/夏普列，不能使用最终测试集替代入库筛选。")
+    sharpe = conservative_pair(ranked, "训练夏普比率", "验证夏普比率")
+    total_return = conservative_pair(ranked, "训练累计收益", "验证累计收益")
+    valid_train = (
+        pd.to_numeric(ranked["训练夏普比率"], errors="coerce").notna()
+        & pd.to_numeric(ranked["训练累计收益"], errors="coerce").notna()
+    )
+    valid_validation = (
+        pd.to_numeric(ranked.get("验证夏普比率"), errors="coerce").notna()
+        & pd.to_numeric(ranked.get("验证累计收益"), errors="coerce").notna()
+        if has_validation
+        else pd.Series(False, index=ranked.index)
+    )
+    selection_sample = np.select(
+        [valid_train & valid_validation, valid_train],
+        ["训练+验证", "训练"],
+        default="不可追溯",
+    )
 
     if has_train_validation_rank_ic:
-        train_rank_ic = ranked["训练RankIC"].replace([np.inf, -np.inf], np.nan)
-        validation_rank_ic = ranked["验证RankIC"].replace([np.inf, -np.inf], np.nan)
-        selection_rank_ic = pd.concat([train_rank_ic, validation_rank_ic], axis=1).min(axis=1)
+        selection_rank_ic = conservative_pair(ranked, "训练RankIC", "验证RankIC")
     elif "训练RankIC" in ranked.columns:
         selection_rank_ic = ranked["训练RankIC"].replace([np.inf, -np.inf], np.nan)
-    elif "测试RankIC" in ranked.columns:
-        selection_rank_ic = ranked["测试RankIC"].replace([np.inf, -np.inf], np.nan)
     else:
         selection_rank_ic = pd.Series(np.nan, index=ranked.index)
 
     if has_train_validation_monotonicity:
-        train_monotonicity = ranked["训练分组单调性"].replace([np.inf, -np.inf], np.nan)
-        validation_monotonicity = ranked["验证分组单调性"].replace([np.inf, -np.inf], np.nan)
-        selection_monotonicity = pd.concat([train_monotonicity, validation_monotonicity], axis=1).min(axis=1)
+        selection_monotonicity = conservative_pair(
+            ranked,
+            "训练分组单调性",
+            "验证分组单调性",
+        )
     elif "训练分组单调性" in ranked.columns:
         selection_monotonicity = ranked["训练分组单调性"].replace([np.inf, -np.inf], np.nan)
-    elif "测试分组单调性" in ranked.columns:
-        selection_monotonicity = ranked["测试分组单调性"].replace([np.inf, -np.inf], np.nan)
     else:
         selection_monotonicity = pd.Series(np.nan, index=ranked.index)
 
@@ -282,15 +293,47 @@ def get_numeric_value(row: pd.Series, column: str, default: float = np.nan) -> f
     return pd.to_numeric(row.get(column), errors="coerce")
 
 
-def choose_metric_column(
+def get_selection_config_value(
+    config: BacktestConfig,
+    canonical_name: str,
+    legacy_name: str,
+) -> Any:
+    """读取入库选择参数；显式旧字段仅作为迁移期兼容覆盖。"""
+    legacy_value = getattr(config, legacy_name, None)
+    if legacy_value is not None:
+        return legacy_value
+    return getattr(config, canonical_name)
+
+
+def build_selection_metric(
     frame: pd.DataFrame,
-    preferred_column: str,
-    fallback_column: str,
-) -> str:
-    """优先选择有有效数据的指标列，否则回退到兼容列。"""
-    if preferred_column in frame.columns and pd.to_numeric(frame[preferred_column], errors="coerce").notna().any():
-        return preferred_column
-    return fallback_column
+    validation_column: str,
+    train_column: str,
+) -> tuple[pd.Series, pd.Series]:
+    """逐因子选择验证指标，单行验证缺失时回退同一行训练指标。"""
+    validation = (
+        pd.to_numeric(frame[validation_column], errors="coerce")
+        if validation_column in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
+    train = (
+        pd.to_numeric(frame[train_column], errors="coerce")
+        if train_column in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
+    validation = validation.replace([np.inf, -np.inf], np.nan)
+    train = train.replace([np.inf, -np.inf], np.nan)
+    selected = validation.combine_first(train).astype("float64")
+    source = pd.Series(
+        np.select(
+            [validation.notna(), train.notna()],
+            [validation_column, train_column],
+            default="不可用",
+        ),
+        index=frame.index,
+        dtype="object",
+    )
+    return selected, source
 
 
 def build_factor_library(
@@ -383,6 +426,47 @@ def build_factor_library(
         if numeric_column not in combined.columns:
             combined[numeric_column] = np.nan
         combined[numeric_column] = pd.to_numeric(combined[numeric_column], errors="coerce")
+
+    # 历史初筛列可能由旧版本口径生成，统一从可追溯的训练/验证指标重建。
+    combined["初筛夏普"] = conservative_pair(
+        combined,
+        "训练夏普比率",
+        "验证夏普比率",
+    )
+    combined["初筛累计收益"] = conservative_pair(
+        combined,
+        "训练累计收益",
+        "验证累计收益",
+    )
+    combined["初筛RankIC"] = conservative_pair(
+        combined,
+        "训练RankIC",
+        "验证RankIC",
+    )
+    combined["初筛分组单调性"] = conservative_pair(
+        combined,
+        "训练分组单调性",
+        "验证分组单调性",
+    )
+    has_traceable_train = (
+        combined["训练夏普比率"].notna()
+        & combined["训练累计收益"].notna()
+    )
+    has_traceable_validation = (
+        combined["验证夏普比率"].notna()
+        & combined["验证累计收益"].notna()
+    )
+    combined["入库数据可追溯"] = has_traceable_train
+    combined["初筛有效"] = (
+        has_traceable_train
+        & combined["初筛夏普"].notna()
+        & combined["初筛累计收益"].notna()
+    )
+    combined["初筛样本"] = np.select(
+        [has_traceable_train & has_traceable_validation, has_traceable_train],
+        ["训练+验证", "训练"],
+        default="不可追溯",
+    )
     combined = add_factor_research_scores(combined, config)
     combined = combined.sort_values(
         [
@@ -403,28 +487,79 @@ def build_factor_library(
     min_train_sharpe = float(getattr(config, "factor_library_min_train_sharpe", -np.inf))
     min_train_total_return = float(getattr(config, "factor_library_min_train_total_return", -np.inf))
     min_train_win_rate = float(getattr(config, "factor_library_min_train_win_rate", -np.inf))
-    min_test_win_rate = float(getattr(config, "factor_library_min_test_win_rate", -np.inf))
-    min_test_trades = max(0, int(getattr(config, "factor_library_min_test_trades", 0) or 0))
+    min_selection_win_rate = float(
+        get_selection_config_value(
+            config,
+            "factor_library_min_selection_win_rate",
+            "factor_library_min_test_win_rate",
+        )
+    )
+    min_selection_trades = max(
+        0,
+        int(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_trades",
+                "factor_library_min_test_trades",
+            )
+            or 0
+        ),
+    )
     min_train_trades = max(0, int(getattr(config, "factor_library_min_train_trades", 0) or 0))
-    min_test_signal_coverage = max(
+    min_selection_signal_coverage = max(
         0.0,
-        float(getattr(config, "factor_library_min_test_signal_coverage", 0.0) or 0.0),
+        float(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_signal_coverage",
+                "factor_library_min_test_signal_coverage",
+            )
+            or 0.0
+        ),
     )
     min_train_signal_coverage = max(
         0.0,
         float(getattr(config, "factor_library_min_train_signal_coverage", 0.0) or 0.0),
     )
-    max_test_drawdown = getattr(config, "factor_library_max_test_drawdown", None)
+    max_selection_drawdown = get_selection_config_value(
+        config,
+        "factor_library_max_selection_drawdown",
+        "factor_library_max_test_drawdown",
+    )
     max_train_drawdown = getattr(config, "factor_library_max_train_drawdown", None)
     min_selection_rank_ic = getattr(config, "factor_library_min_selection_rank_ic", None)
     min_selection_monotonicity = getattr(config, "factor_library_min_selection_monotonicity", None)
     min_research_score = getattr(config, "factor_library_min_research_score", None)
     min_predictive_score = getattr(config, "factor_library_min_predictive_score", None)
     threshold_epsilon = 1e-12
-    selection_win_rate_column = choose_metric_column(combined, "验证胜率", "测试胜率")
-    selection_trade_column = choose_metric_column(combined, "验证交易次数", "测试交易次数")
-    selection_coverage_column = choose_metric_column(combined, "验证信号覆盖率", "测试信号覆盖率")
-    selection_drawdown_column = choose_metric_column(combined, "验证最大回撤", "测试最大回撤")
+    selection_win_rate, selection_win_rate_source = build_selection_metric(
+        combined,
+        "验证胜率",
+        "训练胜率",
+    )
+    selection_trades, selection_trade_source = build_selection_metric(
+        combined,
+        "验证交易次数",
+        "训练交易次数",
+    )
+    selection_coverage, selection_coverage_source = build_selection_metric(
+        combined,
+        "验证信号覆盖率",
+        "训练信号覆盖率",
+    )
+    selection_drawdown, selection_drawdown_source = build_selection_metric(
+        combined,
+        "验证最大回撤",
+        "训练最大回撤",
+    )
+    combined["入库胜率值"] = selection_win_rate
+    combined["入库交易次数值"] = selection_trades
+    combined["入库信号覆盖率值"] = selection_coverage
+    combined["入库回撤值"] = selection_drawdown
+    combined["入库胜率口径"] = selection_win_rate_source
+    combined["入库交易次数口径"] = selection_trade_source
+    combined["入库信号覆盖率口径"] = selection_coverage_source
+    combined["入库回撤口径"] = selection_drawdown_source
 
     eligible_mask = (
         combined["初筛有效"].fillna(False)
@@ -434,7 +569,7 @@ def build_factor_library(
         & (combined["训练夏普比率"] >= min_train_sharpe)
         & (combined["训练累计收益"] >= min_train_total_return)
         & (combined["训练胜率"] > min_train_win_rate)
-        & (combined[selection_win_rate_column] > min_test_win_rate)
+        & (combined["入库胜率值"] > min_selection_win_rate)
     )
     if min_selection_rank_ic is not None:
         eligible_mask &= combined["初筛RankIC"].fillna(-np.inf) >= float(min_selection_rank_ic)
@@ -444,16 +579,24 @@ def build_factor_library(
         eligible_mask &= combined["初筛科研综合评分"].fillna(-np.inf) + threshold_epsilon >= float(min_research_score)
     if min_predictive_score is not None:
         eligible_mask &= combined["初筛预测能力评分"].fillna(-np.inf) + threshold_epsilon >= float(min_predictive_score)
-    if min_test_trades > 0:
-        eligible_mask &= combined[selection_trade_column].fillna(0.0) >= min_test_trades
+    if min_selection_trades > 0:
+        eligible_mask &= (
+            combined["入库交易次数值"].fillna(0.0) >= min_selection_trades
+        )
     if min_train_trades > 0:
         eligible_mask &= combined["训练交易次数"].fillna(0.0) >= min_train_trades
-    if min_test_signal_coverage > 0:
-        eligible_mask &= combined[selection_coverage_column].fillna(0.0) >= min_test_signal_coverage
+    if min_selection_signal_coverage > 0:
+        eligible_mask &= (
+            combined["入库信号覆盖率值"].fillna(0.0)
+            >= min_selection_signal_coverage
+        )
     if min_train_signal_coverage > 0:
         eligible_mask &= combined["训练信号覆盖率"].fillna(0.0) >= min_train_signal_coverage
-    if max_test_drawdown is not None:
-        eligible_mask &= combined[selection_drawdown_column].fillna(-np.inf) >= float(max_test_drawdown)
+    if max_selection_drawdown is not None:
+        eligible_mask &= (
+            combined["入库回撤值"].fillna(-np.inf)
+            >= float(max_selection_drawdown)
+        )
     if max_train_drawdown is not None:
         eligible_mask &= combined["训练最大回撤"].fillna(-np.inf) >= float(max_train_drawdown)
     eligible_factors = combined.loc[eligible_mask, "因子"].tolist()
@@ -486,6 +629,8 @@ def build_factor_library(
 
         if factor_name not in available:
             reject_reason = "factor_not_available"
+        elif not bool(row.get("入库数据可追溯", False)):
+            reject_reason = "missing_traceable_train_metrics"
         elif not bool(row.get("初筛有效", False)):
             reject_reason = "invalid_score"
         elif row.get("初筛夏普", np.nan) < config.factor_library_min_sharpe:
@@ -498,7 +643,10 @@ def build_factor_library(
             reject_reason = "low_train_total_return"
         elif get_numeric_value(row, "训练胜率", -np.inf) <= min_train_win_rate:
             reject_reason = "low_train_win_rate"
-        elif get_numeric_value(row, selection_win_rate_column, -np.inf) <= min_test_win_rate:
+        elif (
+            get_numeric_value(row, "入库胜率值", -np.inf)
+            <= min_selection_win_rate
+        ):
             reject_reason = "low_selection_win_rate"
         elif min_selection_rank_ic is not None and get_numeric_value(row, "初筛RankIC", -np.inf) < float(min_selection_rank_ic):
             reject_reason = "low_selection_rank_ic"
@@ -508,15 +656,25 @@ def build_factor_library(
             reject_reason = "low_research_score"
         elif min_predictive_score is not None and get_numeric_value(row, "初筛预测能力评分", -np.inf) + threshold_epsilon < float(min_predictive_score):
             reject_reason = "low_predictive_score"
-        elif get_numeric_value(row, selection_trade_column, 0.0) < min_test_trades:
+        elif (
+            get_numeric_value(row, "入库交易次数值", 0.0)
+            < min_selection_trades
+        ):
             reject_reason = "low_selection_trade_count"
         elif get_numeric_value(row, "训练交易次数", 0.0) < min_train_trades:
             reject_reason = "low_train_trade_count"
-        elif get_numeric_value(row, selection_coverage_column, 0.0) < min_test_signal_coverage:
+        elif (
+            get_numeric_value(row, "入库信号覆盖率值", 0.0)
+            < min_selection_signal_coverage
+        ):
             reject_reason = "low_selection_signal_coverage"
         elif get_numeric_value(row, "训练信号覆盖率", 0.0) < min_train_signal_coverage:
             reject_reason = "low_train_signal_coverage"
-        elif max_test_drawdown is not None and get_numeric_value(row, selection_drawdown_column, -np.inf) < float(max_test_drawdown):
+        elif (
+            max_selection_drawdown is not None
+            and get_numeric_value(row, "入库回撤值", -np.inf)
+            < float(max_selection_drawdown)
+        ):
             reject_reason = "high_selection_drawdown"
         elif max_train_drawdown is not None and get_numeric_value(row, "训练最大回撤", -np.inf) < float(max_train_drawdown):
             reject_reason = "high_train_drawdown"

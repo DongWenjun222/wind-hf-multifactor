@@ -15,7 +15,7 @@ import re
 from typing import Iterable
 
 
-DEFAULT_SOURCE_PATTERNS = ["*.py", "factor_builders/*.py"]
+DEFAULT_SOURCE_PATTERNS = ["*.py", "framework/*.py", "framework/factor_builders/*.py"]
 DEFAULT_EXCLUDE_PARTS = {"__pycache__", ".git", "wind_hf_multifactor_output"}
 
 

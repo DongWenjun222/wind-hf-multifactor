@@ -3,7 +3,8 @@ from __future__ import annotations
 """
 最新交易信号导出工具。
 
-默认 compute 模式会读取最新可用的 active 因子值/因子信号，并根据因子库表现权重现场合成最新信号；
+默认 compute 模式复用综合回测的滚动模型、特征、校准和交易规则现场生成最新信号；
+vote 模式才会根据 active 因子库表现做加权投票；
 detail 模式才会读取已经生成的 composite_detail.csv 最后一行做快速对照。
 输出既保留模型原始目标，也给出最终执行建议、调仓动作、是否建议交易和原因。
 """
@@ -16,10 +17,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from composite_factor_backtest import (
+    build_xgboost_rolling_signal,
+    get_enabled_composite_models,
+    get_selected_factors,
+)
 from config import BacktestConfig, resolve_symbol_universe
-from factor_library import get_factor_library_dir
-from factors import build_factors, fetch_intraday_data, safe_symbol_name, score_to_raw_signal, stop_wind
-from runtime_utils import configure_warning_output
+from framework.factor_library import conservative_pair, get_factor_library_dir
+from framework.factors import build_factors, fetch_intraday_data, safe_symbol_name, score_to_raw_signal, stop_wind
+from framework.runtime_utils import configure_warning_output
+from single_factor_backtest import split_train_validation_test_index
 
 
 SIGNAL_COLUMNS = [
@@ -181,22 +188,28 @@ def load_active_library_for_signal(config: BacktestConfig) -> pd.DataFrame:
 
 
 def get_factor_weight_series(active_library: pd.DataFrame, available_factors: list[str]) -> pd.Series:
-    """根据 active 因子库表现生成合成权重。"""
-    weight_columns = [
-        "初筛夏普",
-        "验证夏普比率",
-        "训练夏普比率",
-        "测试夏普比率",
-        "初筛累计收益",
-        "验证累计收益",
-        "训练累计收益",
-        "测试累计收益",
-    ]
+    """根据可追溯的训练/验证表现生成合成权重，最终测试集不参与。"""
     library = active_library.set_index("因子").reindex(available_factors)
     raw_weight = pd.Series(np.nan, index=available_factors, dtype="float64")
-    for column in weight_columns:
+
+    traceable = library.get(
+        "入库数据可追溯",
+        pd.Series(False, index=available_factors),
+    )
+    traceable = traceable.map(
+        lambda value: value is True or str(value).strip().lower() == "true"
+    )
+    for column in ("初筛科研综合评分", "初筛预测能力评分"):
         if column in library.columns:
-            raw_weight = raw_weight.fillna(pd.to_numeric(library[column], errors="coerce"))
+            score = pd.to_numeric(library[column], errors="coerce").where(traceable)
+            raw_weight = raw_weight.fillna(score)
+
+    raw_weight = raw_weight.fillna(
+        conservative_pair(library, "训练夏普比率", "验证夏普比率")
+    )
+    raw_weight = raw_weight.fillna(
+        conservative_pair(library, "训练累计收益", "验证累计收益")
+    )
     raw_weight = raw_weight.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
     if raw_weight.sum() <= 0:
         raw_weight = pd.Series(1.0, index=available_factors, dtype="float64")
@@ -292,6 +305,7 @@ def build_weighted_factor_signal_frame(
 def load_cached_factor_inputs(
     symbol_config: BacktestConfig,
     active_factors: list[str],
+    price_data: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str] | None:
     """优先读取已缓存的 active 因子矩阵和行情字段，用于快速现场预测。"""
     if not bool(getattr(symbol_config, "trading_signal_use_factor_cache", True)):
@@ -300,23 +314,6 @@ def load_cached_factor_inputs(
     output_dir = Path(symbol_config.output_dir) / "composite_factor"
     cache_path = output_dir / "active_factor_matrix_cache.pkl"
     detail_path = output_dir / "composite_detail.csv"
-    if not detail_path.exists():
-        return None
-
-    try:
-        detail = pd.read_csv(detail_path, index_col=0, parse_dates=True)
-    except Exception:
-        return None
-    if detail.empty:
-        return None
-
-    price_columns = [
-        column
-        for column in ["open", "high", "low", "close", "volume", "amt", "amount"]
-        if column in detail.columns
-    ]
-    if "close" not in price_columns or "open" not in price_columns:
-        return None
 
     cached_factors: pd.DataFrame | None = None
     source = ""
@@ -330,6 +327,39 @@ def load_cached_factor_inputs(
             if available_factors:
                 cached_factors = cached[available_factors].copy()
                 source = f"现场计算:因子矩阵缓存:{cache_path}"
+
+    if cached_factors is not None and price_data is not None:
+        price_columns = [
+            column
+            for column in ["open", "high", "low", "close", "volume", "amt", "amount"]
+            if column in price_data.columns
+        ]
+        if {"open", "close"}.issubset(price_columns):
+            common_index = cached_factors.index.intersection(price_data.index)
+            if not common_index.empty:
+                data = price_data.loc[common_index, price_columns].copy()
+                factors = cached_factors.loc[common_index].copy()
+                factors.attrs.update(cached_factors.attrs)
+                data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "close"])
+                factors = factors.loc[data.index]
+                if not data.empty and not factors.empty:
+                    return data, factors, source
+
+    if not detail_path.exists():
+        return None
+    try:
+        detail = pd.read_csv(detail_path, index_col=0, parse_dates=True)
+    except Exception:
+        return None
+    if detail.empty:
+        return None
+    price_columns = [
+        column
+        for column in ["open", "high", "low", "close", "volume", "amt", "amount"]
+        if column in detail.columns
+    ]
+    if "close" not in price_columns or "open" not in price_columns:
+        return None
 
     if cached_factors is None:
         value_columns = {
@@ -379,32 +409,155 @@ def load_cached_factor_inputs(
     return data, factors, source
 
 
-def build_latest_computed_signal_row(config: BacktestConfig, symbol: str, source: str) -> tuple[pd.Series, str]:
-    """读取最新行情、构造 active 因子并现场计算最新综合信号。"""
+def load_live_factor_inputs(
+    config: BacktestConfig,
+    symbol: str,
+    source: str,
+) -> tuple[BacktestConfig, pd.DataFrame, pd.DataFrame, list[str], str]:
+    """读取模型现场预测需要的配置、行情、因子和 active 候选池。"""
     symbol_config = build_symbol_compute_config(config, symbol, source)
     active_library = load_active_library_for_signal(symbol_config)
     active_factors = active_library["因子"].tolist()
     if not active_factors:
         raise ValueError(f"{symbol} 没有可用 active 因子。")
 
-    print(f"现场计算 {symbol} 最新信号: active因子={len(active_factors)}")
-    cached_inputs = load_cached_factor_inputs(symbol_config, active_factors)
+    print(f"现场读取 {symbol} 模型输入: active因子={len(active_factors)}")
+    latest_data = fetch_intraday_data(symbol_config)
+    if latest_data.empty:
+        raise ValueError(f"{symbol} 行情数据为空。")
+
+    cached_inputs = load_cached_factor_inputs(
+        symbol_config,
+        active_factors,
+        price_data=latest_data,
+    )
     if cached_inputs is not None:
         data, factors, input_source = cached_inputs
-    else:
+        cache_is_stale = pd.Timestamp(data.index.max()) < pd.Timestamp(latest_data.index.max())
+        precomputed_signals = bool(factors.attrs.get("precomputed_factor_signals", False))
+        feature_mode = str(symbol_config.xgboost_feature_mode).lower()
+        signal_cache_incompatible = precomputed_signals and (
+            feature_mode != "signal"
+            or bool(getattr(symbol_config, "xgboost_include_factor_state_features", False))
+        )
+        if cache_is_stale or signal_cache_incompatible:
+            reason = "因子缓存早于最新行情" if cache_is_stale else "信号缓存无法还原当前连续/状态特征"
+            if not bool(getattr(symbol_config, "trading_signal_rebuild_missing_factors", False)):
+                raise ValueError(
+                    f"{symbol} {reason}；请先重新运行 composite/multi，"
+                    "或设置 trading_signal_rebuild_missing_factors=True 现场重建。"
+                )
+            cached_inputs = None
+
+    if cached_inputs is None:
         if not bool(getattr(symbol_config, "trading_signal_rebuild_missing_factors", False)):
             raise FileNotFoundError(
                 f"{symbol} 没有可复用的因子缓存或明细因子列；"
                 "请先运行该品种 composite/multi 流程，或设置 trading_signal_rebuild_missing_factors=True。"
             )
-        data = fetch_intraday_data(symbol_config)
-        if data.empty:
-            raise ValueError(f"{symbol} 行情数据为空。")
-
+        data = latest_data
         factors = build_factors(data, symbol_config, requested_factors=active_factors)
         input_source = f"现场计算:实时构建:{Path(symbol_config.output_dir)}"
     if factors.empty:
         raise ValueError(f"{symbol} active 因子矩阵为空。")
+    return symbol_config, data, factors, active_factors, input_source
+
+
+def get_live_model_predict_index(
+    factor_index: pd.Index,
+    config: BacktestConfig,
+) -> pd.Index:
+    """生成与历史重训节奏对齐、且覆盖交易规则历史的实时预测区间。"""
+    if len(factor_index) < 2:
+        raise ValueError("模型现场预测至少需要两根 K 线。")
+    predict_start = min(
+        max(1, int(config.xgboost_min_train_samples)),
+        max(0, len(factor_index) - 1),
+    )
+    available_steps = len(factor_index) - predict_start
+    if available_steps <= 0:
+        raise ValueError("可用样本不足，无法生成模型现场预测区间。")
+
+    confidence_window = max(
+        20,
+        int(getattr(config, "xgboost_trade_confidence_rank_window", 240) or 240),
+    )
+    configured_history = max(
+        1,
+        int(getattr(config, "trading_signal_model_history_bars", confidence_window) or confidence_window),
+    )
+    position_history = (
+        int(getattr(config, "xgboost_min_holding_bars", 0) or 0)
+        + int(getattr(config, "xgboost_reentry_cooldown_bars", 0) or 0)
+        + 2
+    )
+    required_history = max(confidence_window, configured_history, position_history)
+    retrain_every = max(1, int(config.xgboost_retrain_every))
+    latest_step = available_steps - 1
+    desired_start_step = max(0, latest_step - required_history + 1)
+    # 从重训边界开始，保证本段内的模型更新时间与完整历史回测一致。
+    aligned_start_step = (desired_start_step // retrain_every) * retrain_every
+    start_position = predict_start + aligned_start_step
+    return factor_index[start_position:]
+
+
+def build_latest_computed_signal_row(
+    config: BacktestConfig,
+    symbol: str,
+    source: str,
+) -> tuple[pd.Series, str]:
+    """复用综合回测滚动模型，现场生成最新模型信号。"""
+    symbol_config, data, factors, _active_factors, input_source = load_live_factor_inputs(
+        config,
+        symbol,
+        source,
+    )
+    split_time, _ = split_train_validation_test_index(
+        data.index,
+        symbol_config.auto_select_train_ratio,
+        symbol_config.auto_select_validation_ratio,
+    )
+    selected_factors, _ = get_selected_factors(data, factors, symbol_config, split_time)
+    model_names = get_enabled_composite_models(symbol_config)
+    model_name = "xgboost" if "xgboost" in model_names else model_names[0]
+    predict_index = get_live_model_predict_index(factors.index, symbol_config)
+    print(
+        f"现场模型预测 {symbol}: model={model_name}, "
+        f"候选因子={len(selected_factors)}, 预测历史={len(predict_index)}"
+    )
+    signal, _importance, _features, _selection = build_xgboost_rolling_signal(
+        data,
+        factors,
+        selected_factors,
+        symbol_config,
+        predict_index,
+        model_name=model_name,
+    )
+    valid = signal.dropna(subset=["target_position", "raw_signal"], how="all")
+    if valid.empty:
+        raise ValueError(f"{symbol} 模型现场计算没有生成有效交易信号。")
+
+    latest_time = valid.index[-1]
+    row = signal.loc[latest_time].copy()
+    for column in ["open", "high", "low", "close", "volume", "amt", "amount"]:
+        if column in data.columns:
+            row[column] = data.loc[latest_time, column]
+    row.name = latest_time
+    return row, f"现场模型:{model_name}:{input_source}"
+
+
+def build_latest_vote_signal_row(
+    config: BacktestConfig,
+    symbol: str,
+    source: str,
+) -> tuple[pd.Series, str]:
+    """使用 active 因子历史表现加权投票，保留为显式基准模式。"""
+    symbol_config, data, factors, _active_factors, input_source = load_live_factor_inputs(
+        config,
+        symbol,
+        source,
+    )
+    active_library = load_active_library_for_signal(symbol_config)
 
     signal = build_weighted_factor_signal_frame(factors, active_library, symbol_config)
     valid = signal.dropna(subset=["target_position", "raw_signal"], how="all")
@@ -417,7 +570,7 @@ def build_latest_computed_signal_row(config: BacktestConfig, symbol: str, source
         if column in data.columns:
             row[column] = data.loc[latest_time, column]
     row.name = latest_time
-    return row, input_source
+    return row, f"现场投票:{input_source}"
 
 
 def safe_float(value: Any, default: float = np.nan) -> float:
@@ -608,10 +761,12 @@ def build_symbol_signal(
         detail_path = get_symbol_composite_detail_path(config, symbol, source)
         row = read_latest_signal_row(detail_path)
         signal_source = str(detail_path)
-    elif mode == "compute":
+    elif mode in {"compute", "model"}:
         row, signal_source = build_latest_computed_signal_row(config, symbol, source)
+    elif mode == "vote":
+        row, signal_source = build_latest_vote_signal_row(config, symbol, source)
     else:
-        raise ValueError("trading_signal mode 只能是 compute 或 detail。")
+        raise ValueError("trading_signal mode 只能是 compute/model、vote 或 detail。")
 
     signal_time = row.name
     current_position = safe_float(get_optional_value(row, "position", 0.0), 0.0)
@@ -709,7 +864,7 @@ def run_trading_signal_export(
     try:
         signals = build_trading_signals(config, selected_symbols, source=source, mode=signal_mode)
     finally:
-        if signal_mode == "compute":
+        if signal_mode in {"compute", "model", "vote"}:
             stop_wind()
     path = save_trading_signals(signals, config, output_path)
     print(f"最新交易信号已保存: {path}")
@@ -742,9 +897,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", help="逗号分隔品种列表；不填则使用 config.symbols 全品种池。")
     parser.add_argument(
         "--mode",
-        choices=["compute", "detail"],
+        choices=["compute", "model", "vote", "detail"],
         default=None,
-        help="信号生成模式：compute 基于 active 因子现场加权合成；detail 读取已有 composite_detail.csv。",
+        help=(
+            "信号生成模式：compute/model 复用综合回测滚动模型；"
+            "vote 使用 active 因子加权投票；detail 读取已有 composite_detail.csv。"
+        ),
     )
     parser.add_argument(
         "--source",

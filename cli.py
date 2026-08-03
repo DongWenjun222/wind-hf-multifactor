@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from composite_factor_backtest import run_composite_backtest
-from config import BacktestConfig, resolve_symbol_universe
-from factors import build_single_factor_matrix, fetch_intraday_data, stop_wind
+from config import BacktestConfig, report_config_validation, resolve_symbol_universe
+from framework.factors import build_single_factor_matrix, fetch_intraday_data, stop_wind
 from multi_symbol_backtest import run_multi_symbol_backtest
 from pooled_model_backtest import run_pooled_model_backtest
-from runtime_utils import run_tracked
+from framework.runtime_utils import run_tracked
 from single_factor_backtest import run_single_factor_backtests
 from trading_signal import run_trading_signal_export
 
@@ -132,6 +132,8 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
         config.pooled_model_max_train_rows = args.pooled_max_train_rows
     if getattr(args, "pooled_model", None) is not None:
         config.pooled_model_name = args.pooled_model
+    if getattr(args, "command", "") == "signal" and getattr(args, "mode", None) is not None:
+        config.trading_signal_mode = args.mode
     if getattr(args, "skip_existing", None) is not None:
         config.multi_symbol_skip_existing = args.skip_existing
     if getattr(args, "run_single_factor", None) is not None:
@@ -278,9 +280,12 @@ def build_parser() -> argparse.ArgumentParser:
     signal.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
     signal.add_argument(
         "--mode",
-        choices=["compute", "detail"],
+        choices=["compute", "model", "vote", "detail"],
         default=None,
-        help="信号生成模式：compute 基于 active 因子现场加权合成；detail 读取已有 composite_detail.csv。",
+        help=(
+            "信号生成模式：compute/model 复用综合回测滚动模型；"
+            "vote 使用 active 因子加权投票；detail 读取已有 composite_detail.csv。"
+        ),
     )
     signal.add_argument(
         "--source",
@@ -297,6 +302,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     config = create_config(args)
+    report_config_validation(config, args.command)
     emit_final_config(config, args)
     if bool(getattr(args, "dry_run", False)):
         print("dry-run 模式：已跳过实际运行。")

@@ -9,8 +9,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from cli import build_parser
+from cli import build_parser, create_config
 from config import BacktestConfig
+from framework.project_fingerprint import get_default_fingerprint_files
 
 
 def read_text(path: Path) -> str:
@@ -27,8 +28,13 @@ def collect_checks() -> list[tuple[bool, str]]:
     composite_parser = subparsers["composite"]
     multi_parser = subparsers["multi"]
     pooled_parser = subparsers["pooled"]
+    signal_parser = subparsers["signal"]
     scope_action = next(action for action in single_parser._actions if "--scope" in action.option_strings)
     cli_scopes = set(scope_action.choices or [])
+    signal_mode_action = next(
+        action for action in signal_parser._actions if "--mode" in action.option_strings
+    )
+    signal_modes = set(signal_mode_action.choices or [])
     option_strings_by_parser = {
         "single": {option for action in single_parser._actions for option in action.option_strings},
         "composite": {option for action in composite_parser._actions for option in action.option_strings},
@@ -51,6 +57,22 @@ def collect_checks() -> list[tuple[bool, str]]:
         (
             {"all", "new", "range", "selected"}.issubset(cli_scopes),
             "CLI single --scope 支持 all/new/range/selected 四种模式",
+        )
+    )
+    checks.append(
+        (
+            {"compute", "model", "vote", "detail"}.issubset(signal_modes),
+            "CLI signal 明确区分模型、投票和历史明细模式",
+        )
+    )
+    range_args = parser.parse_args(
+        ["single", "--scope", "range", "--range-start", "7", "--range-end", "11", "--dry-run"]
+    )
+    range_config = create_config(range_args)
+    checks.append(
+        (
+            tuple(range_config.single_factor_range) == (7, 11),
+            "CLI single 的显式 range 编号区间优先于 config.py 默认值",
         )
     )
     checks.append(
@@ -98,9 +120,10 @@ def collect_checks() -> list[tuple[bool, str]]:
         )
         checks.append(
             (
-                "默认 compute 模式读取 active 因子" in text
-                and "detail 模式" in text,
-                f"{filename} 中 trading_signal.py 描述区分 compute/detail 模式",
+                "compute/model 模式复用综合回测" in text
+                and "vote" in text
+                and "detail" in text,
+                f"{filename} 中 trading_signal.py 描述区分模型、投票和明细模式",
             )
         )
         checks.append(
@@ -110,6 +133,73 @@ def collect_checks() -> list[tuple[bool, str]]:
                 f"{filename} 中 pooled 训练窗口和 long-format 行数说明完整",
             )
         )
+        checks.append(
+            (
+                "backtest_return_mode" in text
+                and "previous_position * gap_return" in text,
+                f"{filename} 中默认连续持仓收益口径说明与代码一致",
+            )
+        )
+        checks.append(
+            (
+                "label_available_time" in text
+                and "完整时间戳" in text,
+                f"{filename} 中 pooled 标签可用时间和横截面截断规则说明完整",
+            )
+        )
+        checks.append(
+            (
+                ".single_pipeline_state.json" in text
+                and ".composite_pipeline_state.json" in text,
+                f"{filename} 中多品种安全断点状态文件说明完整",
+            )
+        )
+        checks.append(
+            (
+                "composite_artifact_manifest.json" in text
+                and "multi_symbol_portfolio_inputs.csv" in text
+                and "multi_symbol_require_composite_artifact_manifest" in text
+                and "multi_symbol_clear_stale_portfolio_outputs" in text,
+                f"{filename} 中综合产物校验和组合输入审计说明完整",
+            )
+        )
+        checks.append(
+            (
+                "current_root_and_symbol_key_artifacts" in text
+                and "原子替换" in text
+                and "不会递归收录全部历史 runs" in text,
+                f"{filename} 中有界运行清单和原子 JSON 写入说明完整",
+            )
+        )
+        checks.append(
+            (
+                "composite_auto_freeze_active_library" in text
+                and "composite_active_library_cutoff_policy" in text
+                and "active_library_oos_audit.json" in text
+                and "因子筛选验证截止" in text
+                and "effective_run_config.json" in text,
+                f"{filename} 中 active 因子库冻结和样本外截止审计说明完整",
+            )
+        )
+        checks.append(
+            (
+                "最终测试集不参与" in text
+                and "不再兼容使用旧测试列" in text
+                and "factor_library_min_selection_win_rate" in text
+                and "迁移别名" in text
+                and "missing_traceable_train_metrics" in text
+                and "最终测试集表现不会用于决定是否淘汰因子" in text
+                and "最终测试指标不会参与实时权重" in text,
+                f"{filename} 中因子入库最终测试集隔离规则说明完整",
+            )
+        )
+    fingerprint_names = {path.as_posix() for path in get_default_fingerprint_files()}
+    checks.append(
+        (
+            "framework/factor_builders/external_daily.py" in fingerprint_names,
+            "源码指纹自动覆盖 external_daily.py 等全部因子构建模块",
+        )
+    )
     return checks
 
 

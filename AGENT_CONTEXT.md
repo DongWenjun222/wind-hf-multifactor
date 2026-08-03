@@ -27,7 +27,7 @@ Wind / 本地 CSV 行情数据
 python smoke_test.py
 python data_quality_report.py
 python leakage_audit.py
-python -m py_compile config.py data_loader.py factors.py factor_taxonomy.py runtime_utils.py cli.py factor_library.py factor_metadata.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py
+python -m py_compile config.py framework/data_loader.py framework/factors.py framework/factor_taxonomy.py framework/runtime_utils.py cli.py framework/factor_library.py factor_metadata.py single_factor_backtest.py composite_factor_backtest.py multi_symbol_backtest.py
 ```
 
 单品种研究：
@@ -49,18 +49,18 @@ python cli.py multi --symbols liquid_commodity
 
 ```text
 config.py                       全局配置中心。
-data_loader.py                  Wind / 本地 CSV 数据读取与缓存。
-factors.py                      因子总装配入口，负责按需构建因子矩阵。
-factor_builders/                各类因子构造模块。
-factor_taxonomy.py              因子家族分类和复杂度标签。
+framework/data_loader.py                  Wind / 本地 CSV 数据读取与缓存。
+framework/factors.py                      因子总装配入口，负责按需构建因子矩阵。
+framework/factor_builders/                各类因子构造模块。
+framework/factor_taxonomy.py              因子家族分类和复杂度标签。
 factor_metadata.py              因子元数据导出。
-factor_library.py               active/rejected/all 因子库管理。
+framework/factor_library.py               active/rejected/all 因子库管理。
 single_factor_backtest.py       单因子训练、验证、测试回测和入库。
 composite_factor_backtest.py    综合模型滚动训练、预测和回测。
 multi_symbol_backtest.py        多品种批量回测和组合层汇总。
-experiment_utils.py             实验快照。
-runtime_utils.py                日志和运行 manifest。
-project_fingerprint.py          因子源码哈希。
+framework/experiment_utils.py             实验快照。
+framework/runtime_utils.py                日志和运行 manifest。
+framework/project_fingerprint.py          因子源码哈希。
 leakage_audit.py                未来函数 / 泄露静态审计。
 data_quality_report.py          数据质量检查。
 hard_prune_factors.py           因子硬删除工具。
@@ -71,8 +71,8 @@ AI_FACTOR_GENERATION_PROMPT.md  AI 自动生成新因子的提示词脚本。
 
 ## 已完成的重要机制
 
-1. 因子模块已经拆分到 `factor_builders/`，每类因子独立维护。
-2. 数据读取已经拆到 `data_loader.py`，支持本地缓存和 Wind 拉取。
+1. 因子模块已经拆分到 `framework/factor_builders/`，每类因子独立维护。
+2. 数据读取已经拆到 `framework/data_loader.py`，支持本地缓存和 Wind 拉取。
 3. 单因子回测有训练集、验证集、最终测试集三段。
 4. 单因子汇总加入了 `IC / RankIC / ICIR / RankICIR / 分组单调性 / 分组收益差`。
 5. 因子库入库同时参考收益、夏普、胜率、训练/验证表现、相关性和家族配额。
@@ -87,7 +87,7 @@ AI_FACTOR_GENERATION_PROMPT.md  AI 自动生成新因子的提示词脚本。
 14. 多品种组合层加入了横截面机会选择，默认使用上一根模型概率优势做 TopN 品种筛选。
 15. 多品种组合层支持等权、波动率倒数、正夏普加权、波动率目标和回撤降仓。
 16. 多品种组合层支持板块/产业链风险预算，默认限制单一板块最大权重，输出板块权重和板块收益贡献。
-17. 项目有 `leakage_audit.py`、`data_quality_report.py`、`project_fingerprint.py` 等工程审计工具。
+17. 项目有 `leakage_audit.py`、`data_quality_report.py`、`framework/project_fingerprint.py` 等工程审计工具。
 
 ## 重要设计原则
 

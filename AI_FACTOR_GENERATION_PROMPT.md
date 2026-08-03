@@ -22,9 +22,10 @@
 开始工作前，必须理解以下文件：
 
 - `config.py`：全局配置，包括数据区间、交易成本、单因子筛选、因子库、XGBoost、qcut 设置。
-- `factors.py`：行情读取、数据清洗、因子生成。新增因子主要修改这个文件。
+- `framework/factors.py`：因子编号、按需构建和总装配；通常不直接存放具体公式。
+- `framework/factor_builders/`：按因子家族保存具体公式，新增因子主要修改对应类别文件。
 - `single_factor_backtest.py`：批量单因子回测、方向选择、qcut、图表、因子库更新入口。
-- `factor_library.py`：因子库管理，负责 active / rejected / all 因子筛选和相关性去重。
+- `framework/factor_library.py`：因子库管理，负责 active / rejected / all 因子筛选和相关性去重。
 - `composite_factor_backtest.py`：XGBoost 综合因子滚动训练、预测、回测。
 - `PROJECT_DOCUMENTATION.md`：项目整体说明文档，必要时同步更新。
 
@@ -32,14 +33,14 @@
 
 优先修改：
 
-- `factors.py`：新增候选因子。
+- `framework/factor_builders/*.py`：在对应因子家族中新增候选公式。
 - `config.py`：只在确有必要时调整新增因子的测试范围或起始编号。
 - `PROJECT_DOCUMENTATION.md`：如果新增了重要因子类型或工作流变化，应同步说明。
 
 默认不要修改：
 
 - `single_factor_backtest.py`
-- `factor_library.py`
+- `framework/factor_library.py`
 - `composite_factor_backtest.py`
 
 除非用户明确要求优化回测、入库或综合模型逻辑，否则不要改这些核心流程文件。
@@ -150,7 +151,7 @@ ai_factor_x
 
 ## 7. 新增因子代码位置
 
-新增参数化因子优先放在 `factors.py` 的 `add_parametric_factors` 函数中。
+新增参数化因子优先放在 `framework/factor_builders/parametric.py`；跨品种、日历、宏观等因子分别放入对应类别文件。
 
 推荐做法：
 
@@ -184,8 +185,8 @@ ai_factor_x
 
 ```text
 config.py
-factors.py
-factor_library.py
+framework/factors.py
+framework/factor_library.py
 single_factor_backtest.py
 ```
 
@@ -199,7 +200,7 @@ composite_factor_backtest.py
 
 运行一个轻量检查，构造因子列名并确认当前总数。
 
-如果完整构造因子数据太慢，可以至少阅读 `factors.py` 中 `build_factors` 和 `add_parametric_factors` 的结构，确认新增位置。
+如果完整构造因子数据太慢，至少阅读 `framework/factors.py` 的装配逻辑和目标 `framework/factor_builders/*.py` 的生成结构，确认编号与按需构建规则。
 
 ### 第三步：设计新因子
 
@@ -211,7 +212,7 @@ composite_factor_backtest.py
 
 每个主题最好生成多个窗口版本。
 
-### 第四步：修改 `factors.py`
+### 第四步：修改对应的 `framework/factor_builders/*.py`
 
 只新增必要的中间变量和 factor_specs 项。
 
@@ -228,7 +229,7 @@ composite_factor_backtest.py
 必须运行：
 
 ```bash
-python -m py_compile factors.py config.py single_factor_backtest.py factor_library.py
+python -m py_compile framework/factors.py framework/factor_builders/parametric.py config.py single_factor_backtest.py framework/factor_library.py
 ```
 
 如果修改了综合模型相关代码，也运行：
@@ -329,7 +330,7 @@ wind_hf_multifactor_output/factor_library/factor_library_all.csv
 
 ```text
 本轮新增了 X 类因子，共约 Y 个候选。
-主要修改：factors.py。
+主要修改：framework/factor_builders/ 中对应类别文件。
 验证：py_compile 通过。
 建议下一步：把 single_factor_scope 设为 "new"，起始编号为 Z，然后运行 single_factor_backtest.py。
 ```
@@ -352,9 +353,9 @@ active 因子库新增/保留情况。
 要求：
 1. 本轮新增 100 个左右的新因子。
 2. 优先选择和现有因子不同的信息方向。
-3. 只修改 factors.py，除非确有必要不要改其他核心逻辑。
+3. 只修改 framework/factor_builders/ 中对应类别文件，除非确有必要不要改其他核心逻辑。
 4. 禁止使用未来数据。
-5. 新因子统一进入 add_parametric_factors 的 factor_specs。
+5. 参数化因子进入 add_parametric_factors 的 factor_specs；其他类别遵循各自构建器结构。
 6. 修改后运行 py_compile 检查。
 7. 最后告诉我新增了哪些因子类型，以及建议的 single_factor_new_factor_start_index。
 ```

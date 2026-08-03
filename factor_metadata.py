@@ -14,8 +14,8 @@ from pathlib import Path
 import pandas as pd
 
 from config import BacktestConfig
-from factor_taxonomy import classify_factor
-from factors import build_factor_name_catalog
+from framework.factor_taxonomy import classify_factor
+from framework.factors import build_factor_name_catalog
 
 
 def build_factor_metadata(config: BacktestConfig) -> pd.DataFrame:

@@ -29,8 +29,8 @@ from composite_factor_backtest import (
     probabilities_to_trade_signal,
     train_composite_classifier,
 )
-from config import BacktestConfig, resolve_symbol_universe
-from factors import build_factors, fetch_intraday_data, safe_symbol_name, stop_wind
+from config import BacktestConfig, report_config_validation, resolve_symbol_universe
+from framework.factors import build_factors, fetch_intraday_data, safe_symbol_name, stop_wind
 from multi_symbol_backtest import (
     PORTFOLIO_METHODS,
     apply_cross_sectional_opportunity_selection,
@@ -49,7 +49,7 @@ from multi_symbol_backtest import (
     normalize_and_cap_weights,
     plot_multi_symbol_portfolio,
 )
-from runtime_utils import run_tracked
+from framework.runtime_utils import run_tracked
 from single_factor_backtest import calculate_metrics, infer_annual_periods, run_backtest
 
 
@@ -659,6 +659,7 @@ def save_pooled_vs_independent_comparison(
 
 def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
     """运行多品种共享信息模型，并保存结果。"""
+    report_config_validation(config, "pooled")
     output_dir = get_pooled_output_dir(config)
     symbols = get_pooled_symbols(config)
     if not symbols:

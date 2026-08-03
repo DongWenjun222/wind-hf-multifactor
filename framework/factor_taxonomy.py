@@ -33,25 +33,25 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     factor_name = str(factor_name)
     if factor_name in BASIC_FACTORS:
         family = "basic"
-        source_file = "factor_builders/basic.py"
+        source_file = "framework/factor_builders/basic.py"
     elif factor_name.startswith("calendar_"):
         family = "calendar"
-        source_file = "factor_builders/calendar.py"
+        source_file = "framework/factor_builders/calendar.py"
     elif factor_name.startswith("macro_"):
         family = "macro_state"
-        source_file = "factor_builders/macro_state.py"
+        source_file = "framework/factor_builders/macro_state.py"
     elif factor_name.startswith("external_"):
         family = "external_daily"
-        source_file = "factor_builders/external_daily.py"
+        source_file = "framework/factor_builders/external_daily.py"
     elif factor_name.startswith(("cross_", "crossmega_", "crossultra_", "crosshyper_", "crossomega_")):
         family = "cross_asset"
-        source_file = "factor_builders/cross_asset.py"
+        source_file = "framework/factor_builders/cross_asset.py"
     elif factor_name.startswith(("ultra_", "hyper_", "omega_")):
         family = "non_cross_complex"
-        source_file = "factor_builders/non_cross.py"
+        source_file = "framework/factor_builders/non_cross.py"
     else:
         family = "parametric"
-        source_file = "factor_builders/parametric.py"
+        source_file = "framework/factor_builders/parametric.py"
 
     tokens = factor_name.split("_")
     window_match = re.search(r"_(\d+)$", factor_name)

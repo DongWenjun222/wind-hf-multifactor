@@ -13,76 +13,76 @@ LIQUID_COMMODITY_MAIN_SYMBOLS_BY_EXCHANGE: dict[str, list[str]] = {
     "SHF": [
         "CU.SHF",
         "AL.SHF",
-        "ZN.SHF",
-        "PB.SHF",
-        "NI.SHF",
-        "SN.SHF",
-        "AO.SHF",
-        "AU.SHF",
-        "AG.SHF",
-        "RB.SHF",
-        "HC.SHF",
-        "SS.SHF",
-        "RU.SHF",
-        "BR.SHF",
-        "BU.SHF",
-        "FU.SHF",
-        "SP.SHF",
+        # "ZN.SHF",
+        # "PB.SHF",
+        # "NI.SHF",
+        # "SN.SHF",
+        # "AO.SHF",
+        # "AU.SHF",
+        # "AG.SHF",
+        # "RB.SHF",
+        # "HC.SHF",
+        # "SS.SHF",
+        # "RU.SHF",
+        # "BR.SHF",
+        # "BU.SHF",
+        # "FU.SHF",
+        # "SP.SHF",
     ],
     # 大连商品交易所：农产品、油脂油料、黑色、化工、畜牧。
     "DCE": [
         "A.DCE",
         "B.DCE",
-        "C.DCE",
-        "CS.DCE",
-        "M.DCE",
-        "Y.DCE",
-        "P.DCE",
-        "JD.DCE",
-        "LH.DCE",
-        "L.DCE",
-        "V.DCE",
-        "PP.DCE",
-        "EG.DCE",
-        "EB.DCE",
-        "PG.DCE",
-        "I.DCE",
-        "J.DCE",
-        "JM.DCE",
+        # "C.DCE",
+        # "CS.DCE",
+        # "M.DCE",
+        # "Y.DCE",
+        # "P.DCE",
+        # "JD.DCE",
+        # "LH.DCE",
+        # "L.DCE",
+        # "V.DCE",
+        # "PP.DCE",
+        # "EG.DCE",
+        # "EB.DCE",
+        # "PG.DCE",
+        # "I.DCE",
+        # "J.DCE",
+        # "JM.DCE",
     ],
     # 郑州商品交易所：农产品、软商品、煤化工、建材化工。
     "CZC": [
         "CF.CZC",
         "SR.CZC",
-        "OI.CZC",
-        "RM.CZC",
-        "AP.CZC",
-        "CJ.CZC",
-        "TA.CZC",
-        "MA.CZC",
-        "FG.CZC",
-        "UR.CZC",
-        "SA.CZC",
-        "PF.CZC",
-        "PK.CZC",
-        "SF.CZC",
-        "SM.CZC",
-        "SH.CZC",
-        "PX.CZC",
+        # "OI.CZC",
+        # "RM.CZC",
+        # "AP.CZC",
+        # "CJ.CZC",
+        # "TA.CZC",
+        # "MA.CZC",
+        # "FG.CZC",
+        # "UR.CZC",
+        # "SA.CZC",
+        # "PF.CZC",
+        # "PK.CZC",
+        # "SF.CZC",
+        # "SM.CZC",
+        # "SH.CZC",
+        # "PX.CZC",
     ],
     # 上海国际能源交易中心：原油、低硫燃料油、20号胶、国际铜、集运指数。
     "INE": [
         "SC.INE",
-        "LU.INE",
-        "NR.INE",
-        "BC.INE",
-        "EC.INE",
+        # "LU.INE",
+        # "NR.INE",
+        # "BC.INE",
+        # "EC.INE",
     ],
     # 广州期货交易所：新能源和新材料相关品种。
     "GFE": [
         "SI.GFE",
-        "LC.GFE",
-        "PS.GFE",
+        # "LC.GFE",
+        # "PS.GFE",
     ],
 }
 
@@ -166,6 +166,14 @@ class BacktestConfig:
     # 多品种批量回测是否跳过已经完成的品种流程。
     # 开启后，如果品种目录中已经存在对应结果文件，就直接复用，适合长任务中断后的断点续跑。
     multi_symbol_skip_existing: bool = True
+
+    # 多品种组合是否强制要求每个综合结果带有可验证的产物清单。
+    # 开启后，明细内容被改写、清单缺失或品种不匹配时不会进入组合。
+    multi_symbol_require_composite_artifact_manifest: bool = True
+
+    # 本轮没有有效综合输入时，是否删除旧的 latest 组合 CSV/PNG。
+    # 输入审计 multi_symbol_portfolio_inputs.csv 会保留，用于说明未生成原因。
+    multi_symbol_clear_stale_portfolio_outputs: bool = True
 
     # 多品种运行时是否每次都重新运行单因子流程，用最新候选因子补充并重筛 active 因子库。
     # 建议保持开启：active_factors.csv 是动态因子库，不应该因为文件已经存在就停止更新。
@@ -557,6 +565,16 @@ class BacktestConfig:
     # 因子库子目录名。如果是相对路径，会放在 output_dir 下面。
     factor_library_dir: str = "factor_library"
 
+    # 综合回测开始时是否自动冻结当前 active 因子库。
+    # 建议保持开启：程序会在构建因子前复制一份不可变输入快照，本轮缓存、选因、
+    # 模型训练和产物清单全部引用该快照，避免 latest active 库在运行中变化。
+    composite_auto_freeze_active_library: bool = True
+
+    # active 因子库筛选截止时间与综合回测最终测试起点的校验策略。
+    # "auto"：旧库缺元数据时警告，但明确检测到未来筛选时停止运行；
+    # "error"：缺元数据或未来筛选均停止；"warn"：只提示；"off"：关闭检查。
+    composite_active_library_cutoff_policy: str = "auto"
+
     # 综合因子是否使用冻结版 active 因子库。
     # 开启后 composite_factor_backtest.py 不再读取当前 factor_library/active_factors.csv，
     # 而是读取 frozen_active_library_path 指向的历史快照，便于做严格样本外检验。
@@ -566,14 +584,14 @@ class BacktestConfig:
     # 例如 "runs/20260510_120000_single/active_factors_snapshot.csv"。
     frozen_active_library_path: Optional[str] = None
 
-    # 因子入库的最低测试夏普要求。低于该值的因子会被拒绝入库。
+    # 因子入库的最低初筛夏普要求，仅由训练/验证表现计算。
     factor_library_min_sharpe: float = 1.0
 
-    # 因子入库的最低测试累计收益要求。低于该值的因子会被拒绝入库。
+    # 因子入库的最低初筛累计收益要求，仅由训练/验证表现计算。
     factor_library_min_total_return: float = 0.0
 
     # 因子入库的最低训练夏普要求。
-    # 和测试门槛同时生效，避免只在测试段偶然表现好、训练段完全无效的因子入库。
+    # 和验证侧门槛同时生效，避免单个样本段偶然表现决定入库。
     factor_library_min_train_sharpe: float = 1.0
 
     # 因子入库的最低训练累计收益要求。
@@ -583,20 +601,26 @@ class BacktestConfig:
     # 使用严格大于判断，例如 0.5 表示训练胜率必须大于 50%，等于 50% 不入库。
     factor_library_min_train_win_rate: float = 0.5
 
-    # 因子入库的最低测试侧胜率要求。
-    # 若存在验证集表现，则优先约束验证胜率；否则回退约束测试胜率。
-    factor_library_min_test_win_rate: float = 0.5
+    # 入库选择样本的最低胜率：优先验证，验证无数据时回退训练。
+    factor_library_min_selection_win_rate: float = 0.5
 
-    # 因子入库的最低测试交易次数要求。
-    # 用于过滤“只交易极少数几次但偶然收益很好”的不稳定因子；0 表示不限制。
-    factor_library_min_test_trades: int = 0
+    # 已弃用兼容字段。非 None 时覆盖 min_selection_win_rate；不会读取最终测试指标。
+    factor_library_min_test_win_rate: Optional[float] = None
+
+    # 入库选择样本的最低交易次数；0 表示不限制。
+    factor_library_min_selection_trades: int = 0
+
+    # 已弃用兼容字段。非 None 时覆盖 min_selection_trades。
+    factor_library_min_test_trades: Optional[int] = None
 
     # 因子入库的最低训练交易次数要求；0 表示不限制。
     factor_library_min_train_trades: int = 0
 
-    # 因子入库的最低测试信号覆盖率要求。
-    # 例如 0.05 表示测试集中至少 5% K线有非零信号；0 表示不限制。
-    factor_library_min_test_signal_coverage: float = 0.0
+    # 入库选择样本的最低信号覆盖率；0 表示不限制。
+    factor_library_min_selection_signal_coverage: float = 0.0
+
+    # 已弃用兼容字段。非 None 时覆盖 min_selection_signal_coverage。
+    factor_library_min_test_signal_coverage: Optional[float] = None
 
     # 因子入库的最低训练信号覆盖率要求；0 表示不限制。
     factor_library_min_train_signal_coverage: float = 0.0
@@ -635,8 +659,10 @@ class BacktestConfig:
     # 如果 active 因子过少，可临时设为 None；如果希望更科研化，可提高到 0.55 或 0.60。
     factor_library_min_predictive_score: Optional[float] = 0.40
 
-    # 因子入库允许的最大测试回撤。
-    # None 表示不限制；例如 -0.10 表示测试最大回撤低于 -10% 的因子会被拒绝。
+    # 入库选择样本允许的最大回撤；None 表示不限制。
+    factor_library_max_selection_drawdown: Optional[float] = None
+
+    # 已弃用兼容字段。非 None 时覆盖 max_selection_drawdown。
     factor_library_max_test_drawdown: Optional[float] = None
 
     # 因子入库允许的最大训练回撤。None 表示不限制。
@@ -697,7 +723,7 @@ class BacktestConfig:
 
     # 是否启用因子自动淘汰清单。
     # 多品种回测结束后，如果某个因子在足够多品种中都表现很差，程序会把它写入淘汰清单；
-    # 后续 factors.py 构建因子矩阵时会自动跳过这些因子，避免候选库越来越臃肿。
+    # 后续 framework/factors.py 构建因子矩阵时会自动跳过这些因子，避免候选库越来越臃肿。
     enable_factor_pruning: bool = True
 
     # 因子淘汰清单文件。相对路径会放在 output_dir 下；多品种独立目录运行时仍使用总 output_dir 下的全局清单。
@@ -789,8 +815,12 @@ class BacktestConfig:
     xgboost_min_train_samples: int = 120*5
 
     # XGBoost 重新训练间隔，单位为 K线根数。
-    # 当前 5*5 表示每 25 根K线重新训练一次，中间复用上一次模型滚动预测。
+    # 当前 5*5*5 表示每 125 根K线重新训练一次，中间复用上一次模型滚动预测。
     xgboost_retrain_every: int = 5*5*5
+
+    # 滚动预测进度每隔多少个时点打印一次；首尾时点始终打印。
+    # 调大可减少全市场批量运行时的控制台和日志开销。
+    xgboost_progress_every: int = 25
 
     # XGBoost 树的数量。调大可能提升拟合能力，但更慢且更容易过拟合。
     xgboost_n_estimators: int = 80
@@ -843,6 +873,7 @@ class BacktestConfig:
 
     # 综合因子回测是否只按 active 因子库构建需要的因子列。
     # 开启后可避免先生成全部海量因子，通常能显著提升 composite_factor_backtest.py 运行速度。
+    # active 因子库为空时程序会直接停止，绝不会静默回退到全量构建。
     composite_build_active_only: bool = True
 
     # 综合因子回测是否缓存 active 因子矩阵。
@@ -984,7 +1015,8 @@ class BacktestConfig:
     trading_signal_max_age_minutes: int = 0
 
     # 最新交易信号现场计算时，是否优先复用综合回测生成的 active 因子矩阵缓存。
-    # 开启后会读取因子值或因子信号重新加权合成，不会直接复制 composite_detail.csv 里的目标仓位。
+    # compute/model 模式优先读取完整因子值并重新训练滚动模型；
+    # vote 模式读取因子值或因子信号重新加权，不会直接复制明细中的目标仓位。
     trading_signal_use_factor_cache: bool = True
 
     # 最新交易信号现场计算时，如果没有可复用的因子缓存/明细因子列，是否临时重建因子。
@@ -993,9 +1025,14 @@ class BacktestConfig:
     trading_signal_rebuild_missing_factors: bool = False
 
     # 最新交易信号默认生成模式。
-    # compute：读取最新可用 active 因子值/因子信号，并按因子库表现权重现场合成；
+    # compute/model：复用综合回测的滚动模型、特征、校准和交易规则现场预测；
+    # vote：读取最新 active 因子值/信号，并按因子库表现权重合成基准信号；
     # detail：只读取已经存在的 composite_detail.csv 最后一行，速度快但依赖已有回测结果。
     trading_signal_mode: str = "compute"
+
+    # 模型现场预测至少回算多少根历史预测，用于置信度分位和持仓规则。
+    # 程序还会自动向前对齐到最近的模型重训边界，确保重训节奏与回测一致。
+    trading_signal_model_history_bars: int = 240
 
     # 是否要求当前模型置信度相对近期历史处于较高分位才交易。
     xgboost_trade_use_confidence_rank_filter: bool = False
@@ -1088,7 +1125,6 @@ class BacktestConfig:
     # quantile 标签模式下，分位阈值还会和该最小绝对收益阈值取更保守的一侧。
     # 例如 2 表示即使分位阈值很接近 0，也至少要求未来收益绝对值超过 2 bps 才标成方向类。
     xgboost_target_quantile_min_abs_bps: float = 0.0
-
     # 交易时允许的最大中性类别概率。
     # 如果 prob_flat 太高，说明模型认为“没有明确方向”的概率较大，即使多空概率略有差异也不交易。
     # 设为 1 表示关闭该过滤。
@@ -1112,3 +1148,157 @@ class BacktestConfig:
 
     # qcut 分组所需的最小历史样本数。样本不足时不生成有效分组。
     qcut_min_periods: int = 120*2
+
+
+def validate_backtest_config(
+    config: BacktestConfig,
+    command: str | None = None,
+) -> list[str]:
+    """集中校验跨脚本共享的配置约束，返回不阻断运行的提示。"""
+    errors: list[str] = []
+    warnings: list[str] = []
+    normalized_command = str(command or "").strip().lower()
+    is_model_signal = (
+        normalized_command == "signal"
+        and str(config.trading_signal_mode).lower() in {"compute", "model"}
+    )
+
+    if int(config.bar_size) <= 0:
+        errors.append("bar_size 必须大于 0。")
+    if str(config.backtest_return_mode).lower() not in {
+        "next_open_continuous",
+        "intrabar_only",
+    }:
+        errors.append(
+            "backtest_return_mode 只能是 'next_open_continuous' 或 'intrabar_only'。"
+        )
+
+    train_ratio = float(config.auto_select_train_ratio)
+    validation_ratio = float(config.auto_select_validation_ratio)
+    if not 0.0 < train_ratio < 1.0:
+        errors.append("auto_select_train_ratio 必须位于 0 和 1 之间。")
+    if validation_ratio < 0.0 or train_ratio + validation_ratio >= 1.0:
+        errors.append(
+            "auto_select_validation_ratio 必须非负，且训练比例与验证比例之和必须小于 1。"
+        )
+
+    validate_single_scope = normalized_command in {"", "single"} or (
+        normalized_command == "multi" and config.multi_symbol_run_single_factor
+    )
+    if validate_single_scope:
+        scope = str(config.single_factor_scope).lower()
+        if scope not in {"all", "new", "range", "selected"}:
+            errors.append("single_factor_scope 只能是 all/new/range/selected。")
+        elif scope == "range":
+            raw_range = config.single_factor_range
+            if raw_range is None or len(raw_range) != 2:
+                errors.append("range 模式必须配置包含起止编号的 single_factor_range。")
+            elif int(raw_range[1]) < max(1, int(raw_range[0])):
+                errors.append("single_factor_range 的结束编号不能小于起始编号。")
+        elif scope == "selected" and not config.single_factor_selected_factors:
+            errors.append("selected 模式必须配置 single_factor_selected_factors。")
+
+        selection_win_rate = (
+            config.factor_library_min_test_win_rate
+            if config.factor_library_min_test_win_rate is not None
+            else config.factor_library_min_selection_win_rate
+        )
+        selection_trades = (
+            config.factor_library_min_test_trades
+            if config.factor_library_min_test_trades is not None
+            else config.factor_library_min_selection_trades
+        )
+        selection_coverage = (
+            config.factor_library_min_test_signal_coverage
+            if config.factor_library_min_test_signal_coverage is not None
+            else config.factor_library_min_selection_signal_coverage
+        )
+        selection_drawdown = (
+            config.factor_library_max_test_drawdown
+            if config.factor_library_max_test_drawdown is not None
+            else config.factor_library_max_selection_drawdown
+        )
+        for name, value in (
+            ("factor_library_min_train_win_rate", config.factor_library_min_train_win_rate),
+            ("factor_library_min_selection_win_rate", selection_win_rate),
+            (
+                "factor_library_min_train_signal_coverage",
+                config.factor_library_min_train_signal_coverage,
+            ),
+            ("factor_library_min_selection_signal_coverage", selection_coverage),
+        ):
+            if not 0.0 <= float(value) <= 1.0:
+                errors.append(f"{name} 必须位于 0 和 1 之间。")
+        for name, value in (
+            ("factor_library_min_train_trades", config.factor_library_min_train_trades),
+            ("factor_library_min_selection_trades", selection_trades),
+        ):
+            if int(value) < 0:
+                errors.append(f"{name} 不能小于 0。")
+        if selection_drawdown is not None and float(selection_drawdown) > 0.0:
+            errors.append("factor_library_max_selection_drawdown 必须为空或不大于 0。")
+
+    validate_feature_scope = normalized_command in {"", "composite"} or is_model_signal or (
+        normalized_command == "multi" and config.multi_symbol_run_composite
+    )
+    if validate_feature_scope:
+        feature_scope = str(config.xgboost_feature_scope).lower()
+        if feature_scope not in {"all", "best", "selected"}:
+            errors.append("xgboost_feature_scope 只能是 all/best/selected。")
+        elif feature_scope == "selected" and not config.selected_factors:
+            errors.append("综合 selected 模式必须配置 selected_factors。")
+        if config.use_frozen_active_library and not config.frozen_active_library_path:
+            errors.append(
+                "use_frozen_active_library=True 时必须配置 frozen_active_library_path。"
+            )
+        cutoff_policy = str(config.composite_active_library_cutoff_policy).lower()
+        if cutoff_policy not in {"auto", "error", "warn", "off"}:
+            errors.append(
+                "composite_active_library_cutoff_policy 只能是 auto/error/warn/off。"
+            )
+
+    validate_model = normalized_command in {"", "composite", "pooled"} or is_model_signal or (
+        normalized_command == "multi" and config.multi_symbol_run_composite
+    )
+    if validate_model:
+        if int(config.xgboost_train_window) <= 0:
+            errors.append("xgboost_train_window 必须大于 0。")
+        if int(config.xgboost_min_train_samples) <= 0:
+            errors.append("xgboost_min_train_samples 必须大于 0。")
+        if int(config.xgboost_retrain_every) <= 0:
+            errors.append("xgboost_retrain_every 必须大于 0。")
+        if int(config.xgboost_target_horizon) <= 0:
+            errors.append("xgboost_target_horizon 必须大于 0。")
+
+    if normalized_command in {"", "pooled"}:
+        pooled_window = config.pooled_model_train_time_window
+        if pooled_window is not None and int(pooled_window) <= 0:
+            errors.append("pooled_model_train_time_window 必须为空或大于 0。")
+        if int(config.pooled_model_max_train_rows) < 0:
+            errors.append("pooled_model_max_train_rows 不能小于 0。")
+
+    if normalized_command == "multi":
+        if not config.multi_symbol_run_single_factor and not config.multi_symbol_run_composite:
+            warnings.append("multi 的单因子和综合因子阶段均关闭，本次只会汇总已有结果。")
+    if normalized_command in {"", "signal"}:
+        signal_mode = str(config.trading_signal_mode).lower()
+        if signal_mode not in {"compute", "model", "vote", "detail"}:
+            errors.append("trading_signal_mode 只能是 compute/model、vote 或 detail。")
+        if int(config.trading_signal_model_history_bars) <= 0:
+            errors.append("trading_signal_model_history_bars 必须大于 0。")
+    if config.commission_bps == 0 and config.slippage_bps == 0:
+        warnings.append("手续费和滑点均为 0；该设置适合研究毛收益，不代表实盘净收益。")
+
+    if errors:
+        raise ValueError("配置校验失败:\n- " + "\n- ".join(errors))
+    return warnings
+
+
+def report_config_validation(config: BacktestConfig, command: str | None = None) -> None:
+    """校验配置，并确保同一次调用链中的提示只打印一次。"""
+    warnings = validate_backtest_config(config, command)
+    if bool(getattr(config, "_validation_reported", False)):
+        return
+    for warning in warnings:
+        print(f"配置提示: {warning}")
+    setattr(config, "_validation_reported", True)

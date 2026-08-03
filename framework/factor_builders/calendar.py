@@ -16,6 +16,7 @@ from .common import (
 def add_calendar_seasonality_factors(
     df: pd.DataFrame,
     config: Any,
+    requested_factors: set[str] | None = None,
 ) -> pd.DataFrame:
     """生成交易日历和季节性因子。
 
@@ -27,6 +28,10 @@ def add_calendar_seasonality_factors(
 
     index = pd.DatetimeIndex(df.index)
     factor_specs: list[tuple[str, pd.Series]] = []
+    requested_set = set(requested_factors or [])
+
+    def is_requested(name: str) -> bool:
+        return not requested_set or name in requested_set
     minute_of_day = pd.Series(index.hour * 60 + index.minute, index=index, dtype="float64")
     day_angle = 2.0 * np.pi * minute_of_day / 1440.0
 
@@ -99,7 +104,9 @@ def add_calendar_seasonality_factors(
     }
 
     for name, value in raw_calendar_inputs.items():
-        factor_specs.append((f"calendar_{name}", value))
+        factor_name = f"calendar_{name}"
+        if is_requested(factor_name):
+            factor_specs.append((factor_name, value))
 
     seasonal_inputs = {
         name: raw_calendar_inputs[name]
@@ -127,12 +134,9 @@ def add_calendar_seasonality_factors(
     }
     for seasonal_name, seasonal_value in seasonal_inputs.items():
         for state_name, state_value in state_inputs.items():
-            factor_specs.append(
-                (
-                    f"calendar_x_{seasonal_name}_{state_name}",
-                    seasonal_value * state_value,
-                )
-            )
+            factor_name = f"calendar_x_{seasonal_name}_{state_name}"
+            if is_requested(factor_name):
+                factor_specs.append((factor_name, seasonal_value * state_value))
 
     extension_specs: list[tuple[str, pd.Series]] = []
     harmonic_inputs = {
@@ -208,9 +212,12 @@ def add_calendar_seasonality_factors(
 
     for multiplier_name, multiplier_value in calendar_multipliers.items():
         for state_name, state_value in state_features:
+            factor_name = f"calendar_ext_{multiplier_name}_{state_name}"
+            if not is_requested(factor_name):
+                continue
             extension_specs.append(
                 (
-                    f"calendar_ext_{multiplier_name}_{state_name}",
+                    factor_name,
                     multiplier_value * state_value,
                 )
             )
@@ -220,6 +227,8 @@ def add_calendar_seasonality_factors(
             break
 
     factor_specs.extend(extension_specs)
+    if requested_set:
+        factor_specs = [spec for spec in factor_specs if spec[0] in requested_set]
 
     calendar_raw = pd.DataFrame(
         {factor_name: raw_factor for factor_name, raw_factor in factor_specs},
