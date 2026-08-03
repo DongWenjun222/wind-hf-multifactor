@@ -399,16 +399,6 @@ def build_factor_library(
     ).reset_index(drop=True)
 
     available = set(factors.columns)
-    partial_scope = str(getattr(config, "single_factor_scope", "")).lower() in {
-        "new",
-        "range",
-        "selected",
-    }
-    existing_active_factors: set[str] = set()
-    if partial_scope and not existing.empty and {"因子", "因子库状态"}.issubset(existing.columns):
-        existing_active_factors = set(
-            existing.loc[existing["因子库状态"] == "active", "因子"].dropna().astype(str)
-        )
     # 只有“表现有效 + 当前代码仍能生成 + 满足收益门槛”的因子，才进入相关性去重候选池。
     min_train_sharpe = float(getattr(config, "factor_library_min_train_sharpe", -np.inf))
     min_train_total_return = float(getattr(config, "factor_library_min_train_total_return", -np.inf))
