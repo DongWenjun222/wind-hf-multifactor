@@ -104,7 +104,7 @@ python cli.py signal --symbol C.DCE --mode detail --source auto
 - `vote`：按 active 因子的历史表现加权投票，只作为简单基准或模型不可用时的人工显式选择；程序不会从模型模式静默降级到 vote。
 - `detail`：直接读取旧 `composite_detail.csv` 最后一行，速度最快，但不是现场重新预测。
 
-`compute/model` 使用当前 active 因子库重新训练最新模型，并不保证复现较早回测使用的旧 active 快照。若因子缓存早于最新行情，程序会拒绝输出旧信号；应先重新运行 `composite/multi`，或显式开启 `trading_signal_rebuild_missing_factors` 现场重建。
+`compute/model` 使用当前 active 因子库重新训练最新模型，并不保证复现较早回测使用的旧 active 快照。若因子缓存缺失或早于最新行情，程序默认根据最新行情仅按需重建该品种的 active 因子，不会计算全量因子；可用 `--no-rebuild-missing-factors` 或配置项 `trading_signal_rebuild_missing_factors=False` 强制只允许使用预生成缓存。active 因子库为空时仍会跳过该品种，避免使用未经筛选的因子交易。
 
 多品种研究推荐顺序：
 

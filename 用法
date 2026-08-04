@@ -1,0 +1,177 @@
+**核心运行文件**
+
+1. [single_factor_backtest.py](D:/工作相关_杂杂杂/高频/single_factor_backtest.py)
+
+单因子研究与因子入库入口。
+
+主要工作：
+
+- 读取指定期货品种的行情数据。
+- 根据 `scope=all/new/range/selected` 按需生成因子。
+- 分割训练集、验证集和最终测试集。
+- 分别回测每个因子的多空信号。
+- 计算收益、夏普、胜率、IC、稳定性等指标。
+- 对因子进行相关性去重和家族配额控制。
+- 更新 `active_factors.csv`、`rejected_factors.csv` 和 `factor_library_all.csv`。
+
+它解决的是：“哪些单因子值得进入候选库？”
+
+---
+
+2. [composite_factor_backtest.py](D:/工作相关_杂杂杂/高频/composite_factor_backtest.py)
+
+单品种多因子模型训练与回测入口。
+
+主要工作：
+
+- 读取该品种的 `active_factors.csv`。
+- 只构建 active 因子，不应计算全部因子。
+- 在 active 因子池内执行 `all/best/selected` 等二次选因。
+- 使用 XGBoost、逻辑回归、随机森林等模型滚动训练。
+- 预测下一根或多周期 K 线方向。
+- 进行概率阈值校准、市场状态过滤和持仓控制。
+- 输出训练集、验证集、测试集的预测指标和策略指标。
+
+它解决的是：“如何将一个品种的多个有效因子合成为最终预测？”
+
+主要输出目录：
+
+```text
+wind_hf_multifactor_output/composite_factor/
+```
+
+---
+
+3. [multi_symbol_backtest.py](D:/工作相关_杂杂杂/高频/multi_symbol_backtest.py)
+
+多品种批量研究与组合回测入口。
+
+它本身是一个流程调度器，会根据配置对每个品种调用：
+
+```text
+单因子流程
+→ 更新该品种 active 因子库
+→ 综合模型流程
+→ 汇总不同品种的策略结果
+→ 构建多品种组合
+```
+
+主要工作：
+
+- 批量处理多个期货品种。
+- 每个品种维护独立的因子库和进度。
+- 可以只运行单因子、只运行综合模型，或者两者都运行。
+- 汇总品种收益、风险、相关性和交易状态。
+- 使用等权、波动率倒数、风险预算等组合方法。
+- 进行横截面机会选择和组合层风险控制。
+
+它解决的是：“如何批量研究多个品种，并形成最终期货组合？”
+
+每个品种的输出位于：
+
+```text
+wind_hf_multifactor_output/by_symbol/<品种>/
+```
+
+---
+
+4. [pooled_model_backtest.py](D:/工作相关_杂杂杂/高频/pooled_model_backtest.py)
+
+多品种共享信息模型入口。
+
+它与 `multi_symbol_backtest.py` 的区别是：
+
+- `multi_symbol_backtest.py` 默认每个品种独立训练模型。
+- `pooled_model_backtest.py` 把多个品种样本合并，共同训练一个模型。
+
+主要工作：
+
+- 读取多个品种各自的 active 因子。
+- 将数据整理成长表格式。
+- 加入品种、板块、市场状态等信息。
+- 按全市场或板块训练共享模型。
+- 将共享模型的预测重新映射到每个品种。
+- 比较共享模型与逐品种独立模型的效果。
+
+它解决的是：“样本较少的品种，能否借助其他品种的信息提高预测稳定性？”
+
+---
+
+5. [trading_signal.py](D:/工作相关_杂杂杂/高频/trading_signal.py)
+
+最新交易信号生成入口。
+
+默认 `compute` 模式会：
+
+- 读取每个品种最新行情。
+- 读取该品种 active 因子库。
+- 按需计算 active 因子值。
+- 使用与综合回测一致的滚动模型重新训练和预测。
+- 输出目标仓位、调仓量、置信度和交易过滤原因。
+
+支持三种模式：
+
+- `compute/model`：现场重新训练模型并预测，最接近实盘使用。
+- `vote`：active 因子加权投票，作为简单基准。
+- `detail`：读取旧回测明细最后一行，速度快但不是最新计算。
+
+它解决的是：“当前最新一根 K 线应该做多、做空还是空仓？”
+
+---
+
+6. [cli.py](D:/工作相关_杂杂杂/高频/cli.py)
+
+统一命令行入口，日常使用最推荐。
+
+它不负责具体计算，而是统一调用上面的流程：
+
+```bash
+python cli.py single
+python cli.py composite
+python cli.py multi
+python cli.py pooled
+python cli.py signal
+```
+
+优点是可以通过命令行覆盖品种、因子范围、模型和实验参数，不需要频繁修改 `config.py`。
+
+**辅助运行文件**
+
+- [data_quality_report.py](D:/工作相关_杂杂杂/高频/data_quality_report.py)：检查行情缺失、重复时间、异常 K 线和极端收益。
+- [smoke_test.py](D:/工作相关_杂杂杂/高频/smoke_test.py)：快速验证项目主要流程能否运行。
+- [consistency_check.py](D:/工作相关_杂杂杂/高频/consistency_check.py)：检查配置、CLI 和文档是否一致。
+- [leakage_audit.py](D:/工作相关_杂杂杂/高频/leakage_audit.py)：扫描未来数据和潜在标签泄露。
+- [factor_metadata.py](D:/工作相关_杂杂杂/高频/factor_metadata.py)：导出因子家族、来源和复杂度信息。
+- [cleanup_outputs.py](D:/工作相关_杂杂杂/高频/cleanup_outputs.py)：清理或归档历史回测结果。
+- [hard_prune_factors.py](D:/工作相关_杂杂杂/高频/hard_prune_factors.py)：根据淘汰池从源码中硬删除因子公式，需谨慎运行。
+- [config.py](D:/工作相关_杂杂杂/高频/config.py)：全局参数中心，一般编辑但不直接运行。
+
+**推荐顺序**
+
+单品种研究：
+
+```text
+data_quality_report.py
+→ single_factor_backtest.py
+→ composite_factor_backtest.py
+→ trading_signal.py
+```
+
+多品种研究：
+
+```text
+data_quality_report.py
+→ multi_symbol_backtest.py
+→ pooled_model_backtest.py（可选）
+→ trading_signal.py
+```
+
+其中最重要的职责边界是：
+
+```text
+single_factor_backtest.py：筛选因子
+composite_factor_backtest.py：单品种合成预测
+multi_symbol_backtest.py：批量执行和组合管理
+pooled_model_backtest.py：跨品种共享建模
+trading_signal.py：生成最新可执行信号
+```

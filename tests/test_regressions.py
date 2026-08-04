@@ -44,6 +44,7 @@ from trading_signal import (
     get_factor_weight_series,
     get_live_model_predict_index,
     load_cached_factor_inputs,
+    load_live_factor_inputs,
 )
 
 
@@ -467,6 +468,47 @@ class FrameworkRegressionTests(unittest.TestCase):
             cached_data, cached_factors, _ = cached
             self.assertEqual(len(cached_data), 10)
             self.assertEqual(len(cached_factors), 10)
+
+    def test_live_signal_rebuilds_only_active_factors_when_cache_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            self.assertTrue(config.trading_signal_rebuild_missing_factors)
+            symbol_dir = Path(temp_dir) / "by_symbol" / "CU_SHF"
+            library_dir = symbol_dir / "factor_library"
+            library_dir.mkdir(parents=True)
+            pd.DataFrame({"因子": ["factor_a"]}).to_csv(
+                library_dir / "active_factors.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            index = pd.date_range("2025-01-01", periods=10, freq="30min")
+            price_data = pd.DataFrame(
+                {
+                    "open": np.arange(10.0) + 100.0,
+                    "high": np.arange(10.0) + 101.0,
+                    "low": np.arange(10.0) + 99.0,
+                    "close": np.arange(10.0) + 100.5,
+                    "volume": np.arange(10.0) + 1.0,
+                },
+                index=index,
+            )
+            built_factors = pd.DataFrame({"factor_a": np.arange(10.0)}, index=index)
+
+            with patch("trading_signal.fetch_intraday_data", return_value=price_data), patch(
+                "trading_signal.build_factors",
+                return_value=built_factors,
+            ) as build_mock:
+                _, _, factors, active_factors, source = load_live_factor_inputs(
+                    config,
+                    "CU.SHF",
+                    "multi",
+                )
+
+            self.assertEqual(active_factors, ["factor_a"])
+            self.assertEqual(list(factors.columns), ["factor_a"])
+            self.assertIn("实时构建", source)
+            self.assertEqual(build_mock.call_args.kwargs["requested_factors"], ["factor_a"])
 
     def test_live_model_predict_index_aligns_to_retrain_boundary(self) -> None:
         config = BacktestConfig()

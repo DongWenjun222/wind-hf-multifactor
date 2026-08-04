@@ -456,7 +456,17 @@ def load_live_factor_inputs(
                 "请先运行该品种 composite/multi 流程，或设置 trading_signal_rebuild_missing_factors=True。"
             )
         data = latest_data
+        print(f"现场按需重建 {symbol} active 因子: 请求={len(active_factors)}")
         factors = build_factors(data, symbol_config, requested_factors=active_factors)
+        missing_factors = sorted(set(active_factors).difference(factors.columns))
+        if missing_factors:
+            preview = ", ".join(missing_factors[:10])
+            suffix = "..." if len(missing_factors) > 10 else ""
+            raise ValueError(
+                f"{symbol} 有 {len(missing_factors)} 个 active 因子无法现场生成: "
+                f"{preview}{suffix}"
+            )
+        print(f"现场按需重建完成 {symbol}: 生成={len(active_factors)}")
         input_source = f"现场计算:实时构建:{Path(symbol_config.output_dir)}"
     if factors.empty:
         raise ValueError(f"{symbol} active 因子矩阵为空。")
@@ -912,6 +922,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", help="输出 CSV 路径；不填则写入 output_dir/trading_signals/trading_signals_latest.csv。")
     parser.add_argument("--output-dir", help="覆盖 config.output_dir。")
+    parser.add_argument(
+        "--rebuild-missing-factors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "缺少或过期因子缓存时，是否根据最新行情按需重建 active 因子；"
+            "默认使用 config.py 配置。"
+        ),
+    )
     return parser
 
 
@@ -922,6 +941,8 @@ def main() -> None:
     configure_warning_output(config)
     if args.output_dir:
         config.output_dir = args.output_dir
+    if args.rebuild_missing_factors is not None:
+        config.trading_signal_rebuild_missing_factors = args.rebuild_missing_factors
     run_trading_signal_export(
         config,
         symbols=args.symbols,

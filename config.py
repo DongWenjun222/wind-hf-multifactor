@@ -525,7 +525,7 @@ class BacktestConfig:
 
     # 当 single_factor_scope="range" 时使用的因子编号区间，起止都包含。
     # 因子编号从 1 开始；如果写成 [0, 10000]，程序会自动按 [1, 10000] 处理。
-    single_factor_range: tuple[int, int] = (1, 100)
+    single_factor_range: tuple[int, int] = (1, 1000)
 
     # 当 single_factor_scope="selected" 时使用的单因子名单。
     # 留空表示不额外指定；如果启用 selected，建议填入因子列名列表。
@@ -1020,9 +1020,9 @@ class BacktestConfig:
     trading_signal_use_factor_cache: bool = True
 
     # 最新交易信号现场计算时，如果没有可复用的因子缓存/明细因子列，是否临时重建因子。
-    # 默认关闭，避免全品种交易信号导出时因为某个品种缺缓存而卡很久；
-    # 需要重建时建议先运行 single 或 multi 流程。
-    trading_signal_rebuild_missing_factors: bool = False
+    # 默认开启，因为交易信号必须覆盖最新行情；重建时只按需计算该品种 active 因子，
+    # 不会回退为数万个因子的全量构建。若只允许使用预先生成的缓存，可显式设为 False。
+    trading_signal_rebuild_missing_factors: bool = True
 
     # 最新交易信号默认生成模式。
     # compute/model：复用综合回测的滚动模型、特征、校准和交易规则现场预测；
