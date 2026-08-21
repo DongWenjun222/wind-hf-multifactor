@@ -5,7 +5,7 @@ from __future__ import annotations
 本文件把单因子信号合成为一个可交易的综合信号：
 - 支持 selected / all / best 三种因子输入范围。
 - 支持 signal / continuous / both 三种特征形式。
-- 使用下一根K线涨跌方向作为分类目标，训练三分类 XGBoost。
+- 使用覆盖最小持仓期、成本与波动缓冲后的未来收益方向作为三分类目标。
 - 采用滚动窗口训练和滚动预测，尽量模拟真实上线时只能使用历史数据的状态。
 - 同时输出 XGBoost 策略和等权投票基准策略，方便判断模型是否真的优于简单合成。
 """
@@ -36,6 +36,11 @@ from framework.runtime_utils import (
     write_json_atomic,
 )
 from framework.project_fingerprint import build_source_fingerprint_hash
+from framework.output_layout import (
+    apply_frequency_runtime_defaults,
+    get_frequency_key,
+    get_research_output_dir,
+)
 from framework.factor_library import get_factor_library_dir
 from framework.factors import (
     build_factors,
@@ -50,6 +55,7 @@ from framework.factors import (
 from single_factor_backtest import (
     build_signal_from_score,
     calculate_metrics,
+    calculate_wilson_interval,
     infer_annual_periods,
     plot_backtest_result,
     print_metrics,
@@ -438,6 +444,7 @@ def build_factor_cache_meta(
     data_content_hash = hashlib.sha256(data_hash_values.tobytes()).hexdigest()
     return {
         "symbol": config.symbol,
+        "bar_frequency": get_frequency_key(config),
         "bar_size": int(config.bar_size),
         "start": str(data.index.min()) if len(data.index) else "",
         "end": str(data.index.max()) if len(data.index) else "",
@@ -677,7 +684,7 @@ def build_factor_signal_features(
     """把多个因子的连续值转换成 -1/0/1 信号特征矩阵。
 
     这是当前框架的核心自变量之一：
-    每个单因子的独立多空判断作为 XGBoost 输入，让模型学习不同因子信号组合下的下一根K线方向。
+    每个单因子的独立多空判断作为模型输入，让模型学习不同信号组合下的可交易未来方向。
     """
     missing = sorted(set(selected_factors).difference(factors.columns))
     if missing:
@@ -800,17 +807,54 @@ def get_feature_base_factor(feature_name: str, selected_factors: list[str]) -> s
     return feature_name
 
 
-def get_xgboost_target_neutral_threshold(config: BacktestConfig) -> float:
-    """返回 XGBoost 分类目标中的中性收益阈值。
+def get_xgboost_target_round_trip_cost(config: BacktestConfig) -> float:
+    """返回标签需要覆盖的一次完整开平仓成本，单位为收益率。"""
+    if bool(getattr(config, "xgboost_target_include_round_trip_cost", True)):
+        return 2.0 * (
+            max(0.0, float(config.commission_bps))
+            + max(0.0, float(config.slippage_bps))
+        ) / 10000.0
+    return 0.0
 
-    阈值单位最终转换为收益率。
-    如果配置为 None，则用手续费 + 滑点作为中性区间，
-    只有下一根K线收益超过交易成本附近的波动才标记为上涨或下跌。
+
+def get_xgboost_target_neutral_threshold(config: BacktestConfig) -> float:
+    """返回 XGBoost 分类目标中的静态中性收益阈值。
+
+    静态阈值由一次完整开平仓的双边成本和额外中性缓冲组成。
+    动态波动率缓冲在 calculate_xgboost_target_neutral_threshold 中另行叠加。
     """
     neutral_bps = config.xgboost_target_neutral_bps
     if neutral_bps is None:
-        neutral_bps = config.commission_bps + config.slippage_bps
-    return max(0.0, float(neutral_bps)) / 10000.0
+        neutral_bps = 0.0
+    return get_xgboost_target_round_trip_cost(config) + (
+        max(0.0, float(neutral_bps)) / 10000.0
+    )
+
+
+def calculate_xgboost_target_volatility(
+    data: pd.DataFrame,
+    index: pd.Index,
+    config: BacktestConfig,
+) -> pd.Series:
+    """估计信号时点可知的持有期收益波动率，不使用未来行情。"""
+    window = max(
+        20,
+        int(getattr(config, "xgboost_target_dynamic_neutral_window", 240) or 240),
+    )
+    min_periods = max(20, window // 3)
+    return_mode = str(
+        getattr(config, "backtest_return_mode", "next_open_continuous")
+        or "next_open_continuous"
+    ).lower()
+    if return_mode == "next_open_continuous":
+        base_return = data["close"].replace(0, np.nan).pct_change()
+    else:
+        base_return = data["close"] / data["open"].replace(0, np.nan) - 1.0
+    volatility = (
+        base_return.rolling(window=window, min_periods=min_periods).std()
+        * np.sqrt(get_xgboost_target_horizon(config))
+    )
+    return volatility.reindex(index).replace([np.inf, -np.inf], np.nan).astype("float64")
 
 
 def calculate_xgboost_target_neutral_threshold(
@@ -824,10 +868,6 @@ def calculate_xgboost_target_neutral_threshold(
     if not bool(getattr(config, "xgboost_target_use_dynamic_neutral_threshold", False)):
         return threshold
 
-    window = max(
-        20,
-        int(getattr(config, "xgboost_target_dynamic_neutral_window", 240) or 240),
-    )
     multiplier = max(
         0.0,
         float(getattr(config, "xgboost_target_dynamic_neutral_multiplier", 0.0) or 0.0),
@@ -835,15 +875,9 @@ def calculate_xgboost_target_neutral_threshold(
     if multiplier <= 0:
         return threshold
 
-    intrabar_return = data["close"] / data["open"].replace(0, np.nan) - 1.0
-    min_periods = max(20, window // 3)
-    dynamic_threshold = (
-        intrabar_return.rolling(window=window, min_periods=min_periods).std()
-        * multiplier
-        * np.sqrt(get_xgboost_target_horizon(config))
-    )
-    dynamic_threshold = dynamic_threshold.reindex(index).replace([np.inf, -np.inf], np.nan)
-    return pd.concat([threshold, dynamic_threshold], axis=1).max(axis=1).astype("float64")
+    dynamic_threshold = calculate_xgboost_target_volatility(data, index, config) * multiplier
+    # 波动缓冲叠加在双边成本之上，保证非中性标签代表成本后仍有足够统计边际。
+    return threshold.add(dynamic_threshold.fillna(0.0), fill_value=0.0).astype("float64")
 
 
 def get_xgboost_target_label_mode(config: BacktestConfig) -> str:
@@ -891,8 +925,14 @@ def calculate_quantile_target_bounds(
         index=index,
     ).replace([np.inf, -np.inf], np.nan)
     fallback_neutral = calculate_xgboost_target_neutral_threshold(data, index, config)
-    bounds["target_lower_threshold"] = bounds["target_lower_threshold"].fillna(-fallback_neutral)
-    bounds["target_upper_threshold"] = bounds["target_upper_threshold"].fillna(fallback_neutral)
+    bounds["target_lower_threshold"] = pd.concat(
+        [bounds["target_lower_threshold"], -fallback_neutral],
+        axis=1,
+    ).min(axis=1)
+    bounds["target_upper_threshold"] = pd.concat(
+        [bounds["target_upper_threshold"], fallback_neutral],
+        axis=1,
+    ).max(axis=1)
     return bounds.astype("float64")
 
 
@@ -1006,8 +1046,17 @@ def calculate_next_bar_direction(
 
 
 def get_xgboost_target_horizon(config: BacktestConfig) -> int:
-    """返回配置中的预测目标跨度，并保证至少为一根 K 线。"""
-    return max(1, int(getattr(config, "xgboost_target_horizon", 1) or 1))
+    """返回有效预测跨度，并可自动覆盖执行层最小持仓期。"""
+    horizon = max(1, int(getattr(config, "xgboost_target_horizon", 1) or 1))
+    if (
+        bool(getattr(config, "xgboost_target_align_with_min_holding", True))
+        and bool(getattr(config, "xgboost_use_position_rules", False))
+    ):
+        horizon = max(
+            horizon,
+            max(1, int(getattr(config, "xgboost_min_holding_bars", 1) or 1)),
+        )
+    return horizon
 
 
 def calculate_future_horizon_return(
@@ -1026,6 +1075,35 @@ def calculate_future_horizon_return(
     return (exit_close / entry_open - 1.0).reindex(index)
 
 
+def calculate_future_target_outcomes(
+    data: pd.DataFrame,
+    index: pd.Index,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """构造与真实持仓和交易成本一致的未来目标收益诊断。
+
+    future_horizon_net_return 表示按未来价格方向交易、扣除完整双边成本后
+    仍可获得的带方向机会收益；绝对波动不足以覆盖成本时记为 0。
+    standardized 列再除以信号时点已知的事前持有期波动率。
+    """
+    gross_return = calculate_future_horizon_return(data, index, config).astype("float64")
+    round_trip_cost = get_xgboost_target_round_trip_cost(config)
+    net_magnitude = (gross_return.abs() - round_trip_cost).clip(lower=0.0)
+    net_return = np.sign(gross_return) * net_magnitude
+    volatility = calculate_xgboost_target_volatility(data, index, config)
+    standardized_net_return = net_return / volatility.replace(0.0, np.nan)
+    return pd.DataFrame(
+        {
+            "future_horizon_return": gross_return,
+            "future_horizon_round_trip_cost": round_trip_cost,
+            "future_horizon_net_return": net_return,
+            "future_horizon_target_volatility": volatility,
+            "future_horizon_standardized_net_return": standardized_net_return,
+        },
+        index=index,
+    ).replace([np.inf, -np.inf], np.nan)
+
+
 def calculate_next_bar_return(data: pd.DataFrame, index: pd.Index) -> pd.Series:
     """计算下一根K线 open 到 close 的收益，并对齐到当前时点。"""
     open_price = data["open"].replace(0, np.nan)
@@ -1034,24 +1112,24 @@ def calculate_next_bar_return(data: pd.DataFrame, index: pd.Index) -> pd.Series:
 
 def choose_signal_direction_on_training(
     raw_signal: pd.Series,
-    next_return: pd.Series,
+    target_return: pd.Series,
 ) -> float:
     """在训练窗口内判断一个合成信号是否需要反向。
 
-    比较原始信号和反向信号在训练窗口的下一根K线收益贡献。
+    比较原始信号和反向信号在训练窗口的目标持有期净收益贡献。
     该逻辑用于 XGBoost 概率信号和等权投票基准的方向校准。
     """
     aligned = pd.DataFrame(
         {
             "signal": raw_signal,
-            "next_return": next_return.reindex(raw_signal.index),
+            "target_return": target_return.reindex(raw_signal.index),
         }
     ).dropna()
     if aligned.empty or aligned["signal"].abs().sum() == 0:
         return 1.0
 
-    forward_return = (aligned["signal"] * aligned["next_return"]).sum()
-    inverse_return = (-aligned["signal"] * aligned["next_return"]).sum()
+    forward_return = (aligned["signal"] * aligned["target_return"]).sum()
+    inverse_return = (-aligned["signal"] * aligned["target_return"]).sum()
     return -1.0 if inverse_return > forward_return else 1.0
 
 
@@ -1508,6 +1586,168 @@ def safe_corr(left: pd.Series, right: pd.Series, method: str = "pearson") -> flo
     return float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1], method=method))
 
 
+def calculate_multiclass_classification_metrics(
+    target: pd.Series,
+    prediction: pd.Series,
+) -> dict[str, float]:
+    """计算三分类 Balanced Accuracy、MCC 及准确率 Wilson 区间。"""
+    aligned = pd.DataFrame({"target": target, "prediction": prediction}).dropna()
+    if aligned.empty:
+        return {
+            "BalancedAccuracy": np.nan,
+            "MCC": np.nan,
+            "准确率Wilson下限": np.nan,
+            "准确率Wilson上限": np.nan,
+        }
+
+    classes = [-1.0, 0.0, 1.0]
+    confusion = pd.crosstab(aligned["target"], aligned["prediction"]).reindex(
+        index=classes,
+        columns=classes,
+        fill_value=0,
+    )
+    matrix = confusion.to_numpy(dtype="float64")
+    true_totals = matrix.sum(axis=1)
+    predicted_totals = matrix.sum(axis=0)
+    sample_count = float(matrix.sum())
+    correct_count = float(np.trace(matrix))
+
+    recalls = np.divide(
+        np.diag(matrix),
+        true_totals,
+        out=np.full(len(classes), np.nan, dtype="float64"),
+        where=true_totals > 0,
+    )
+    balanced_accuracy = float(np.nanmean(recalls)) if np.isfinite(recalls).any() else np.nan
+    numerator = correct_count * sample_count - float(np.dot(true_totals, predicted_totals))
+    denominator = np.sqrt(
+        (sample_count**2 - float(np.dot(predicted_totals, predicted_totals)))
+        * (sample_count**2 - float(np.dot(true_totals, true_totals)))
+    )
+    mcc = numerator / denominator if denominator > 0 else np.nan
+    lower, upper = calculate_wilson_interval(int(correct_count), int(sample_count))
+    return {
+        "BalancedAccuracy": balanced_accuracy,
+        "MCC": float(mcc) if np.isfinite(mcc) else np.nan,
+        "准确率Wilson下限": lower,
+        "准确率Wilson上限": upper,
+    }
+
+
+def calculate_multiclass_calibration_error(
+    target: pd.Series,
+    probabilities: pd.DataFrame,
+    bins: int,
+) -> dict[str, float]:
+    """计算基于最大类别置信度的多分类 ECE 和 MCE。"""
+    frame = probabilities[["prob_down", "prob_flat", "prob_up"]].copy()
+    frame["target"] = target.map(TARGET_TO_CLASS)
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
+    if frame.empty:
+        return {"概率校准误差ECE": np.nan, "概率校准最大误差MCE": np.nan}
+
+    probability = frame[["prob_down", "prob_flat", "prob_up"]].clip(0.0, 1.0)
+    probability = probability.div(probability.sum(axis=1).replace(0.0, np.nan), axis=0)
+    valid = probability.notna().all(axis=1)
+    probability = probability.loc[valid]
+    labels = frame.loc[valid, "target"].astype(int).to_numpy()
+    if probability.empty:
+        return {"概率校准误差ECE": np.nan, "概率校准最大误差MCE": np.nan}
+
+    values = probability.to_numpy(dtype="float64")
+    confidence = values.max(axis=1)
+    correct = (values.argmax(axis=1) == labels).astype("float64")
+    bin_edges = np.linspace(0.0, 1.0, max(2, int(bins)) + 1)
+    bin_ids = np.clip(np.digitize(confidence, bin_edges[1:-1], right=True), 0, len(bin_edges) - 2)
+    weighted_error = 0.0
+    max_error = 0.0
+    for bin_id in range(len(bin_edges) - 1):
+        mask = bin_ids == bin_id
+        if not mask.any():
+            continue
+        error = abs(float(correct[mask].mean()) - float(confidence[mask].mean()))
+        weighted_error += float(mask.mean()) * error
+        max_error = max(max_error, error)
+    return {
+        "概率校准误差ECE": weighted_error,
+        "概率校准最大误差MCE": max_error,
+    }
+
+
+def calculate_block_bootstrap_statistics(
+    strategy_returns: pd.Series,
+    annual_periods: int,
+    config: BacktestConfig,
+) -> dict[str, float]:
+    """使用循环移动区块自助法估计收益和标准 Sharpe 的不确定性。"""
+    if not bool(getattr(config, "statistical_enable_block_bootstrap", True)):
+        return {}
+    values = strategy_returns.replace([np.inf, -np.inf], np.nan).dropna().to_numpy("float64")
+    sample_count = len(values)
+    bootstrap_samples = max(1, int(getattr(config, "statistical_bootstrap_samples", 500) or 500))
+    if sample_count < 8 or bootstrap_samples < 20:
+        return {
+            "BlockBootstrap有效样本数": float(sample_count),
+            "BlockBootstrap重复次数": float(bootstrap_samples),
+            "标准夏普置信下限": np.nan,
+            "标准夏普置信上限": np.nan,
+            "年化算术收益置信下限": np.nan,
+            "年化算术收益置信上限": np.nan,
+            "平均收益为零双侧P值": np.nan,
+        }
+
+    configured_block = int(getattr(config, "statistical_bootstrap_block_size", 0) or 0)
+    block_size = configured_block if configured_block > 0 else int(round(np.sqrt(sample_count)))
+    block_size = min(sample_count, max(1, block_size))
+    block_count = int(np.ceil(sample_count / block_size))
+    confidence_level = min(
+        0.999,
+        max(0.50, float(getattr(config, "statistical_confidence_level", 0.95) or 0.95)),
+    )
+    alpha = (1.0 - confidence_level) / 2.0
+    rng = np.random.default_rng(int(getattr(config, "statistical_bootstrap_seed", 0) or 0))
+    offsets = np.arange(block_size, dtype="int64")
+    centered = values - values.mean()
+    bootstrap_mean = np.empty(bootstrap_samples, dtype="float64")
+    bootstrap_sharpe = np.full(bootstrap_samples, np.nan, dtype="float64")
+    null_mean = np.empty(bootstrap_samples, dtype="float64")
+
+    for sample_id in range(bootstrap_samples):
+        starts = rng.integers(0, sample_count, size=block_count)
+        indices = ((starts[:, None] + offsets) % sample_count).reshape(-1)[:sample_count]
+        sample = values[indices]
+        bootstrap_mean[sample_id] = sample.mean()
+        sample_volatility = sample.std(ddof=1)
+        if sample_volatility > 0:
+            bootstrap_sharpe[sample_id] = (
+                bootstrap_mean[sample_id] / sample_volatility * np.sqrt(annual_periods)
+            )
+        null_mean[sample_id] = centered[indices].mean()
+
+    valid_sharpe = bootstrap_sharpe[np.isfinite(bootstrap_sharpe)]
+    observed_mean = float(values.mean())
+    p_value = (1.0 + float((np.abs(null_mean) >= abs(observed_mean)).sum())) / (
+        bootstrap_samples + 1.0
+    )
+    return {
+        "BlockBootstrap有效样本数": float(sample_count),
+        "BlockBootstrap重复次数": float(bootstrap_samples),
+        "BlockBootstrap区块长度": float(block_size),
+        "标准夏普置信下限": float(np.quantile(valid_sharpe, alpha))
+        if len(valid_sharpe)
+        else np.nan,
+        "标准夏普置信上限": float(np.quantile(valid_sharpe, 1.0 - alpha))
+        if len(valid_sharpe)
+        else np.nan,
+        "年化算术收益置信下限": float(np.quantile(bootstrap_mean, alpha) * annual_periods),
+        "年化算术收益置信上限": float(
+            np.quantile(bootstrap_mean, 1.0 - alpha) * annual_periods
+        ),
+        "平均收益为零双侧P值": p_value,
+        "平均收益为正Bootstrap置信度": float((bootstrap_mean > 0.0).mean()),
+    }
+
+
 def train_xgboost_classifier(
     train_features: pd.DataFrame,
     train_target: pd.Series,
@@ -1631,6 +1871,11 @@ def get_enabled_composite_models(config: BacktestConfig) -> list[str]:
     alias = {
         "logistic": "logistic_regression",
         "lr": "logistic_regression",
+        "elastic_net": "elastic_net_logistic",
+        "elasticnet": "elastic_net_logistic",
+        "enet": "elastic_net_logistic",
+        "hist_gb": "hist_gradient_boosting",
+        "histgb": "hist_gradient_boosting",
         "rf": "random_forest",
         "et": "extra_trees",
     }
@@ -1671,6 +1916,66 @@ def train_sklearn_classifier(
             ),
         )
         fit_kwargs = {"logisticregression__sample_weight": weight} if weight is not None else {}
+        model.fit(train_features[feature_columns], train_label, **fit_kwargs)
+        return model
+
+    if model_name == "elastic_net_logistic":
+        from sklearn.impute import SimpleImputer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        model = make_pipeline(
+            SimpleImputer(strategy="constant", fill_value=0.0),
+            StandardScaler(),
+            LogisticRegression(
+                C=float(getattr(config, "composite_elastic_net_c", 0.10) or 0.10),
+                penalty="elasticnet",
+                solver="saga",
+                l1_ratio=float(
+                    getattr(config, "composite_elastic_net_l1_ratio", 0.50) or 0.50
+                ),
+                max_iter=int(getattr(config, "composite_logistic_max_iter", 1000) or 1000),
+                multi_class="auto",
+                random_state=int(config.xgboost_random_state),
+            ),
+        )
+        fit_kwargs = {"logisticregression__sample_weight": weight} if weight is not None else {}
+        model.fit(train_features[feature_columns], train_label, **fit_kwargs)
+        return model
+
+    if model_name == "hist_gradient_boosting":
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import make_pipeline
+
+        model = make_pipeline(
+            SimpleImputer(strategy="constant", fill_value=0.0),
+            HistGradientBoostingClassifier(
+                learning_rate=float(
+                    getattr(config, "composite_hist_learning_rate", 0.05) or 0.05
+                ),
+                max_iter=int(getattr(config, "composite_hist_max_iter", 120) or 120),
+                max_leaf_nodes=int(
+                    getattr(config, "composite_hist_max_leaf_nodes", 15) or 15
+                ),
+                min_samples_leaf=int(
+                    getattr(config, "composite_hist_min_samples_leaf", 20) or 20
+                ),
+                l2_regularization=float(
+                    getattr(config, "composite_hist_l2_regularization", 2.0) or 2.0
+                ),
+                early_stopping=True,
+                validation_fraction=0.20,
+                n_iter_no_change=15,
+                random_state=int(config.xgboost_random_state),
+            ),
+        )
+        fit_kwargs = (
+            {"histgradientboostingclassifier__sample_weight": weight}
+            if weight is not None
+            else {}
+        )
         model.fit(train_features[feature_columns], train_label, **fit_kwargs)
         return model
 
@@ -1716,7 +2021,8 @@ def train_sklearn_classifier(
 
     raise ValueError(
         "未知综合模型: "
-        f"{model_name}。可选: xgboost, logistic_regression, random_forest, extra_trees。"
+        f"{model_name}。可选: xgboost, logistic_regression, elastic_net_logistic, "
+        "hist_gradient_boosting, random_forest, extra_trees。"
     )
 
 
@@ -1893,7 +2199,8 @@ def build_xgboost_rolling_signal(
         features = build_features_for_factors(factors, signal_features, selected_factors, config)
         feature_columns = features.columns.tolist()
     target = calculate_next_bar_direction(data, factors.index, config)
-    next_bar_return = calculate_next_bar_return(data, factors.index)
+    target_outcomes = calculate_future_target_outcomes(data, factors.index, config)
+    target_economic_return = target_outcomes["future_horizon_net_return"]
     predict_index = pd.Index(predict_index).intersection(factors.index)
     predict_positions = factors.index.get_indexer(predict_index)
     predict_positions = predict_positions[predict_positions >= 0]
@@ -2024,7 +2331,7 @@ def build_xgboost_rolling_signal(
                 )
                 active_min_edge, active_min_probability = calibrate_trade_thresholds_on_training(
                     train_probability,
-                    next_bar_return,
+                    target_economic_return,
                     train_trade_allowed,
                     config,
                 )
@@ -2038,7 +2345,7 @@ def build_xgboost_rolling_signal(
                 if config.xgboost_auto_calibrate_signal_direction:
                     active_xgboost_signal_direction = choose_signal_direction_on_training(
                         train_raw_signal,
-                        next_bar_return,
+                        target_economic_return,
                     )
                 else:
                     active_xgboost_signal_direction = 1.0
@@ -2054,7 +2361,7 @@ def build_xgboost_rolling_signal(
                 train_vote_signal = train_vote_signal.where(train_trade_allowed, 0.0)
                 active_vote_signal_direction = choose_signal_direction_on_training(
                     train_vote_signal,
-                    next_bar_return,
+                    target_economic_return,
                 )
             else:
                 active_vote_signal_direction = 1.0
@@ -2102,7 +2409,7 @@ def build_xgboost_rolling_signal(
     signal = pd.DataFrame(index=factors.index)
     signal["xgboost_predicted_direction"] = predicted_direction
     signal["target_direction"] = target
-    signal["future_horizon_return"] = calculate_future_horizon_return(data, factors.index, config)
+    signal = signal.join(target_outcomes)
     target_bounds = calculate_xgboost_target_bounds(data, factors.index, config)
     signal = signal.join(target_bounds)
     signal["target_neutral_threshold"] = (
@@ -2212,6 +2519,235 @@ def build_xgboost_rolling_signal(
 
     selection_summary = pd.DataFrame(selection_rows) if selection_rows else None
     return signal, feature_importance, features, selection_summary
+
+
+def _normalize_capped_model_weights(values: pd.Series, max_weight: float) -> pd.Series:
+    """把非负模型得分归一化，并用水位法落实单模型权重上限。"""
+    values = values.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    positive = values[values > 0]
+    result = pd.Series(0.0, index=values.index, dtype="float64")
+    if positive.empty:
+        return result
+
+    effective_cap = max(float(max_weight), 1.0 / len(positive))
+    remaining = list(positive.index)
+    remaining_mass = 1.0
+    while remaining:
+        scores = positive.loc[remaining]
+        proposed = (
+            pd.Series(remaining_mass / len(remaining), index=remaining)
+            if float(scores.sum()) <= 0
+            else scores / float(scores.sum()) * remaining_mass
+        )
+        capped = proposed[proposed > effective_cap + 1e-12]
+        if capped.empty:
+            result.loc[remaining] = proposed
+            break
+        result.loc[capped.index] = effective_cap
+        remaining_mass -= effective_cap * len(capped)
+        remaining = [name for name in remaining if name not in capped.index]
+    return result
+
+
+def build_historical_probability_ensemble(
+    model_signals: dict[str, pd.DataFrame],
+    data: pd.DataFrame,
+    config: BacktestConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """用严格滞后的滚动预测质量融合基础模型概率。
+
+    时点 t 的权重只使用截至 t-horizon 已经成熟的标签，避免多周期目标把
+    当前或未来收益泄露到模型权重。基础模型的训练窗口方向校准会先作用到
+    down/up 概率，再进入融合。
+    """
+    requested = {
+        str(name).strip().lower()
+        for name in (getattr(config, "composite_ensemble_model_names", []) or [])
+    }
+    selected = {
+        name: signal
+        for name, signal in model_signals.items()
+        if not requested or name.lower() in requested
+    }
+    min_models = max(2, int(getattr(config, "composite_ensemble_min_models", 2) or 2))
+    if len(selected) < min_models:
+        raise ValueError(f"概率融合至少需要 {min_models} 个成功基础模型，当前只有 {len(selected)} 个。")
+
+    first_signal = next(iter(selected.values()))
+    index = first_signal.index
+    for signal in selected.values():
+        index = index.intersection(signal.index, sort=False)
+    if index.empty:
+        raise ValueError("基础模型没有共同的滚动预测时点，无法构建概率融合。")
+
+    target = first_signal["target_direction"].reindex(index).astype("float64")
+    return_column = (
+        "future_horizon_net_return"
+        if "future_horizon_net_return" in first_signal.columns
+        else "future_horizon_return"
+    )
+    future_return = first_signal[return_column].reindex(index).astype("float64")
+    horizon = get_xgboost_target_horizon(config)
+    window = max(2, int(getattr(config, "composite_ensemble_weight_window", 480) or 480))
+    min_history = max(2, int(getattr(config, "composite_ensemble_min_history", 120) or 120))
+    min_accuracy = float(
+        getattr(config, "composite_ensemble_min_directional_accuracy", 0.48) or 0.48
+    )
+    min_corr = float(getattr(config, "composite_ensemble_min_edge_return_corr", -0.02))
+    max_weight = float(getattr(config, "composite_ensemble_max_model_weight", 0.60) or 0.60)
+    shrinkage = min(
+        1.0,
+        max(0.0, float(getattr(config, "composite_ensemble_equal_weight_shrinkage", 0.35) or 0.35)),
+    )
+
+    adjusted_probabilities: dict[str, pd.DataFrame] = {}
+    scores = pd.DataFrame(0.0, index=index, columns=selected, dtype="float64")
+    eligible = pd.DataFrame(False, index=index, columns=selected)
+    accuracies = pd.DataFrame(np.nan, index=index, columns=selected, dtype="float64")
+    correlations = pd.DataFrame(np.nan, index=index, columns=selected, dtype="float64")
+    history_counts = pd.DataFrame(0.0, index=index, columns=selected, dtype="float64")
+
+    for model_name, signal in selected.items():
+        probability = signal[["prob_down", "prob_flat", "prob_up"]].reindex(index).astype("float64")
+        direction = signal["xgboost_signal_direction"].reindex(index).fillna(1.0)
+        reversed_mask = direction < 0
+        adjusted = probability.copy()
+        adjusted.loc[reversed_mask, "prob_down"] = probability.loc[reversed_mask, "prob_up"]
+        adjusted.loc[reversed_mask, "prob_up"] = probability.loc[reversed_mask, "prob_down"]
+        adjusted_probabilities[model_name] = adjusted
+
+        edge = adjusted["prob_up"] - adjusted["prob_down"]
+        directional = target.ne(0) & edge.notna()
+        correct = pd.Series(np.nan, index=index, dtype="float64")
+        correct.loc[directional] = (
+            np.sign(edge.loc[directional]) == np.sign(target.loc[directional])
+        ).astype("float64")
+        count = directional.astype("float64").rolling(window, min_periods=1).sum().shift(horizon)
+        accuracy = correct.rolling(window, min_periods=1).mean().shift(horizon)
+        correlation = edge.rolling(
+            window,
+            min_periods=max(5, min_history // 2),
+        ).corr(future_return).shift(horizon)
+        is_eligible = (
+            count.ge(min_history)
+            & accuracy.ge(min_accuracy)
+            & correlation.ge(min_corr)
+            & adjusted.notna().all(axis=1)
+        )
+        performance_score = (
+            (accuracy - min_accuracy).clip(lower=0.0)
+            + (correlation - min_corr).clip(lower=0.0)
+        ).where(is_eligible, 0.0)
+        scores[model_name] = performance_score.fillna(0.0)
+        eligible[model_name] = is_eligible.fillna(False)
+        accuracies[model_name] = accuracy
+        correlations[model_name] = correlation
+        history_counts[model_name] = count.fillna(0.0)
+
+    weights = pd.DataFrame(0.0, index=index, columns=selected, dtype="float64")
+    for timestamp in index:
+        eligible_names = eligible.columns[eligible.loc[timestamp]].tolist()
+        if len(eligible_names) < min_models:
+            continue
+        dynamic = _normalize_capped_model_weights(
+            scores.loc[timestamp, eligible_names],
+            max_weight,
+        )
+        if float(dynamic.sum()) <= 0:
+            dynamic[:] = 1.0 / len(dynamic)
+        equal = pd.Series(1.0 / len(eligible_names), index=eligible_names)
+        blended = (1.0 - shrinkage) * dynamic + shrinkage * equal
+        weights.loc[timestamp, eligible_names] = _normalize_capped_model_weights(
+            blended,
+            max_weight,
+        )
+
+    ensemble_probability = pd.DataFrame(
+        0.0,
+        index=index,
+        columns=["prob_down", "prob_flat", "prob_up"],
+    )
+    for model_name, probability in adjusted_probabilities.items():
+        ensemble_probability = ensemble_probability.add(
+            probability.mul(weights[model_name], axis=0),
+            fill_value=0.0,
+        )
+    valid_weight = weights.sum(axis=1).gt(0)
+    ensemble_probability.loc[~valid_weight] = np.nan
+    probability_sum = ensemble_probability.sum(axis=1).replace(0.0, np.nan)
+    ensemble_probability = ensemble_probability.div(probability_sum, axis=0)
+
+    signal = first_signal.reindex(index).copy()
+    signal[["prob_down", "prob_flat", "prob_up"]] = ensemble_probability
+    signal["prob_edge"] = signal["prob_up"] - signal["prob_down"]
+    signal["directional_probability"] = signal[["prob_up", "prob_down"]].max(axis=1)
+    signal["xgboost_signal_direction"] = 1.0
+    predicted_class = np.argmax(ensemble_probability.fillna(0.0).to_numpy(), axis=1)
+    predicted_direction = pd.Series(
+        [CLASS_TO_TARGET[int(value)] for value in predicted_class],
+        index=index,
+        dtype="float64",
+    ).where(valid_weight)
+    signal["xgboost_predicted_direction"] = predicted_direction
+    signal["calibrated_predicted_direction"] = predicted_direction
+    signal["calibrated_min_edge"] = float(config.xgboost_trade_min_edge)
+    signal["calibrated_min_probability"] = float(config.xgboost_trade_min_probability)
+    signal["calibrated_prob_edge"] = signal["prob_edge"]
+    signal["composite_score"] = signal["calibrated_prob_edge"]
+
+    market_state = build_market_state_filter(data, config).reindex(index)
+    for column in market_state.columns:
+        signal[column] = market_state[column]
+    confidence_filter = build_confidence_rank_filter(signal["calibrated_prob_edge"], config)
+    for column in confidence_filter.columns:
+        signal[column] = confidence_filter[column]
+    signal["trade_allowed"] = (
+        (signal["trade_allowed"].fillna(0.0) > 0)
+        & (signal["confidence_trade_allowed"].fillna(0.0) > 0)
+        & valid_weight
+    ).astype("float64")
+    signal["position_size"] = build_dynamic_confidence_position_size(
+        ensemble_probability,
+        signal["calibrated_min_edge"],
+        signal["calibrated_min_probability"],
+        config,
+    ).fillna(0.0)
+    signal["directional_vs_flat_edge"] = signal["directional_probability"] - signal["prob_flat"]
+    signal["flat_trade_allowed"] = (
+        (signal["prob_flat"] <= float(getattr(config, "xgboost_trade_max_flat_probability", 1.0)))
+        & (
+            signal["directional_vs_flat_edge"]
+            >= float(getattr(config, "xgboost_trade_min_directional_vs_flat_edge", 0.0))
+        )
+    ).astype("float64")
+    raw_signal = probabilities_to_trade_signal(
+        ensemble_probability,
+        config,
+        min_edge=float(config.xgboost_trade_min_edge),
+        min_probability=float(config.xgboost_trade_min_probability),
+    ).where(signal["flat_trade_allowed"].fillna(0.0) > 0, 0.0)
+    signal["raw_signal"] = raw_signal.where(signal["trade_allowed"] > 0, 0.0).fillna(0.0)
+    signal["raw_signal_before_position_rules"] = signal["raw_signal"]
+    signal["target_position_before_rules"] = signal["raw_signal"] * signal["position_size"]
+    signal["target_position"] = apply_position_rules(signal["target_position_before_rules"], config)
+    signal["raw_signal"] = np.sign(signal["target_position"]).astype("float64")
+    signal["position"] = signal["target_position"].shift(1).fillna(0.0)
+
+    diagnostics = []
+    for model_name in selected:
+        model_diagnostic = pd.DataFrame(
+            {
+                "时间": index,
+                "模型": model_name,
+                "权重": weights[model_name].to_numpy(),
+                "历史方向准确率": accuracies[model_name].to_numpy(),
+                "历史概率收益相关性": correlations[model_name].to_numpy(),
+                "成熟方向样本数": history_counts[model_name].to_numpy(),
+                "是否合格": eligible[model_name].to_numpy(),
+            }
+        )
+        diagnostics.append(model_diagnostic)
+    return signal, pd.concat(diagnostics, ignore_index=True)
 
 
 def save_prediction_diagnostics(backtest_df: pd.DataFrame, output_dir: Path) -> None:
@@ -2342,6 +2878,7 @@ def save_prediction_diagnostics(backtest_df: pd.DataFrame, output_dir: Path) -> 
 def calculate_prediction_metrics_for_segment(
     segment_name: str,
     segment_df: pd.DataFrame,
+    config: BacktestConfig | None = None,
 ) -> dict[str, Any] | None:
     """计算不依赖交易规则和策略收益的纯预测质量指标。"""
     required = {
@@ -2354,7 +2891,18 @@ def calculate_prediction_metrics_for_segment(
     if segment_df.empty or not required.issubset(segment_df.columns):
         return None
 
-    valid = segment_df[list(required) + [c for c in ["prob_down", "prob_flat", "prob_up", "raw_signal"] if c in segment_df.columns]]
+    optional_columns = [
+        "prob_down",
+        "prob_flat",
+        "prob_up",
+        "raw_signal",
+        "xgboost_signal_direction",
+        "future_horizon_net_return",
+        "future_horizon_standardized_net_return",
+    ]
+    valid = segment_df[
+        list(required) + [column for column in optional_columns if column in segment_df.columns]
+    ]
     valid = valid.replace([np.inf, -np.inf], np.nan).dropna(
         subset=["target_direction", "future_horizon_return", "xgboost_predicted_direction"]
     )
@@ -2369,6 +2917,23 @@ def calculate_prediction_metrics_for_segment(
     directional_target = target != 0
     predicted_directional = calibrated_pred != 0
     traded = valid.get("raw_signal", pd.Series(0.0, index=valid.index)).fillna(0.0) != 0
+    raw_classification = calculate_multiclass_classification_metrics(target, raw_pred)
+    calibrated_classification = calculate_multiclass_classification_metrics(
+        target,
+        calibrated_pred,
+    )
+    directional_correct = (
+        np.sign(calibrated_pred[directional_target]) == np.sign(target[directional_target])
+    )
+    directional_lower, directional_upper = calculate_wilson_interval(
+        int(directional_correct.sum()),
+        int(directional_correct.count()),
+    )
+    future_net_return = valid.get("future_horizon_net_return", future_return).astype("float64")
+    future_standardized_net_return = valid.get(
+        "future_horizon_standardized_net_return",
+        pd.Series(np.nan, index=valid.index),
+    ).astype("float64")
 
     rows: dict[str, Any] = {
         "样本段": segment_name,
@@ -2378,12 +2943,20 @@ def calculate_prediction_metrics_for_segment(
         "目标中性占比": float((target == 0).mean()),
         "原始三分类准确率": float((raw_pred == target).mean()),
         "校准后三分类准确率": float((calibrated_pred == target).mean()),
+        "原始三分类BalancedAccuracy": raw_classification["BalancedAccuracy"],
+        "原始三分类MCC": raw_classification["MCC"],
+        "校准后三分类BalancedAccuracy": calibrated_classification["BalancedAccuracy"],
+        "校准后三分类MCC": calibrated_classification["MCC"],
+        "校准准确率Wilson下限": calibrated_classification["准确率Wilson下限"],
+        "校准准确率Wilson上限": calibrated_classification["准确率Wilson上限"],
         "方向目标样本数": int(directional_target.sum()),
         "方向目标准确率": (
             float((np.sign(calibrated_pred[directional_target]) == np.sign(target[directional_target])).mean())
             if directional_target.any()
             else np.nan
         ),
+        "方向准确率Wilson下限": directional_lower,
+        "方向准确率Wilson上限": directional_upper,
         "预测方向覆盖率": float(predicted_directional.mean()),
         "交易信号覆盖率": float(traded.mean()),
         "交易信号方向准确率": (
@@ -2393,6 +2966,26 @@ def calculate_prediction_metrics_for_segment(
         ),
         "概率差与未来收益Pearson": safe_corr(prob_edge, future_return, method="pearson"),
         "概率差与未来收益Spearman": safe_corr(prob_edge, future_return, method="spearman"),
+        "概率差与未来净收益Pearson": safe_corr(
+            prob_edge,
+            future_net_return,
+            method="pearson",
+        ),
+        "概率差与未来净收益Spearman": safe_corr(
+            prob_edge,
+            future_net_return,
+            method="spearman",
+        ),
+        "概率差与标准化未来净收益Pearson": safe_corr(
+            prob_edge,
+            future_standardized_net_return,
+            method="pearson",
+        ),
+        "概率差与标准化未来净收益Spearman": safe_corr(
+            prob_edge,
+            future_standardized_net_return,
+            method="spearman",
+        ),
         "平均绝对概率差": float(prob_edge.abs().mean()),
         "预测为多样本未来平均收益": float(future_return[calibrated_pred > 0].mean())
         if (calibrated_pred > 0).any()
@@ -2415,7 +3008,21 @@ def calculate_prediction_metrics_for_segment(
 
     if {"prob_down", "prob_flat", "prob_up"}.issubset(valid.columns):
         class_label = target.map(TARGET_TO_CLASS).astype("Int64")
-        prob_matrix = valid[["prob_down", "prob_flat", "prob_up"]].clip(1e-12, 1.0)
+        prob_matrix = valid[["prob_down", "prob_flat", "prob_up"]].astype("float64").copy()
+        if "xgboost_signal_direction" in valid.columns:
+            reverse_mask = valid["xgboost_signal_direction"].fillna(1.0) < 0
+            original_down = prob_matrix.loc[reverse_mask, "prob_down"].copy()
+            prob_matrix.loc[reverse_mask, "prob_down"] = prob_matrix.loc[reverse_mask, "prob_up"]
+            prob_matrix.loc[reverse_mask, "prob_up"] = original_down
+        calibration_metrics = calculate_multiclass_calibration_error(
+            target,
+            prob_matrix,
+            int(getattr(config, "prediction_calibration_bins", 10) or 10)
+            if config is not None
+            else 10,
+        )
+        rows.update(calibration_metrics)
+        prob_matrix = prob_matrix.clip(1e-12, 1.0)
         prob_matrix = prob_matrix.div(prob_matrix.sum(axis=1).replace(0, np.nan), axis=0)
         logloss_frame = prob_matrix.assign(__label__=class_label).dropna(
             subset=["prob_down", "prob_flat", "prob_up", "__label__"]
@@ -2466,6 +3073,13 @@ def calculate_trading_metrics_for_segment(
         "平均目标仓位绝对值": float(target_position.abs().mean()),
         "交易信号覆盖率": float((raw_signal != 0).mean()),
     }
+    rows.update(
+        calculate_block_bootstrap_statistics(
+            cleaned["strategy_net_return"],
+            annual_periods,
+            config,
+        )
+    )
     if "trade_allowed" in cleaned.columns:
         rows["交易过滤后可交易覆盖率"] = float(cleaned["trade_allowed"].fillna(0.0).mean())
     if "flat_trade_allowed" in cleaned.columns:
@@ -2484,7 +3098,11 @@ def save_prediction_and_trading_reports(
     prediction_rows = []
     trading_rows = []
     for segment_name, segment_df in segment_backtests.items():
-        prediction_row = calculate_prediction_metrics_for_segment(segment_name, segment_df)
+        prediction_row = calculate_prediction_metrics_for_segment(
+            segment_name,
+            segment_df,
+            config,
+        )
         if prediction_row is not None:
             prediction_rows.append(prediction_row)
         trading_row = calculate_trading_metrics_for_segment(segment_name, segment_df, config)
@@ -3011,17 +3629,23 @@ def save_composite_outputs(
 
     summary = pd.Series(metrics, name="value")
     summary.loc["模型"] = f"{primary_model_name}_rolling_multiclass"
+    summary.loc["绩效指标口径"] = "standard_sharpe_mean_over_vol_v2"
     summary.loc["训练验证切分时间"] = str(split_time)
     summary.loc["验证测试切分时间"] = str(validation_end_time)
-    summary.loc["预测目标"] = "future_horizon_return_direction(-1,0,1)"
+    summary.loc["预测目标"] = "cost_and_volatility_adjusted_future_return(-1,0,1)"
     summary.loc["预测标签模式"] = get_xgboost_target_label_mode(config)
+    summary.loc["预测目标基础跨度K线数"] = int(config.xgboost_target_horizon)
     summary.loc["预测目标跨度K线数"] = get_xgboost_target_horizon(config)
-    summary.loc["训练标签隔离K线数"] = max(0, get_xgboost_target_horizon(config) - 1)
-    summary.loc["目标中性区间bps"] = (
-        config.xgboost_target_neutral_bps
-        if config.xgboost_target_neutral_bps is not None
-        else config.commission_bps + config.slippage_bps
+    summary.loc["目标跨度对齐最小持仓"] = bool(
+        getattr(config, "xgboost_target_align_with_min_holding", True)
     )
+    summary.loc["训练标签隔离K线数"] = max(0, get_xgboost_target_horizon(config) - 1)
+    summary.loc["目标计入双边成本"] = bool(
+        getattr(config, "xgboost_target_include_round_trip_cost", True)
+    )
+    summary.loc["目标双边成本bps"] = get_xgboost_target_round_trip_cost(config) * 10000.0
+    summary.loc["目标额外中性缓冲bps"] = float(config.xgboost_target_neutral_bps or 0.0)
+    summary.loc["目标静态中性区间bps"] = get_xgboost_target_neutral_threshold(config) * 10000.0
     summary.loc["启用动态目标中性区间"] = bool(
         getattr(config, "xgboost_target_use_dynamic_neutral_threshold", False)
     )
@@ -3234,8 +3858,9 @@ def save_composite_outputs(
 
 def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
     """运行一次指定配置下的综合因子回测，并返回测试集绩效指标。"""
+    config = apply_frequency_runtime_defaults(config)
     report_config_validation(config, "composite")
-    output_dir = Path(config.output_dir) / "composite_factor"
+    output_dir = get_research_output_dir(config, "composite_factor")
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = get_experiment_run_dir(config, "composite")
     config, _active_snapshot_path = freeze_active_factor_library_for_run(
@@ -3253,7 +3878,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
             requested_factors = load_active_factor_names(config)
             print(f"综合回测按 active 因子按需构建: {len(requested_factors)} 个候选因子")
 
-        print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
+        print(f"读取 {config.symbol} 的 {get_frequency_key(config)} 数据...")
         data = fetch_intraday_data(config)
 
         print("构建因子...")
@@ -3338,6 +3963,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
         generated_paths: list[Path] = []
         primary_metrics: dict[str, float] | None = None
         benchmark_vote_metrics: dict[str, float] | None = None
+        successful_model_signals: dict[str, pd.DataFrame] = {}
 
         for model_name in model_names:
             try:
@@ -3353,6 +3979,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                 print(f"\n跳过模型 {model_name}: {exc}")
                 comparison_rows.append({"模型": model_name, "错误": str(exc)})
                 continue
+            successful_model_signals[model_name] = signal
             train_signal = signal.loc[train_factors.index]
             validation_signal = signal.loc[validation_factors.index]
             backtest_signal = signal.loc[backtest_factors.index]
@@ -3477,6 +4104,60 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                     ]
                 )
 
+        if bool(getattr(config, "composite_enable_probability_ensemble", True)):
+            try:
+                ensemble_signal, ensemble_diagnostics = build_historical_probability_ensemble(
+                    successful_model_signals,
+                    data,
+                    config,
+                )
+                ensemble_diagnostics.to_csv(
+                    output_dir / "composite_model_ensemble_weights.csv",
+                    index=False,
+                    encoding="utf-8-sig",
+                )
+                train_ensemble_signal = ensemble_signal.reindex(train_factors.index)
+                validation_ensemble_signal = ensemble_signal.reindex(validation_factors.index)
+                test_ensemble_signal = ensemble_signal.reindex(backtest_factors.index)
+                train_ensemble_df, train_ensemble_metrics = run_backtest(
+                    train_data,
+                    train_ensemble_signal,
+                    config,
+                )
+                validation_ensemble_df, validation_ensemble_metrics = run_backtest(
+                    validation_data,
+                    validation_ensemble_signal,
+                    config,
+                )
+                test_ensemble_df, test_ensemble_metrics = run_backtest(
+                    backtest_data,
+                    test_ensemble_signal,
+                    config,
+                )
+                comparison_rows.extend(
+                    [
+                        {"模型": "probability_ensemble_train", **train_ensemble_metrics},
+                        {
+                            "模型": "probability_ensemble_validation",
+                            **validation_ensemble_metrics,
+                        },
+                        {"模型": "probability_ensemble", **test_ensemble_metrics},
+                    ]
+                )
+                ensemble_plot_path = plot_train_test_backtest_result(
+                    train_ensemble_df,
+                    validation_ensemble_df,
+                    test_ensemble_df,
+                    output_dir,
+                    f"{config.symbol} 历史绩效动态概率融合回测",
+                    "融合预测方向(-1/0/1)",
+                    "composite_report_probability_ensemble.png",
+                )
+                generated_paths.append(ensemble_plot_path)
+            except ValueError as exc:
+                print(f"\n跳过概率融合: {exc}")
+                comparison_rows.append({"模型": "probability_ensemble", "错误": str(exc)})
+
         pd.DataFrame(comparison_rows).to_csv(
             output_dir / "composite_model_comparison.csv",
             index=False,
@@ -3498,6 +4179,7 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
                     output_dir / "composite_cost_stress_report.csv",
                     output_dir / "composite_prediction_diagnostics.csv",
                     output_dir / "composite_prediction_confusion_matrix.csv",
+                    output_dir / "composite_model_ensemble_weights.csv",
                     output_dir / "composite_artifact_manifest.json",
                     output_dir / "related_data_coverage.csv",
                     *generated_paths,
@@ -3511,16 +4193,21 @@ def run_composite_backtest(config: BacktestConfig) -> dict[str, float]:
         print("\n========== 等权投票基准回测 ==========")
         print_metrics(benchmark_vote_metrics or {})
         print("\n输出文件:")
-        print(output_dir / "composite_detail.csv")
-        print(output_dir / "composite_summary.csv")
-        print(output_dir / "composite_model_comparison.csv")
-        print(output_dir / "composite_validation_test_gap.csv")
-        print(output_dir / "composite_xgboost_feature_importance.csv")
-        print(output_dir / "composite_factor_contribution.csv")
-        print(output_dir / "composite_robustness_report.csv")
-        print(output_dir / "composite_cost_stress_report.csv")
-        for path in generated_paths:
-            print(path)
+        output_paths = [
+            output_dir / "composite_detail.csv",
+            output_dir / "composite_summary.csv",
+            output_dir / "composite_model_comparison.csv",
+            output_dir / "composite_validation_test_gap.csv",
+            output_dir / "composite_xgboost_feature_importance.csv",
+            output_dir / "composite_factor_contribution.csv",
+            output_dir / "composite_robustness_report.csv",
+            output_dir / "composite_cost_stress_report.csv",
+            output_dir / "composite_model_ensemble_weights.csv",
+            *generated_paths,
+        ]
+        for path in dict.fromkeys(output_paths):
+            if path.exists():
+                print(path)
         return metrics
     finally:
         # 资源释放由脚本入口或批量入口统一负责，这里只保持异常传播和语法结构完整。

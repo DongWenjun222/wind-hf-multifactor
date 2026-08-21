@@ -27,11 +27,19 @@ from framework.experiment_utils import (
     write_run_config,
 )
 from framework.runtime_utils import run_tracked
+from framework.output_layout import (
+    apply_frequency_runtime_defaults,
+    get_frequency_key,
+    get_research_output_dir,
+)
 from framework.factor_library import (
     build_factor_library,
     get_factor_library_dir,
+    get_existing_factor_library_storage_path,
+    get_selection_config_value,
     rank_single_factor_summary,
     save_factor_library,
+    slice_factor_selection_covariates,
 )
 from framework.factors import (
     build_factors,
@@ -94,6 +102,28 @@ def infer_annual_periods(index: pd.DatetimeIndex, annual_days: int) -> int:
     return int(max(annual_days, round(bars_per_day.median() * annual_days)))
 
 
+def calculate_wilson_interval(
+    successes: int,
+    trials: int,
+    z_value: float = 1.959963984540054,
+) -> tuple[float, float]:
+    """计算二项比例的 Wilson 区间；小样本下比正态近似更稳定。"""
+    if trials <= 0:
+        return np.nan, np.nan
+    probability = successes / trials
+    denominator = 1.0 + z_value**2 / trials
+    center = (probability + z_value**2 / (2.0 * trials)) / denominator
+    margin = (
+        z_value
+        * np.sqrt(
+            probability * (1.0 - probability) / trials
+            + z_value**2 / (4.0 * trials**2)
+        )
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
 def calculate_metrics(
     strategy_returns: pd.Series,
     benchmark_returns: pd.Series,
@@ -118,9 +148,27 @@ def calculate_metrics(
 
     total_return = equity.iloc[-1] - 1.0
     benchmark_total_return = benchmark_equity.iloc[-1] - 1.0
-    annual_return = equity.iloc[-1] ** (annual_periods / len(strategy_returns)) - 1.0
-    annual_vol = strategy_returns.std(ddof=0) * np.sqrt(annual_periods)
-    sharpe = annual_return / annual_vol if annual_vol > 0 else np.nan
+    final_equity = float(equity.iloc[-1])
+    annual_return = (
+        final_equity ** (annual_periods / len(strategy_returns)) - 1.0
+        if final_equity > 0
+        else np.nan
+    )
+    periodic_mean = float(strategy_returns.mean())
+    periodic_vol = float(strategy_returns.std(ddof=1)) if len(strategy_returns) > 1 else np.nan
+    annual_arithmetic_return = periodic_mean * annual_periods
+    annual_vol = periodic_vol * np.sqrt(annual_periods) if np.isfinite(periodic_vol) else np.nan
+    # 标准 Sharpe 使用单期平均超额收益除以单期波动率；无风险收益默认按 0 处理。
+    sharpe = (
+        periodic_mean / periodic_vol * np.sqrt(annual_periods)
+        if np.isfinite(periodic_vol) and periodic_vol > 0
+        else np.nan
+    )
+    cagr_vol_ratio = (
+        annual_return / annual_vol
+        if np.isfinite(annual_return) and np.isfinite(annual_vol) and annual_vol > 0
+        else np.nan
+    )
     max_drawdown = drawdown.min()
 
     # 交易胜率按“连续持仓区间”粗略统计，而不是逐根K线统计。
@@ -132,15 +180,25 @@ def calculate_metrics(
     trade_pnl = active_returns.groupby(trade_id[active_mask]).sum()
     win_rate = (trade_pnl > 0).mean() if not trade_pnl.empty else np.nan
     trade_count = int(len(trade_pnl))
+    win_rate_lower, win_rate_upper = calculate_wilson_interval(
+        int((trade_pnl > 0).sum()),
+        trade_count,
+    )
 
     return {
         "累计收益": total_return,
         "基准累计收益": benchmark_total_return,
         "年化收益": annual_return,
+        "年化算术平均收益": annual_arithmetic_return,
         "年化波动": annual_vol,
         "夏普比率": sharpe,
+        "标准夏普比率": sharpe,
+        "CAGR波动比": cagr_vol_ratio,
+        "单期平均收益": periodic_mean,
         "最大回撤": max_drawdown,
         "胜率": win_rate,
+        "胜率Wilson下限": win_rate_lower,
+        "胜率Wilson上限": win_rate_upper,
         "交易次数": float(trade_count),
         "样本K线数": float(len(strategy_returns)),
         "年化周期数": float(annual_periods),
@@ -156,10 +214,16 @@ def empty_metrics() -> Dict[str, float]:
         "累计收益": np.nan,
         "基准累计收益": np.nan,
         "年化收益": np.nan,
+        "年化算术平均收益": np.nan,
         "年化波动": np.nan,
         "夏普比率": np.nan,
+        "标准夏普比率": np.nan,
+        "CAGR波动比": np.nan,
+        "单期平均收益": np.nan,
         "最大回撤": np.nan,
         "胜率": np.nan,
+        "胜率Wilson下限": np.nan,
+        "胜率Wilson上限": np.nan,
         "交易次数": 0.0,
         "样本K线数": 0.0,
         "年化周期数": np.nan,
@@ -195,6 +259,138 @@ def calculate_position_coverage(backtest_df: pd.DataFrame | None) -> float:
     if backtest_df is None or backtest_df.empty or "position" not in backtest_df.columns:
         return np.nan
     return float((backtest_df["position"].fillna(0.0) != 0).mean())
+
+
+def get_expensive_diagnostic_skip_reason(
+    train_metrics: dict[str, float],
+    validation_metrics: dict[str, float],
+    train_signal_coverage: float,
+    validation_signal_coverage: float,
+    config: BacktestConfig,
+) -> str | None:
+    """判断因子是否已经确定无法入库，从而跳过昂贵预测诊断。
+
+    本函数只检查位于预测评分之前的硬门槛。返回非空原因意味着即使继续计算
+    qcut、IC 和月度稳定性，该因子也不可能进入 active 因子库。
+    """
+    if not bool(getattr(config, "single_factor_defer_expensive_diagnostics", True)):
+        return None
+
+    def numeric(metrics: dict[str, float], name: str) -> float:
+        return float(pd.to_numeric(metrics.get(name), errors="coerce"))
+
+    def selection_value(
+        validation_value: float,
+        train_value: float,
+    ) -> float:
+        return validation_value if pd.notna(validation_value) else train_value
+
+    train_sharpe = numeric(train_metrics, "夏普比率")
+    validation_sharpe = numeric(validation_metrics, "夏普比率")
+    train_return = numeric(train_metrics, "累计收益")
+    validation_return = numeric(validation_metrics, "累计收益")
+    train_win_rate = numeric(train_metrics, "胜率")
+    validation_win_rate = numeric(validation_metrics, "胜率")
+    train_trades = numeric(train_metrics, "交易次数")
+    validation_trades = numeric(validation_metrics, "交易次数")
+    train_drawdown = numeric(train_metrics, "最大回撤")
+    validation_drawdown = numeric(validation_metrics, "最大回撤")
+
+    selection_sharpe = (
+        min(train_sharpe, validation_sharpe)
+        if pd.notna(train_sharpe) and pd.notna(validation_sharpe)
+        else train_sharpe
+    )
+    selection_return = (
+        min(train_return, validation_return)
+        if pd.notna(train_return) and pd.notna(validation_return)
+        else train_return
+    )
+    selection_win_rate = selection_value(validation_win_rate, train_win_rate)
+    selection_trades = selection_value(validation_trades, train_trades)
+    selection_coverage = selection_value(
+        validation_signal_coverage,
+        train_signal_coverage,
+    )
+    selection_drawdown = selection_value(validation_drawdown, train_drawdown)
+
+    if pd.isna(selection_sharpe) or selection_sharpe < float(config.factor_library_min_sharpe):
+        return "low_selection_sharpe"
+    if selection_return < float(config.factor_library_min_total_return):
+        return "low_selection_total_return"
+    if train_sharpe < float(config.factor_library_min_train_sharpe):
+        return "low_train_sharpe"
+    if train_return < float(config.factor_library_min_train_total_return):
+        return "low_train_total_return"
+
+    min_train_win_rate = getattr(config, "factor_library_min_train_win_rate", None)
+    if min_train_win_rate is not None and train_win_rate <= float(min_train_win_rate):
+        return "low_train_win_rate"
+    min_selection_win_rate = get_selection_config_value(
+        config,
+        "factor_library_min_selection_win_rate",
+        "factor_library_min_test_win_rate",
+    )
+    if (
+        min_selection_win_rate is not None
+        and selection_win_rate <= float(min_selection_win_rate)
+    ):
+        return "low_selection_win_rate"
+
+    min_train_trades = max(
+        0,
+        int(getattr(config, "factor_library_min_train_trades", 0) or 0),
+    )
+    min_selection_trades = max(
+        0,
+        int(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_trades",
+                "factor_library_min_test_trades",
+            )
+            or 0
+        ),
+    )
+    if selection_trades < min_selection_trades:
+        return "low_selection_trade_count"
+    if train_trades < min_train_trades:
+        return "low_train_trade_count"
+
+    min_train_coverage = max(
+        0.0,
+        float(getattr(config, "factor_library_min_train_signal_coverage", 0.0) or 0.0),
+    )
+    min_selection_coverage = max(
+        0.0,
+        float(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_signal_coverage",
+                "factor_library_min_test_signal_coverage",
+            )
+            or 0.0
+        ),
+    )
+    if selection_coverage < min_selection_coverage:
+        return "low_selection_signal_coverage"
+    if train_signal_coverage < min_train_coverage:
+        return "low_train_signal_coverage"
+
+    max_selection_drawdown = get_selection_config_value(
+        config,
+        "factor_library_max_selection_drawdown",
+        "factor_library_max_test_drawdown",
+    )
+    if (
+        max_selection_drawdown is not None
+        and selection_drawdown < float(max_selection_drawdown)
+    ):
+        return "high_selection_drawdown"
+    max_train_drawdown = getattr(config, "factor_library_max_train_drawdown", None)
+    if max_train_drawdown is not None and train_drawdown < float(max_train_drawdown):
+        return "high_train_drawdown"
+    return None
 
 
 def calculate_monthly_stability(backtest_df: pd.DataFrame | None) -> dict[str, float]:
@@ -790,6 +986,66 @@ def choose_factor_direction(
     }
 
 
+def choose_factor_direction_with_train_result(
+    data: pd.DataFrame,
+    score: pd.Series,
+    factor_name: str,
+    config: BacktestConfig,
+    split_time: pd.Timestamp,
+) -> tuple[
+    float,
+    dict[str, float],
+    tuple[pd.DataFrame | None, dict[str, float], str | None] | None,
+]:
+    """选择方向并返回已计算的训练回测，避免主循环重复运行同一方向。"""
+    if not config.auto_detect_factor_direction:
+        direction, metrics = choose_factor_direction(
+            data,
+            score,
+            factor_name,
+            config,
+            split_time,
+        )
+        return direction, metrics, None
+
+    train_data = data.loc[data.index < split_time]
+    results: dict[
+        float,
+        tuple[pd.DataFrame | None, dict[str, float], str | None],
+    ] = {}
+    for direction in (1.0, -1.0):
+        signal = build_signal_from_score(
+            score,
+            config.signal_threshold,
+            factor_name,
+            direction=direction,
+        )
+        results[direction] = safe_run_backtest(
+            train_data,
+            signal.loc[signal.index < split_time],
+            config,
+        )
+
+    positive = results[1.0][1]
+    negative = results[-1.0][1]
+    positive_score = tuple(
+        -np.inf if pd.isna(value) else value
+        for value in (positive.get("夏普比率"), positive.get("累计收益"))
+    )
+    negative_score = tuple(
+        -np.inf if pd.isna(value) else value
+        for value in (negative.get("夏普比率"), negative.get("累计收益"))
+    )
+    selected_direction = 1.0 if positive_score >= negative_score else -1.0
+    direction_metrics = {
+        "训练正向夏普": positive.get("夏普比率", np.nan),
+        "训练反向夏普": negative.get("夏普比率", np.nan),
+        "训练正向收益": positive.get("累计收益", np.nan),
+        "训练反向收益": negative.get("累计收益", np.nan),
+    }
+    return selected_direction, direction_metrics, results[selected_direction]
+
+
 def rolling_qcut_labels(
     score: pd.Series,
     groups: int,
@@ -901,6 +1157,36 @@ def get_single_factor_plot_top_n(config: BacktestConfig) -> int:
     return max(0, int(getattr(config, "single_factor_plot_top_n", 0) or 0))
 
 
+def get_active_factor_plot_names(
+    active_library: pd.DataFrame,
+    config: BacktestConfig,
+) -> list[str]:
+    """返回需要补图的人工复核候选；默认覆盖整个 pre_active + active 池。"""
+    if active_library.empty or "因子" not in active_library.columns:
+        return []
+    factor_names = active_library["因子"].dropna().astype(str).drop_duplicates().tolist()
+    if bool(getattr(config, "single_factor_plot_all_active", True)):
+        return factor_names
+    return factor_names[: get_single_factor_plot_top_n(config)]
+
+
+def get_reusable_single_factor_plot(
+    output_dir: Path,
+    factor_label: str,
+    config: BacktestConfig,
+) -> Path | None:
+    """返回当前 latest 目录中可复用的因子图；历史 runs 图片不会参与。"""
+    if not bool(getattr(config, "single_factor_reuse_existing_plots", True)):
+        return None
+    plot_path = output_dir / f"{factor_label}_report.png"
+    try:
+        if plot_path.is_file() and plot_path.stat().st_size > 0:
+            return plot_path
+    except OSError:
+        return None
+    return None
+
+
 def _normalize_factor_vector(values: np.ndarray) -> np.ndarray | None:
     """把单个因子抽样值标准化成单位向量，便于用点积近似相关性。"""
     values = values.astype("float32", copy=False)
@@ -921,7 +1207,11 @@ def prefilter_correlated_single_factors(
     config: BacktestConfig,
     output_dir: Path,
 ) -> list[str]:
-    """在正式单因子回测前，按因子值相关性跳过高度重复的候选因子。"""
+    """在正式单因子回测前按研究期因子值相关性跳过重复候选。
+
+    相关性样本只来自配置指定的训练集或训练集加验证集，最终测试期
+    的因子分布不会参与候选集合选择。
+    """
     if not bool(getattr(config, "single_factor_enable_corr_prefilter", False)):
         return factor_columns
     if len(factor_columns) <= 1:
@@ -936,7 +1226,14 @@ def prefilter_correlated_single_factors(
         1,
         int(getattr(config, "single_factor_corr_prefilter_max_reference_factors", 5000) or 5000),
     )
-    sampled = factors.loc[:, factor_columns].tail(sample_rows)
+    selection_factors = slice_factor_selection_covariates(factors, config)
+    sampled = selection_factors.loc[:, factor_columns].tail(sample_rows)
+    selection_scope = str(
+        getattr(config, "factor_selection_covariate_scope", "train_validation")
+        or "train_validation"
+    ).strip().lower()
+    sample_start = sampled.index[0] if not sampled.empty else ""
+    sample_end = sampled.index[-1] if not sampled.empty else ""
 
     kept: list[str] = []
     reference_names: list[str] = []
@@ -956,6 +1253,9 @@ def prefilter_correlated_single_factors(
                     "过滤原因": "empty_or_constant_factor",
                     "阈值": threshold,
                     "抽样K线数": len(sampled),
+                    "相关性样本范围": selection_scope,
+                    "抽样开始": str(sample_start),
+                    "抽样截止": str(sample_end),
                 }
             )
             continue
@@ -978,6 +1278,9 @@ def prefilter_correlated_single_factors(
                     "过滤原因": "high_value_corr_prefilter",
                     "阈值": threshold,
                     "抽样K线数": len(sampled),
+                    "相关性样本范围": selection_scope,
+                    "抽样开始": str(sample_start),
+                    "抽样截止": str(sample_end),
                 }
             )
             continue
@@ -1005,6 +1308,9 @@ def prefilter_correlated_single_factors(
                 "相关性阈值": threshold,
                 "抽样K线数": len(sampled),
                 "最多代表因子数": max_reference_factors,
+                "相关性样本范围": selection_scope,
+                "抽样开始": str(sample_start),
+                "抽样截止": str(sample_end),
             }
         ]
     )
@@ -1029,16 +1335,13 @@ def generate_top_single_factor_plots(
     factor_label_map: dict[str, str],
     split_time: pd.Timestamp,
 ) -> dict[str, str]:
-    """只给入库排名靠前的因子补充生成图表。
+    """为 active 因子补充生成图表。
 
     当 single_factor_plot_all=False 时，主循环不再为每个因子出图。
-    回测和入库筛选结束后，本函数只对 active_library 前 N 个因子重新生成可视化报告。
+    回测和入库筛选结束后，默认对全部 active 因子重新生成可视化报告；
+    关闭 single_factor_plot_all_active 后才回退为前 N 个。
     """
     if active_library.empty or "因子" not in active_library.columns:
-        return {}
-
-    top_n = get_single_factor_plot_top_n(config)
-    if top_n <= 0:
         return {}
 
     _, validation_end_time = split_train_validation_test_index(
@@ -1050,21 +1353,47 @@ def generate_top_single_factor_plots(
     validation_data = data.loc[(data.index >= split_time) & (data.index < validation_end_time)]
     backtest_data = data.loc[data.index >= validation_end_time]
     plot_paths: dict[str, str] = {}
-    factor_names = active_library["因子"].dropna().head(top_n).tolist()
+    factor_names = get_active_factor_plot_names(active_library, config)
+    if not factor_names:
+        return {}
+    direction_by_factor = (
+        active_library.drop_duplicates("因子", keep="first").set_index("因子").get("方向")
+    )
 
-    for factor_name in tqdm(factor_names, desc="生成Top因子图表"):
-        if factor_name not in factors.columns:
-            continue
-
+    reused_count = 0
+    generated_count = 0
+    for factor_name in tqdm(factor_names, desc="生成待审核/active因子图表"):
         try:
             factor_label = factor_label_map.get(factor_name, factor_name)
-            direction, _ = choose_factor_direction(
-                data,
-                factors[factor_name],
-                factor_name,
+            existing_plot = get_reusable_single_factor_plot(
+                output_dir,
+                factor_label,
                 config,
-                split_time,
             )
+            if existing_plot is not None:
+                plot_paths[factor_name] = str(existing_plot)
+                reused_count += 1
+                continue
+            if factor_name not in factors.columns:
+                continue
+            stored_direction = (
+                direction_by_factor.get(factor_name)
+                if direction_by_factor is not None
+                else None
+            )
+            stored_direction_text = str(stored_direction).strip().lower()
+            if stored_direction_text in {"正向", "1", "1.0"}:
+                direction = 1.0
+            elif stored_direction_text in {"反向", "-1", "-1.0"}:
+                direction = -1.0
+            else:
+                direction, _ = choose_factor_direction(
+                    data,
+                    factors[factor_name],
+                    factor_name,
+                    config,
+                    split_time,
+                )
             signal = build_signal_from_score(
                 factors[factor_name],
                 config.signal_threshold,
@@ -1134,9 +1463,15 @@ def generate_top_single_factor_plots(
                 f"{factor_label}_report.png",
             )
             plot_paths[factor_name] = str(plot_path)
+            generated_count += 1
         except Exception as exc:
-            print(f"Top因子图表生成失败: {factor_name}, {exc}")
+            print(f"active因子图表生成失败: {factor_name}, {exc}")
 
+    if reused_count or generated_count:
+        print(
+            f"active因子图表: 复用已有 {reused_count} 张，"
+            f"新生成 {generated_count} 张"
+        )
     return plot_paths
 
 
@@ -1149,12 +1484,12 @@ def run_single_factor_backtests(
 
     主要步骤：
     1. 根据配置选择本轮需要测试的因子。
-    2. 对每个因子做方向选择、训练集回测、测试集回测和 qcut 检验。
+    2. 对每个因子做方向选择和三段回测，只为仍可能入库的因子计算昂贵 qcut/IC 诊断。
     3. 汇总所有结果，按样本外夏普/累计收益排序。
     4. 调用因子库模块做收益门槛和相关性去重。
     5. 保存 active/all/rejected 因子库、单因子汇总、qcut 汇总和必要图表。
     """
-    output_dir = Path(config.output_dir) / "single_factor"
+    output_dir = get_research_output_dir(config, "single_factor")
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = get_experiment_run_dir(config, "single")
     write_run_config(config, output_dir)
@@ -1213,6 +1548,8 @@ def run_single_factor_backtests(
     plot_top_n = get_single_factor_plot_top_n(config)
     if plot_all:
         print("单因子图表生成: 全量生成")
+    elif bool(getattr(config, "single_factor_plot_all_active", True)):
+        print("单因子图表生成: 筛选完成后为全部active因子生成")
     else:
         print(f"单因子图表生成: 仅对入库Top {plot_top_n} 因子生成")
     split_time, validation_end_time = split_train_validation_test_index(
@@ -1223,18 +1560,21 @@ def run_single_factor_backtests(
     train_data = data.loc[data.index < split_time]
     validation_data = data.loc[(data.index >= split_time) & (data.index < validation_end_time)]
     backtest_data = data.loc[data.index >= validation_end_time]
+    deferred_diagnostic_count = 0
     # 主循环只做必要计算；是否画图由配置控制，避免海量因子时生成过多 PNG。
     for factor_name in tqdm(factor_columns) :
         factor_label = factor_label_map[factor_name]
        # print(f"\n========== 单因子回测: {factor_name} ==========")
         summary_path = output_dir / "single_factor_summary.csv"
         try:
-            direction, direction_metrics = choose_factor_direction(
-                data,
-                factors[factor_name],
-                factor_name,
-                config,
-                split_time,
+            direction, direction_metrics, cached_train_result = (
+                choose_factor_direction_with_train_result(
+                    data,
+                    factors[factor_name],
+                    factor_name,
+                    config,
+                    split_time,
+                )
             )
             signal = build_signal_from_score(
                 factors[factor_name],
@@ -1247,11 +1587,14 @@ def run_single_factor_backtests(
                 (signal.index >= split_time) & (signal.index < validation_end_time)
             ]
             backtest_signal = signal.loc[signal.index >= validation_end_time]
-            train_df, train_metrics, train_error = safe_run_backtest(
-                train_data,
-                train_signal,
-                config,
-            )
+            if cached_train_result is None:
+                train_df, train_metrics, train_error = safe_run_backtest(
+                    train_data,
+                    train_signal,
+                    config,
+                )
+            else:
+                train_df, train_metrics, train_error = cached_train_result
             validation_df, validation_metrics, validation_error = safe_run_backtest(
                 validation_data,
                 validation_signal,
@@ -1272,67 +1615,100 @@ def run_single_factor_backtests(
             train_stability = calculate_monthly_stability(train_df)
             validation_stability = calculate_monthly_stability(validation_df)
             test_stability = calculate_monthly_stability(backtest_df)
+            train_signal_coverage = calculate_signal_coverage(train_df)
+            validation_signal_coverage = calculate_signal_coverage(validation_df)
+            test_signal_coverage = calculate_signal_coverage(backtest_df)
+            diagnostic_skip_reason = (
+                None
+                if plot_all
+                else get_expensive_diagnostic_skip_reason(
+                    train_metrics,
+                    validation_metrics,
+                    train_signal_coverage,
+                    validation_signal_coverage,
+                    config,
+                )
+            )
 
-            qcut_df, _ = build_qcut_group_nav(
-                data,
-                factors[factor_name],
-                config,
-                direction=direction,
-            )
-            train_qcut_df, train_qcut_summary = rebuild_qcut_report_for_period(
-                qcut_df,
-                train_data.index,
-                config,
-            )
-            validation_qcut_df, validation_qcut_summary = rebuild_qcut_report_for_period(
-                qcut_df,
-                validation_data.index,
-                config,
-            )
-            test_qcut_df, test_qcut_summary = rebuild_qcut_report_for_period(
-                qcut_df,
-                backtest_data.index,
-                config,
-            )
-            train_predictive_metrics = calculate_predictive_metrics(
-                data,
-                factors[factor_name],
-                train_data.index,
-                train_qcut_summary,
-                direction=direction,
-            )
-            validation_predictive_metrics = calculate_predictive_metrics(
-                data,
-                factors[factor_name],
-                validation_data.index,
-                validation_qcut_summary,
-                direction=direction,
-            )
-            test_predictive_metrics = calculate_predictive_metrics(
-                data,
-                factors[factor_name],
-                backtest_data.index,
-                test_qcut_summary,
-                direction=direction,
-            )
+            if diagnostic_skip_reason is None:
+                qcut_df, _ = build_qcut_group_nav(
+                    data,
+                    factors[factor_name],
+                    config,
+                    direction=direction,
+                )
+                train_qcut_df, train_qcut_summary = rebuild_qcut_report_for_period(
+                    qcut_df,
+                    train_data.index,
+                    config,
+                )
+                validation_qcut_df, validation_qcut_summary = rebuild_qcut_report_for_period(
+                    qcut_df,
+                    validation_data.index,
+                    config,
+                )
+                test_qcut_df, test_qcut_summary = rebuild_qcut_report_for_period(
+                    qcut_df,
+                    backtest_data.index,
+                    config,
+                )
+                train_predictive_metrics = calculate_predictive_metrics(
+                    data,
+                    factors[factor_name],
+                    train_data.index,
+                    train_qcut_summary,
+                    direction=direction,
+                )
+                validation_predictive_metrics = calculate_predictive_metrics(
+                    data,
+                    factors[factor_name],
+                    validation_data.index,
+                    validation_qcut_summary,
+                    direction=direction,
+                )
+                test_predictive_metrics = calculate_predictive_metrics(
+                    data,
+                    factors[factor_name],
+                    backtest_data.index,
+                    test_qcut_summary,
+                    direction=direction,
+                )
+            else:
+                deferred_diagnostic_count += 1
+                empty_qcut_columns = ["分组", "样本数", "平均收益", "胜率"]
+                train_qcut_df = pd.DataFrame()
+                validation_qcut_df = pd.DataFrame()
+                test_qcut_df = pd.DataFrame()
+                train_qcut_summary = pd.DataFrame(columns=empty_qcut_columns)
+                validation_qcut_summary = pd.DataFrame(columns=empty_qcut_columns)
+                test_qcut_summary = pd.DataFrame(columns=empty_qcut_columns)
+                train_predictive_metrics = empty_predictive_metrics()
+                validation_predictive_metrics = empty_predictive_metrics()
+                test_predictive_metrics = empty_predictive_metrics()
 
             plot_path = ""
             if plot_all:
-                plot_path = plot_single_factor_train_test_result(
-                    train_df,
-                    validation_df,
-                    backtest_df,
-                    train_qcut_df,
-                    train_qcut_summary,
-                    validation_qcut_df,
-                    validation_qcut_summary,
-                    test_qcut_df,
-                    test_qcut_summary,
+                plot_path = get_reusable_single_factor_plot(
                     output_dir,
-                    f"{config.symbol} 单因子回测: {factor_label}",
                     factor_label,
-                    f"{factor_label}_report.png",
+                    config,
                 )
+                if plot_path is None:
+                    plot_path = plot_single_factor_train_test_result(
+                        train_df,
+                        validation_df,
+                        backtest_df,
+                        train_qcut_df,
+                        train_qcut_summary,
+                        validation_qcut_df,
+                        validation_qcut_summary,
+                        test_qcut_df,
+                        test_qcut_summary,
+                        output_dir,
+                        f"{config.symbol} 单因子回测: {factor_label}",
+                        factor_label,
+                        f"{factor_label}_report.png",
+                    )
 
             train_qcut_summary.insert(0, "因子标签", factor_label)
             train_qcut_summary.insert(0, "样本", "训练集")
@@ -1355,37 +1731,53 @@ def run_single_factor_backtests(
                 "因子": factor_name,
                 "因子标签": factor_label,
                 "方向": "正向" if direction > 0 else "反向",
+                "绩效指标口径": "standard_sharpe_mean_over_vol_v2",
                 "训练截止": str(split_time),
                 "验证截止": str(validation_end_time),
                 "训练累计收益": train_metrics["累计收益"],
                 "训练年化收益": train_metrics["年化收益"],
+                "训练年化算术平均收益": train_metrics["年化算术平均收益"],
                 "训练年化波动": train_metrics["年化波动"],
                 "训练夏普比率": train_metrics["夏普比率"],
+                "训练标准夏普比率": train_metrics["标准夏普比率"],
+                "训练CAGR波动比": train_metrics["CAGR波动比"],
                 "训练最大回撤": train_metrics["最大回撤"],
                 "训练胜率": train_metrics["胜率"],
+                "训练胜率Wilson下限": train_metrics["胜率Wilson下限"],
+                "训练胜率Wilson上限": train_metrics["胜率Wilson上限"],
                 "训练交易次数": train_metrics["交易次数"],
                 "训练样本K线数": train_metrics["样本K线数"],
-                "训练信号覆盖率": calculate_signal_coverage(train_df),
+                "训练信号覆盖率": train_signal_coverage,
                 "训练持仓覆盖率": calculate_position_coverage(train_df),
                 "验证累计收益": validation_metrics["累计收益"],
                 "验证年化收益": validation_metrics["年化收益"],
+                "验证年化算术平均收益": validation_metrics["年化算术平均收益"],
                 "验证年化波动": validation_metrics["年化波动"],
                 "验证夏普比率": validation_metrics["夏普比率"],
+                "验证标准夏普比率": validation_metrics["标准夏普比率"],
+                "验证CAGR波动比": validation_metrics["CAGR波动比"],
                 "验证最大回撤": validation_metrics["最大回撤"],
                 "验证胜率": validation_metrics["胜率"],
+                "验证胜率Wilson下限": validation_metrics["胜率Wilson下限"],
+                "验证胜率Wilson上限": validation_metrics["胜率Wilson上限"],
                 "验证交易次数": validation_metrics["交易次数"],
                 "验证样本K线数": validation_metrics["样本K线数"],
-                "验证信号覆盖率": calculate_signal_coverage(validation_df),
+                "验证信号覆盖率": validation_signal_coverage,
                 "验证持仓覆盖率": calculate_position_coverage(validation_df),
                 "测试累计收益": metrics["累计收益"],
                 "测试年化收益": metrics["年化收益"],
+                "测试年化算术平均收益": metrics["年化算术平均收益"],
                 "测试年化波动": metrics["年化波动"],
                 "测试夏普比率": metrics["夏普比率"],
+                "测试标准夏普比率": metrics["标准夏普比率"],
+                "测试CAGR波动比": metrics["CAGR波动比"],
                 "测试最大回撤": metrics["最大回撤"],
                 "测试胜率": metrics["胜率"],
+                "测试胜率Wilson下限": metrics["胜率Wilson下限"],
+                "测试胜率Wilson上限": metrics["胜率Wilson上限"],
                 "测试交易次数": metrics["交易次数"],
                 "测试样本K线数": metrics["样本K线数"],
-                "测试信号覆盖率": calculate_signal_coverage(backtest_df),
+                "测试信号覆盖率": test_signal_coverage,
                 "测试持仓覆盖率": calculate_position_coverage(backtest_df),
                 **prefix_metrics(train_stability, "训练"),
                 **prefix_metrics(validation_stability, "验证"),
@@ -1394,6 +1786,11 @@ def run_single_factor_backtests(
                 **prefix_metrics(validation_predictive_metrics, "验证"),
                 **prefix_metrics(test_predictive_metrics, "测试"),
                 **direction_metrics,
+                "详细诊断状态": (
+                    "已计算"
+                    if diagnostic_skip_reason is None
+                    else f"基础门槛已淘汰:{diagnostic_skip_reason}"
+                ),
                 "图片文件": str(plot_path) if plot_path else "",
                 "错误": "",
             }
@@ -1403,34 +1800,50 @@ def run_single_factor_backtests(
                 "因子": factor_name,
                 "因子标签": factor_label,
                 "方向": "",
+                "绩效指标口径": "standard_sharpe_mean_over_vol_v2",
                 "训练截止": str(split_time),
                 "验证截止": str(validation_end_time),
                 "训练累计收益": np.nan,
                 "训练年化收益": np.nan,
+                "训练年化算术平均收益": np.nan,
                 "训练年化波动": np.nan,
                 "训练夏普比率": np.nan,
+                "训练标准夏普比率": np.nan,
+                "训练CAGR波动比": np.nan,
                 "训练最大回撤": np.nan,
                 "训练胜率": np.nan,
+                "训练胜率Wilson下限": np.nan,
+                "训练胜率Wilson上限": np.nan,
                 "训练交易次数": 0.0,
                 "训练样本K线数": 0.0,
                 "训练信号覆盖率": np.nan,
                 "训练持仓覆盖率": np.nan,
                 "验证累计收益": np.nan,
                 "验证年化收益": np.nan,
+                "验证年化算术平均收益": np.nan,
                 "验证年化波动": np.nan,
                 "验证夏普比率": np.nan,
+                "验证标准夏普比率": np.nan,
+                "验证CAGR波动比": np.nan,
                 "验证最大回撤": np.nan,
                 "验证胜率": np.nan,
+                "验证胜率Wilson下限": np.nan,
+                "验证胜率Wilson上限": np.nan,
                 "验证交易次数": 0.0,
                 "验证样本K线数": 0.0,
                 "验证信号覆盖率": np.nan,
                 "验证持仓覆盖率": np.nan,
                 "测试累计收益": np.nan,
                 "测试年化收益": np.nan,
+                "测试年化算术平均收益": np.nan,
                 "测试年化波动": np.nan,
                 "测试夏普比率": np.nan,
+                "测试标准夏普比率": np.nan,
+                "测试CAGR波动比": np.nan,
                 "测试最大回撤": np.nan,
                 "测试胜率": np.nan,
+                "测试胜率Wilson下限": np.nan,
+                "测试胜率Wilson上限": np.nan,
                 "测试交易次数": 0.0,
                 "测试样本K线数": 0.0,
                 "测试信号覆盖率": np.nan,
@@ -1441,6 +1854,7 @@ def run_single_factor_backtests(
                 **prefix_metrics(empty_predictive_metrics(), "训练"),
                 **prefix_metrics(empty_predictive_metrics(), "验证"),
                 **prefix_metrics(empty_predictive_metrics(), "测试"),
+                "详细诊断状态": "回测失败",
                 "图片文件": "",
                 "错误": str(exc),
             }
@@ -1448,6 +1862,12 @@ def run_single_factor_backtests(
         #print_metrics(metrics)
         #print(f"图片: {plot_path}")
 
+    if bool(getattr(config, "single_factor_defer_expensive_diagnostics", True)):
+        print(
+            "两阶段诊断: "
+            f"{deferred_diagnostic_count}/{len(factor_columns)} 个已被基础门槛淘汰的因子"
+            "跳过 qcut/IC 明细计算"
+        )
     summary = pd.DataFrame(summary_rows)
     active_summary, full_summary = rank_single_factor_summary(summary, config)
     active_library, library_all, rejected_library = build_factor_library(
@@ -1455,12 +1875,27 @@ def run_single_factor_backtests(
         factors,
         config,
     )
+    review_library = library_all[
+        library_all["因子库状态"].isin(["pre_active", "active"])
+    ].copy()
+    if not full_summary.empty and "因子" in full_summary.columns:
+        state_by_factor = library_all.drop_duplicates("因子", keep="last").set_index("因子")
+        full_summary["因子库状态"] = full_summary["因子"].map(
+            state_by_factor["因子库状态"]
+        )
+        full_summary["拒绝原因"] = full_summary["因子"].map(
+            state_by_factor["拒绝原因"]
+        )
     selection_metadata = {
         "因子筛选训练截止": str(split_time),
         "因子筛选验证截止": str(validation_end_time),
+        "因子相关性样本范围": str(
+            getattr(config, "factor_selection_covariate_scope", "train_validation")
+        ),
     }
     for frame in (
         active_library,
+        review_library,
         library_all,
         rejected_library,
         full_summary,
@@ -1469,7 +1904,7 @@ def run_single_factor_backtests(
             frame[column] = value
     if not plot_all:
         plot_paths = generate_top_single_factor_plots(
-            active_library,
+            review_library,
             data,
             factors,
             config,
@@ -1478,7 +1913,7 @@ def run_single_factor_backtests(
             split_time,
         )
         if plot_paths:
-            for frame in (active_library, library_all, full_summary):
+            for frame in (active_library, review_library, library_all, full_summary):
                 if not frame.empty and {"因子", "图片文件"}.issubset(frame.columns):
                     frame["图片文件"] = frame["因子"].map(plot_paths).fillna(frame["图片文件"])
 
@@ -1501,6 +1936,7 @@ def run_single_factor_backtests(
         encoding="utf-8-sig",
     )
     library_dir = get_factor_library_dir(config)
+    master_library_path = get_existing_factor_library_storage_path(config)
     if run_dir is not None:
         snapshot_active_factor_library(config, run_dir)
         copy_existing_files(
@@ -1510,15 +1946,16 @@ def run_single_factor_backtests(
                 qcut_summary_path,
                 progress_path if progress_path is not None else Path("__missing_progress_file__"),
                 library_dir / "active_factors.csv",
-                library_dir / "factor_library_all.csv",
-                library_dir / "rejected_factors.csv",
+                library_dir / "pre_active_factors.csv",
+                library_dir / "rejected_reason_summary.csv",
             ],
             run_dir,
         )
     print(f"\n单因子入库汇总: {summary_path}")
     print(f"单因子全量汇总: {full_summary_path}")
     print(f"因子库active: {library_dir / 'active_factors.csv'}")
-    print(f"因子库全量: {library_dir / 'factor_library_all.csv'}")
+    print(f"因子库待人工审核: {library_dir / 'pre_active_factors.csv'}")
+    print(f"因子库全量: {master_library_path or '未生成'}")
     print(f"因子库拒绝: {library_dir / 'rejected_factors.csv'}")
     if progress_path is not None:
         print(f"新增因子测试进度: {progress_path}")
@@ -1532,8 +1969,9 @@ def run_single_factor_pipeline(
     max_bars: int | None = None,
 ) -> pd.DataFrame:
     """运行单品种单因子完整流程，供单品种入口和多品种调度共同复用。"""
+    config = apply_frequency_runtime_defaults(config)
     report_config_validation(config, "single")
-    print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
+    print(f"读取 {config.symbol} 的 {get_frequency_key(config)} 数据...")
     data = fetch_intraday_data(config)
 
     effective_max_bars = int(max_bars or 0)

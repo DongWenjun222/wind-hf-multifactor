@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
+from framework.output_layout import get_frequency_key, is_daily_frequency
 
 try:
     from WindPy import w
@@ -48,12 +49,35 @@ def safe_symbol_name(symbol: str) -> str:
 def get_data_cache_path(config: BacktestConfig) -> Path:
     """根据标的代码和 K 线周期生成本地行情缓存路径。"""
     safe_symbol = config.symbol.replace(".", "_").replace("/", "_")
-    return Path(config.data_cache_dir) / f"{safe_symbol}_{config.bar_size}min_data.csv"
+    frequency = get_frequency_key(config)
+    return (
+        Path(config.data_cache_dir)
+        / "market"
+        / frequency
+        / f"{safe_symbol}_{frequency}_data.csv"
+    )
 
 
 def get_local_data_candidates(config: BacktestConfig) -> list[Path]:
-    """返回可尝试读取的本地行情文件列表。"""
-    return [get_data_cache_path(config)]
+    """返回新版和旧版可尝试读取的本地行情文件列表。"""
+    safe_symbol = config.symbol.replace(".", "_").replace("/", "_")
+    frequency = get_frequency_key(config)
+    filename = f"{safe_symbol}_{frequency}_data.csv"
+    legacy_minute_filename = f"{safe_symbol}_{config.bar_size}min_data.csv"
+    candidates = [
+        get_data_cache_path(config),
+        Path(config.data_cache_dir) / filename,
+        Path(config.output_dir) / filename,
+    ]
+    if not is_daily_frequency(config):
+        candidates.extend(
+            [
+                Path(config.data_cache_dir) / "market" / legacy_minute_filename,
+                Path(config.data_cache_dir) / legacy_minute_filename,
+                Path(config.output_dir) / legacy_minute_filename,
+            ]
+        )
+    return list(dict.fromkeys(candidates))
 
 
 def normalize_intraday_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -72,14 +96,43 @@ def normalize_intraday_data(data: pd.DataFrame) -> pd.DataFrame:
     if "amt" not in data.columns and "amount" in data.columns:
         data["amt"] = data["amount"]
 
-    for optional_col in ["volume", "amt", "amount"]:
+    for optional_col in ["volume", "amt", "amount", "oi", "open_interest", "settle"]:
         if optional_col not in data.columns:
             data[optional_col] = np.nan
 
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna(subset=["open", "high", "low", "close"])
-    market_cols = ["open", "high", "low", "close", "volume", "amt", "amount"]
+    market_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amt",
+        "amount",
+        "oi",
+        "open_interest",
+        "settle",
+    ]
     return data[[col for col in market_cols if col in data.columns]]
+
+
+def filter_completed_daily_bars(
+    data: pd.DataFrame,
+    config: BacktestConfig,
+    now: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """仅保留已经完成的日线，防止实盘信号读取当天未收盘数据。"""
+    if not is_daily_frequency(config) or data.empty:
+        return data
+    current = pd.Timestamp.now() if now is None else pd.Timestamp(now)
+    ready_text = str(getattr(config, "daily_bar_ready_time", "15:30") or "15:30")
+    ready_offset = pd.Timestamp(f"2000-01-01 {ready_text}") - pd.Timestamp("2000-01-01")
+    latest_complete_date = current.normalize()
+    if current < current.normalize() + ready_offset:
+        latest_complete_date -= pd.Timedelta(days=1)
+    completed = data.index.normalize() <= latest_complete_date
+    return data.loc[completed].copy()
 
 
 def validate_local_data_bar_size(
@@ -88,6 +141,8 @@ def validate_local_data_bar_size(
     data_path: Path,
 ) -> None:
     """校验本地数据的实际 K 线周期是否与配置一致。"""
+    if is_daily_frequency(config):
+        return
     if len(data.index) < 3:
         return
 
@@ -125,6 +180,7 @@ def load_local_intraday_data(config: BacktestConfig) -> pd.DataFrame:
         try:
             data = pd.read_csv(data_path, index_col=0, parse_dates=True)
             data = normalize_intraday_data(data)
+            data = filter_completed_daily_bars(data, config)
             validate_local_data_bar_size(data, config, data_path)
             data = data.loc[(data.index >= start_time) & (data.index <= end_time)]
             if data.empty:
@@ -150,7 +206,21 @@ def save_local_intraday_data(data: pd.DataFrame, config: BacktestConfig) -> Path
 
 
 def fetch_intraday_data_from_wind(config: BacktestConfig) -> pd.DataFrame:
-    """从 Wind 拉取分钟行情并做标准化。"""
+    """从 Wind 拉取当前频率行情并做标准化。"""
+    if is_daily_frequency(config):
+        fields = str(getattr(config, "daily_price_fields", config.price_fields))
+        error_code, raw = w.wsd(
+            config.symbol,
+            fields,
+            config.start_time,
+            config.end_time,
+            "",
+            usedf=True,
+        )
+        if error_code != 0:
+            raise RuntimeError(f"Wind 日频数据获取失败，错误码: {error_code}")
+        return filter_completed_daily_bars(normalize_intraday_data(raw), config)
+
     options = f"BarSize={config.bar_size}"
     error_code, raw = w.wsi(
         config.symbol,
@@ -166,14 +236,14 @@ def fetch_intraday_data_from_wind(config: BacktestConfig) -> pd.DataFrame:
 
 
 def fetch_intraday_data(config: BacktestConfig) -> pd.DataFrame:
-    """获取回测行情数据，优先本地缓存，失败后尝试 Wind。"""
+    """获取当前研究频率行情，优先本地缓存，失败后尝试 Wind。"""
     if config.prefer_local_data:
         try:
             return load_local_intraday_data(config)
         except (FileNotFoundError, ValueError) as exc:
             print(f"未能使用本地行情数据，将从 Wind 获取。原因: {exc}")
 
-    print("从 Wind 获取行情数据...")
+    print(f"从 Wind 获取 {get_frequency_key(config)} 行情数据...")
     ensure_wind_started()
     data = fetch_intraday_data_from_wind(config)
     saved_path = save_local_intraday_data(data, config)
@@ -185,7 +255,18 @@ def get_macro_data_cache_path(config: BacktestConfig, symbol: str) -> Path:
     """根据 Wind 宏观代码生成本地日频缓存路径。"""
     safe_symbol = safe_symbol_name(symbol)
     safe_field = safe_symbol_name(getattr(config, "macro_state_field", "close"))
-    return Path(config.data_cache_dir) / f"macro_{safe_symbol}_{safe_field}_daily.csv"
+    return Path(config.data_cache_dir) / "macro" / f"macro_{safe_symbol}_{safe_field}_daily.csv"
+
+
+def get_macro_data_cache_candidates(config: BacktestConfig, symbol: str) -> list[Path]:
+    """返回新版和旧版宏观日频缓存候选。"""
+    filename = get_macro_data_cache_path(config, symbol).name
+    candidates = [
+        get_macro_data_cache_path(config, symbol),
+        Path(config.data_cache_dir) / filename,
+        Path(config.output_dir) / filename,
+    ]
+    return list(dict.fromkeys(candidates))
 
 
 def normalize_macro_daily_data(data: pd.DataFrame, field_name: str) -> pd.DataFrame:
@@ -210,11 +291,11 @@ def normalize_macro_daily_data(data: pd.DataFrame, field_name: str) -> pd.DataFr
 
 def load_local_macro_daily_data(config: BacktestConfig, symbol: str) -> pd.DataFrame:
     """读取本地宏观日频缓存。"""
-    cache_path = get_macro_data_cache_path(config, symbol)
-    if not cache_path.exists():
-        raise FileNotFoundError(f"没有找到宏观缓存: {cache_path}")
-    data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    return normalize_macro_daily_data(data, getattr(config, "macro_state_field", "close"))
+    for cache_path in get_macro_data_cache_candidates(config, symbol):
+        if cache_path.exists():
+            data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            return normalize_macro_daily_data(data, getattr(config, "macro_state_field", "close"))
+    raise FileNotFoundError(f"没有找到宏观缓存: {get_macro_data_cache_candidates(config, symbol)}")
 
 
 def fetch_macro_daily_data_from_wind(config: BacktestConfig, symbol: str) -> pd.DataFrame:
@@ -263,7 +344,25 @@ def get_external_daily_cache_path(config: BacktestConfig, source: dict[str, str 
     safe_name = safe_symbol_name(str(source["name"]))
     safe_symbol = safe_symbol_name(str(source["symbol"]))
     safe_field = safe_symbol_name(str(source.get("field", "close")))
-    return Path(config.data_cache_dir) / f"external_{safe_name}_{safe_symbol}_{safe_field}_daily.csv"
+    return (
+        Path(config.data_cache_dir)
+        / "external"
+        / f"external_{safe_name}_{safe_symbol}_{safe_field}_daily.csv"
+    )
+
+
+def get_external_daily_cache_candidates(
+    config: BacktestConfig,
+    source: dict[str, str | int],
+) -> list[Path]:
+    """返回新版和旧版外部日频缓存候选。"""
+    filename = get_external_daily_cache_path(config, source).name
+    candidates = [
+        get_external_daily_cache_path(config, source),
+        Path(config.data_cache_dir) / filename,
+        Path(config.output_dir) / filename,
+    ]
+    return list(dict.fromkeys(candidates))
 
 
 def normalize_external_daily_data(data: pd.DataFrame, field_name: str) -> pd.DataFrame:
@@ -291,11 +390,13 @@ def load_local_external_daily_data(
     source: dict[str, str | int],
 ) -> pd.DataFrame:
     """读取本地外部日频数据缓存。"""
-    cache_path = get_external_daily_cache_path(config, source)
-    if not cache_path.exists():
-        raise FileNotFoundError(f"没有找到外部日频缓存: {cache_path}")
-    data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    return normalize_external_daily_data(data, str(source.get("field", "close")))
+    for cache_path in get_external_daily_cache_candidates(config, source):
+        if cache_path.exists():
+            data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            return normalize_external_daily_data(data, str(source.get("field", "close")))
+    raise FileNotFoundError(
+        f"没有找到外部日频缓存: {get_external_daily_cache_candidates(config, source)}"
+    )
 
 
 def fetch_external_daily_data_from_wind(

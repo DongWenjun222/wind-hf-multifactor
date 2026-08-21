@@ -19,6 +19,7 @@ from config import BacktestConfig, report_config_validation, resolve_symbol_univ
 from framework.factors import build_single_factor_matrix, fetch_intraday_data, stop_wind
 from multi_symbol_backtest import run_multi_symbol_backtest
 from pooled_model_backtest import run_pooled_model_backtest
+from framework.output_layout import apply_frequency_runtime_defaults, is_daily_frequency
 from framework.runtime_utils import run_tracked
 from single_factor_backtest import run_single_factor_backtests
 from trading_signal import run_trading_signal_export
@@ -71,6 +72,7 @@ def apply_common_overrides(config: BacktestConfig, args: argparse.Namespace) -> 
         ("symbol", "symbol"),
         ("start_time", "start_time"),
         ("end_time", "end_time"),
+        ("frequency", "bar_frequency"),
         ("bar_size", "bar_size"),
         ("output_dir", "output_dir"),
         ("data_cache_dir", "data_cache_dir"),
@@ -79,6 +81,12 @@ def apply_common_overrides(config: BacktestConfig, args: argparse.Namespace) -> 
         value = getattr(args, arg_name, None)
         if value is not None:
             setattr(config, config_name, value)
+    frequency = getattr(args, "frequency", None)
+    bar_size = getattr(args, "bar_size", None)
+    if frequency and str(frequency).lower().endswith("min"):
+        config.bar_size = int(str(frequency).lower().removesuffix("min"))
+    elif bar_size is not None and not frequency:
+        config.bar_frequency = f"{int(bar_size)}min"
 
 
 def create_config(args: argparse.Namespace) -> BacktestConfig:
@@ -140,13 +148,22 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
         config.multi_symbol_run_single_factor = args.run_single_factor
     if getattr(args, "run_composite", None) is not None:
         config.multi_symbol_run_composite = args.run_composite
-    return config
+    if is_daily_frequency(config):
+        # CLI 通用模型参数在日频下应覆盖 daily_* 默认值，而不是随后被默认值反向覆盖。
+        if getattr(args, "train_window", None) is not None:
+            config.daily_xgboost_train_window = int(args.train_window)
+        if getattr(args, "min_train_samples", None) is not None:
+            config.daily_xgboost_min_train_samples = int(args.min_train_samples)
+        if getattr(args, "retrain_every", None) is not None:
+            config.daily_xgboost_retrain_every = int(args.retrain_every)
+    return apply_frequency_runtime_defaults(config)
 
 
 def run_single(config: BacktestConfig) -> Any:
     """运行单因子流程。"""
+    config = apply_frequency_runtime_defaults(config)
     try:
-        print(f"读取 {config.symbol} 的 {config.bar_size} 分钟数据...")
+        print(f"读取 {config.symbol} 的 {config.bar_frequency} 数据...")
         data = fetch_intraday_data(config)
         print("按需构建单因子矩阵...")
         factors = build_single_factor_matrix(data, config)
@@ -196,6 +213,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--symbol", help="单品种运行时的 Wind 品种代码。")
     parser.add_argument("--start-time", help="回测开始时间。")
     parser.add_argument("--end-time", help="回测结束时间。")
+    parser.add_argument(
+        "--frequency",
+        choices=["1d", "30min", "60min", "15min", "5min"],
+        help="研究频率；1d 使用日频独立因子库和模型，其余使用分钟线。",
+    )
     parser.add_argument("--bar-size", type=int, help="K 线周期，单位分钟。")
     parser.add_argument("--output-dir", help="结果输出目录。")
     parser.add_argument("--data-cache-dir", help="行情数据缓存目录。")
@@ -291,7 +313,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         choices=["auto", "single", "multi"],
         default="auto",
-        help="信号来源：single 读根目录 composite_factor；multi 读 by_symbol；auto 优先 by_symbol。",
+        help=(
+            "信号来源：single 读根目录 composite_factor；"
+            "multi 读 by_symbol/symbols；auto 优先多品种目录。"
+        ),
     )
     signal.add_argument("--output", help="输出 CSV 路径。")
     return parser

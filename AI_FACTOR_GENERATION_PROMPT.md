@@ -270,7 +270,7 @@ wind_hf_multifactor_output/single_factor/single_factor_summary.csv
 wind_hf_multifactor_output/single_factor/single_factor_all_summary.csv
 wind_hf_multifactor_output/factor_library/active_factors.csv
 wind_hf_multifactor_output/factor_library/rejected_factors.csv
-wind_hf_multifactor_output/factor_library/factor_library_all.csv
+wind_hf_multifactor_output/factor_library/<频率>/factor_library_all.parquet
 ```
 
 ### 第八步：复盘入库结果

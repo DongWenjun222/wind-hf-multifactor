@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
+from framework.output_layout import get_frequency_key
 from framework.data_loader import (
     fetch_intraday_data,
     fetch_macro_state_data,
@@ -166,7 +167,12 @@ def save_data_quality_report(
 ) -> Path:
     """保存数据质量报告。"""
     if output_path is None:
-        output_path = Path(config.output_dir) / "data_quality_report.csv"
+        output_path = (
+            Path(config.output_dir)
+            / "audits"
+            / get_frequency_key(config)
+            / "data_quality_report.csv"
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report = build_data_quality_report(config, extreme_return_threshold)
     report.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -176,7 +182,10 @@ def save_data_quality_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成主品种、相关品种和宏观数据质量报告。")
     parser.add_argument("--symbol", help="覆盖 config.symbol。")
-    parser.add_argument("--output", help="输出 CSV 路径，默认 output_dir/data_quality_report.csv。")
+    parser.add_argument(
+        "--output",
+        help="输出 CSV 路径，默认 output_dir/audits/data_quality_report.csv。",
+    )
     parser.add_argument("--extreme-return-threshold", type=float, default=0.08, help="分钟线极端收益阈值。")
     args = parser.parse_args()
 

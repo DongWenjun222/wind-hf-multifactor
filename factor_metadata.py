@@ -60,7 +60,7 @@ def build_factor_metadata(config: BacktestConfig) -> pd.DataFrame:
 def save_factor_metadata(config: BacktestConfig, output_path: Path | None = None) -> Path:
     """生成并保存因子元数据。"""
     if output_path is None:
-        output_path = Path(config.output_dir) / "factor_metadata.csv"
+        output_path = Path(config.output_dir) / "factor_management" / "factor_metadata.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = build_factor_metadata(config)
     metadata.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -79,7 +79,10 @@ def save_factor_metadata(config: BacktestConfig, output_path: Path | None = None
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成因子元数据表。")
-    parser.add_argument("--output", help="输出 CSV 路径，默认写入 output_dir/factor_metadata.csv。")
+    parser.add_argument(
+        "--output",
+        help="输出 CSV 路径，默认写入 output_dir/factor_management/factor_metadata.csv。",
+    )
     args = parser.parse_args()
     config = BacktestConfig()
     output_path = save_factor_metadata(config, Path(args.output) if args.output else None)

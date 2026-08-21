@@ -6,7 +6,7 @@ from __future__ import annotations
 - 同时参考训练集和验证集表现做入库筛选，最终测试集只作为留存评估。
 - 合并历史因子库，避免每次回测覆盖已有记录。
 - 对候选因子做收益门槛和相关性去重，只保留表现较好且差异足够大的因子。
-- 输出 active / all / rejected 三类 CSV，供后续 XGBoost 综合因子和人工复盘使用。
+- 输出 active CSV、压缩全量主库和精简 rejected CSV，兼顾程序更新与人工复盘。
 """
 
 from pathlib import Path
@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
+from .output_layout import get_frequency_scoped_dir
 from .factor_taxonomy import get_factor_family
 from .factors import score_to_raw_signal
 
@@ -250,19 +251,362 @@ def get_factor_library_dir(config: BacktestConfig) -> Path:
     library_dir = Path(config.factor_library_dir)
     if not library_dir.is_absolute():
         library_dir = Path(config.output_dir) / library_dir
+    library_dir = get_frequency_scoped_dir(library_dir, config)
     library_dir.mkdir(parents=True, exist_ok=True)
     return library_dir
 
 
+def get_manual_factor_exclusions_path(config: BacktestConfig) -> Path:
+    """返回当前品种、当前频率的人工排除清单路径。"""
+    return get_factor_library_dir(config) / "manual_factor_exclusions.csv"
+
+
+def get_manual_factor_approvals_path(config: BacktestConfig) -> Path:
+    """返回当前品种、当前频率的人工审批清单路径。"""
+    return get_factor_library_dir(config) / "manual_factor_approvals.csv"
+
+
+def get_manual_factor_protections_path(config: BacktestConfig) -> Path:
+    """返回当前品种、当前频率的手工保护清单路径。"""
+    return get_factor_library_dir(config) / "manual_factor_protections.csv"
+
+
+def load_manual_factor_approvals(
+    config: BacktestConfig,
+    *,
+    bootstrap_existing_active: bool = True,
+) -> pd.DataFrame:
+    """读取人工审批清单，并可把升级前的 active 库登记为存量审批。"""
+    columns = ["因子编号", "因子标签", "因子", "人工审批原因", "人工审批时间", "审批来源"]
+    path = get_manual_factor_approvals_path(config)
+    if not path.exists() and bootstrap_existing_active:
+        active_path = get_factor_library_dir(config) / "active_factors.csv"
+        if active_path.exists():
+            try:
+                existing_active = pd.read_csv(active_path, encoding="utf-8-sig")
+            except Exception:
+                existing_active = pd.DataFrame()
+            if "因子" in existing_active.columns and not existing_active.empty:
+                now = pd.Timestamp.now().isoformat(timespec="seconds")
+                migrated = existing_active.copy()
+                for identity_column in ("因子编号", "因子标签"):
+                    if identity_column not in migrated.columns:
+                        migrated[identity_column] = ""
+                migrated["因子"] = migrated["因子"].fillna("").astype(str).str.strip()
+                migrated["人工审批原因"] = "升级前已有active，自动迁移为存量审批"
+                migrated["人工审批时间"] = now
+                migrated["审批来源"] = "legacy_active_migration"
+                migrated = migrated[migrated["因子"].ne("")]
+                save_manual_factor_approvals(migrated, config)
+                return migrated[columns].reset_index(drop=True)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        approvals = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in approvals.columns:
+            approvals[column] = ""
+    approvals["因子"] = approvals["因子"].fillna("").astype(str).str.strip()
+    approvals = approvals[approvals["因子"].ne("")]
+    return approvals[columns].drop_duplicates("因子", keep="last").reset_index(drop=True)
+
+
+def save_manual_factor_approvals(
+    approvals: pd.DataFrame,
+    config: BacktestConfig,
+) -> Path:
+    """原子保存人工审批清单。"""
+    path = get_manual_factor_approvals_path(config)
+    columns = ["因子编号", "因子标签", "因子", "人工审批原因", "人工审批时间", "审批来源"]
+    output = approvals.copy()
+    for column in columns:
+        if column not in output.columns:
+            output[column] = ""
+    output = output[columns].drop_duplicates("因子", keep="last")
+    temp_path = path.with_name(f".{path.name}.tmp")
+    output.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    temp_path.replace(path)
+    return path
+
+
+def load_manual_factor_exclusions(config: BacktestConfig) -> pd.DataFrame:
+    """读取人工排除清单；文件不存在时返回结构完整的空表。"""
+    columns = ["因子编号", "因子标签", "因子", "人工排除原因", "人工排除时间"]
+    path = get_manual_factor_exclusions_path(config)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        exclusions = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in exclusions.columns:
+            exclusions[column] = ""
+    exclusions["因子"] = exclusions["因子"].fillna("").astype(str).str.strip()
+    exclusions = exclusions[exclusions["因子"].ne("")]
+    return exclusions[columns].drop_duplicates("因子", keep="last").reset_index(drop=True)
+
+
+def save_manual_factor_exclusions(
+    exclusions: pd.DataFrame,
+    config: BacktestConfig,
+) -> Path:
+    """原子保存人工排除清单，避免维护过程中留下半写入文件。"""
+    path = get_manual_factor_exclusions_path(config)
+    columns = ["因子编号", "因子标签", "因子", "人工排除原因", "人工排除时间"]
+    output = exclusions.copy()
+    for column in columns:
+        if column not in output.columns:
+            output[column] = ""
+    output = output[columns].drop_duplicates("因子", keep="last")
+    temp_path = path.with_name(f".{path.name}.tmp")
+    output.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    temp_path.replace(path)
+    return path
+
+
+def load_manual_factor_protections(config: BacktestConfig) -> pd.DataFrame:
+    """读取不会被自动治理流程剔除的 active 因子清单。"""
+    columns = ["因子编号", "因子标签", "因子", "手工保护原因", "手工保护时间"]
+    path = get_manual_factor_protections_path(config)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        protections = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in protections.columns:
+            protections[column] = ""
+    protections["因子"] = protections["因子"].fillna("").astype(str).str.strip()
+    protections = protections[protections["因子"].ne("")]
+    return protections[columns].drop_duplicates("因子", keep="last").reset_index(drop=True)
+
+
+def save_manual_factor_protections(
+    protections: pd.DataFrame,
+    config: BacktestConfig,
+) -> Path:
+    """原子保存 active 因子手工保护清单。"""
+    path = get_manual_factor_protections_path(config)
+    columns = ["因子编号", "因子标签", "因子", "手工保护原因", "手工保护时间"]
+    output = protections.copy()
+    for column in columns:
+        if column not in output.columns:
+            output[column] = ""
+    output = output[columns].drop_duplicates("因子", keep="last")
+    temp_path = path.with_name(f".{path.name}.tmp")
+    output.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    temp_path.replace(path)
+    return path
+
+
+def get_manual_excluded_factor_names(config: BacktestConfig) -> set[str]:
+    """返回人工禁止进入 active 库的因子名集合。"""
+    if not bool(getattr(config, "factor_library_respect_manual_exclusions", True)):
+        return set()
+    exclusions = load_manual_factor_exclusions(config)
+    return set(exclusions["因子"].astype(str))
+
+
 def load_existing_factor_library(config: BacktestConfig) -> pd.DataFrame:
-    """读取已有的全量因子库文件。
+    """读取已有的全量因子库，优先压缩格式并兼容旧 CSV。
 
     如果文件不存在，返回空 DataFrame，方便首次运行时直接创建新因子库。
     """
-    library_path = get_factor_library_dir(config) / "factor_library_all.csv"
-    if not library_path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(library_path)
+    library_dir = get_factor_library_dir(config)
+    candidates = [
+        (library_dir / "factor_library_all.parquet", "parquet"),
+        (library_dir / "factor_library_all.pkl.gz", "pickle"),
+        (library_dir / "factor_library_all.csv", "csv"),
+    ]
+    candidates.sort(
+        key=lambda item: item[0].stat().st_mtime if item[0].exists() else -1.0,
+        reverse=True,
+    )
+    for library_path, storage_format in candidates:
+        if not library_path.exists():
+            continue
+        try:
+            if storage_format == "parquet":
+                return pd.read_parquet(library_path)
+            if storage_format == "pickle":
+                return pd.read_pickle(library_path, compression="gzip")
+            return pd.read_csv(library_path, low_memory=False)
+        except Exception as exc:
+            concise_reason = str(exc).splitlines()[0]
+            print(
+                f"因子主库读取失败，尝试下一兼容格式: {library_path}，"
+                f"原因: {type(exc).__name__}: {concise_reason}"
+            )
+
+    # 主库存在但当前环境缺少读取引擎时，利用三张可移植 CSV 视图恢复维护能力。
+    # 该视图可能缺少完整诊断列，因此用 attrs 标记为部分主库，管理脚本不会反写覆盖原文件。
+    view_specs = [
+        (library_dir / "rejected_factors.csv", None),
+        (library_dir / "pre_active_factors.csv", "pre_active"),
+        (library_dir / "active_factors.csv", "active"),
+    ]
+    view_frames: list[pd.DataFrame] = []
+    for view_path, forced_status in view_specs:
+        if not view_path.exists():
+            continue
+        try:
+            frame = pd.read_csv(view_path, encoding="utf-8-sig", low_memory=False)
+        except Exception:
+            continue
+        if "因子" not in frame.columns:
+            continue
+        if forced_status is not None:
+            frame["因子库状态"] = forced_status
+        view_frames.append(frame)
+    if view_frames:
+        restored = pd.concat(view_frames, ignore_index=True, sort=False).copy()
+        restored = restored.dropna(subset=["因子"]).drop_duplicates("因子", keep="last")
+        restored.attrs["factor_library_partial"] = True
+        print(
+            "完整主库不可读，已从 active/pre_active/rejected CSV 恢复兼容视图；"
+            "原主库不会被人工维护命令覆盖。"
+        )
+        return restored.reset_index(drop=True)
+    return pd.DataFrame()
+
+
+def get_existing_factor_library_storage_path(config: BacktestConfig) -> Path | None:
+    """返回当前实际存在的全量因子主库路径。"""
+    library_dir = get_factor_library_dir(config)
+    for filename in (
+        "factor_library_all.parquet",
+        "factor_library_all.pkl.gz",
+        "factor_library_all.csv",
+    ):
+        path = library_dir / filename
+        if path.exists():
+            return path
+    return None
+
+
+def _write_factor_library_master(
+    library_all: pd.DataFrame,
+    config: BacktestConfig,
+) -> Path:
+    """原子写入全量主库；auto 模式在 Parquet 不可用时回退 gzip Pickle。"""
+    library_dir = get_factor_library_dir(config)
+    requested_format = str(
+        getattr(config, "factor_library_storage_format", "auto") or "auto"
+    ).strip().lower()
+    if requested_format not in {"auto", "parquet", "pickle", "csv"}:
+        raise ValueError("factor_library_storage_format 只能是 auto/parquet/pickle/csv。")
+
+    errors: list[str] = []
+    formats = [requested_format] if requested_format != "auto" else ["parquet", "pickle"]
+    for storage_format in formats:
+        if storage_format == "parquet":
+            target = library_dir / "factor_library_all.parquet"
+        elif storage_format == "pickle":
+            target = library_dir / "factor_library_all.pkl.gz"
+        else:
+            target = library_dir / "factor_library_all.csv"
+        temp_path = target.with_name(f".{target.name}.tmp")
+        try:
+            if storage_format == "parquet":
+                parquet_frame = library_all.copy()
+                for column in parquet_frame.select_dtypes(include=["object"]).columns:
+                    parquet_frame[column] = parquet_frame[column].map(
+                        lambda value: None if pd.isna(value) else str(value)
+                    )
+                parquet_frame.to_parquet(temp_path, index=False, compression="zstd")
+            elif storage_format == "pickle":
+                library_all.to_pickle(temp_path, compression="gzip")
+            else:
+                library_all.to_csv(temp_path, index=False, encoding="utf-8-sig")
+            temp_path.replace(target)
+
+            # Parquet 依赖可选引擎；同时保留 Pickle 副本，确保换解释器后仍可维护。
+            if storage_format == "parquet" and bool(
+                getattr(config, "factor_library_write_pickle_fallback", True)
+            ):
+                fallback_target = library_dir / "factor_library_all.pkl.gz"
+                fallback_temp = fallback_target.with_name(f".{fallback_target.name}.tmp")
+                try:
+                    library_all.to_pickle(fallback_temp, compression="gzip")
+                    fallback_temp.replace(fallback_target)
+                finally:
+                    if fallback_temp.exists():
+                        fallback_temp.unlink()
+
+            if bool(
+                getattr(config, "factor_library_remove_legacy_csv_after_migration", True)
+            ) and storage_format != "csv":
+                legacy_csv = library_dir / "factor_library_all.csv"
+                if legacy_csv.exists():
+                    legacy_csv.unlink()
+            for stale_name in ("factor_library_all.parquet", "factor_library_all.pkl.gz"):
+                stale_path = library_dir / stale_name
+                preserve_compatible_master = bool(
+                    getattr(config, "factor_library_write_pickle_fallback", True)
+                )
+                if (
+                    stale_path != target
+                    and stale_path.exists()
+                    and not preserve_compatible_master
+                ):
+                    stale_path.unlink()
+            return target
+        except Exception as exc:
+            errors.append(f"{storage_format}: {exc}")
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+    raise RuntimeError("全量因子主库写入失败: " + " | ".join(errors))
+
+
+def build_compact_rejected_library(rejected_library: pd.DataFrame) -> pd.DataFrame:
+    """生成可人工查看、但不重复保存全部 135 列的拒绝因子表。"""
+    compact_columns = [
+        "因子编号", "因子", "因子家族", "初筛样本", "初筛夏普", "初筛累计收益",
+        "初筛RankIC", "初筛分组单调性", "初筛预测能力评分", "初筛一致性评分",
+        "初筛科研综合评分", "训练夏普比率", "验证夏普比率",
+        "训练胜率", "验证胜率", "训练交易次数", "验证交易次数", "因子库状态",
+        "拒绝原因", "详细诊断状态", "人工排除原因", "人工排除时间",
+        "最大库内相关性", "家族数量上限", "错误",
+    ]
+    available_columns = [column for column in compact_columns if column in rejected_library.columns]
+    return rejected_library[available_columns].copy()
+
+
+def slice_factor_selection_covariates(
+    factors: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """截取允许参与因子筛选的协变量样本，始终隔离最终测试集。
+
+    因子相关性虽然不读取未来收益标签，但如果使用最终测试期的因子分布，
+    仍会让测试集参与决定候选集合。这里按与单因子回测相同的时间比例做
+    位置切分，只返回训练集或训练集加验证集。
+    """
+    if factors.empty:
+        return factors
+
+    sample_count = len(factors)
+    if sample_count < 3:
+        # 极短输入无法形成完整三段；至少保留最后一行作为未使用留存样本。
+        return factors.iloc[: max(0, sample_count - 1)]
+
+    train_ratio = float(getattr(config, "auto_select_train_ratio", 0.7))
+    validation_ratio = float(getattr(config, "auto_select_validation_ratio", 0.15))
+    train_end = min(max(int(sample_count * train_ratio), 1), sample_count - 2)
+    validation_end = int(sample_count * (train_ratio + validation_ratio))
+    validation_end = min(max(validation_end, train_end + 1), sample_count - 1)
+
+    scope = str(
+        getattr(config, "factor_selection_covariate_scope", "train_validation")
+        or "train_validation"
+    ).strip().lower()
+    end_position = train_end if scope == "train" else validation_end
+    return factors.iloc[:end_position]
 
 
 def build_signal_corr_frame(
@@ -359,6 +703,20 @@ def build_factor_library(
         return combined, combined, pd.DataFrame()
 
     combined = combined.drop_duplicates(subset=["因子"], keep="last")
+    manual_exclusions = load_manual_factor_exclusions(config)
+    manual_excluded = (
+        set(manual_exclusions["因子"].astype(str))
+        if bool(getattr(config, "factor_library_respect_manual_exclusions", True))
+        else set()
+    )
+    manual_reason_map = manual_exclusions.set_index("因子")["人工排除原因"].to_dict()
+    manual_time_map = manual_exclusions.set_index("因子")["人工排除时间"].to_dict()
+    manual_protections = load_manual_factor_protections(config)
+    protected_names = set(manual_protections["因子"].astype(str))
+    protection_reason_map = manual_protections.set_index("因子")["手工保护原因"].to_dict()
+    protection_time_map = manual_protections.set_index("因子")["手工保护时间"].to_dict()
+    combined["人工排除原因"] = combined["因子"].map(manual_reason_map).fillna("")
+    combined["人工排除时间"] = combined["因子"].map(manual_time_map).fillna("")
     combined["因子家族"] = combined["因子"].map(get_factor_family)
     combined["初筛有效"] = combined["初筛有效"].map(
         lambda value: str(value).lower() == "true" if pd.notna(value) else False
@@ -481,18 +839,29 @@ def build_factor_library(
         ascending=[False, False, False, False, False, False, False],
         na_position="last",
     ).reset_index(drop=True)
+    if protected_names:
+        # 保护因子优先占位，确保不会被普通候选的相关性、家族配额或全库上限挤出。
+        protected_mask = combined["因子"].astype(str).isin(protected_names)
+        combined = pd.concat(
+            [combined.loc[protected_mask], combined.loc[~protected_mask]],
+            ignore_index=True,
+        )
 
     available = set(factors.columns)
     # 只有“表现有效 + 当前代码仍能生成 + 满足收益门槛”的因子，才进入相关性去重候选池。
     min_train_sharpe = float(getattr(config, "factor_library_min_train_sharpe", -np.inf))
     min_train_total_return = float(getattr(config, "factor_library_min_train_total_return", -np.inf))
-    min_train_win_rate = float(getattr(config, "factor_library_min_train_win_rate", -np.inf))
-    min_selection_win_rate = float(
-        get_selection_config_value(
-            config,
-            "factor_library_min_selection_win_rate",
-            "factor_library_min_test_win_rate",
-        )
+    raw_train_win_rate = getattr(config, "factor_library_min_train_win_rate", None)
+    min_train_win_rate = (
+        None if raw_train_win_rate is None else float(raw_train_win_rate)
+    )
+    raw_selection_win_rate = get_selection_config_value(
+        config,
+        "factor_library_min_selection_win_rate",
+        "factor_library_min_test_win_rate",
+    )
+    min_selection_win_rate = (
+        None if raw_selection_win_rate is None else float(raw_selection_win_rate)
     )
     min_selection_trades = max(
         0,
@@ -564,13 +933,16 @@ def build_factor_library(
     eligible_mask = (
         combined["初筛有效"].fillna(False)
         & combined["因子"].isin(available)
+        & ~combined["因子"].isin(manual_excluded)
         & (combined["初筛夏普"] >= config.factor_library_min_sharpe)
         & (combined["初筛累计收益"] >= config.factor_library_min_total_return)
         & (combined["训练夏普比率"] >= min_train_sharpe)
         & (combined["训练累计收益"] >= min_train_total_return)
-        & (combined["训练胜率"] > min_train_win_rate)
-        & (combined["入库胜率值"] > min_selection_win_rate)
     )
+    if min_train_win_rate is not None:
+        eligible_mask &= combined["训练胜率"] > min_train_win_rate
+    if min_selection_win_rate is not None:
+        eligible_mask &= combined["入库胜率值"] > min_selection_win_rate
     if min_selection_rank_ic is not None:
         eligible_mask &= combined["初筛RankIC"].fillna(-np.inf) >= float(min_selection_rank_ic)
     if min_selection_monotonicity is not None:
@@ -600,16 +972,49 @@ def build_factor_library(
     if max_train_drawdown is not None:
         eligible_mask &= combined["训练最大回撤"].fillna(-np.inf) >= float(max_train_drawdown)
     eligible_factors = combined.loc[eligible_mask, "因子"].tolist()
+    protected_available = [
+        factor_name
+        for factor_name in combined["因子"].astype(str)
+        if factor_name in protected_names and factor_name in available
+    ]
+    eligible_factors = list(dict.fromkeys([*protected_available, *eligible_factors]))
 
+    correlation_factors = slice_factor_selection_covariates(factors, config)
+    correlation_scope = str(
+        getattr(config, "factor_selection_covariate_scope", "train_validation")
+        or "train_validation"
+    ).strip().lower()
+    correlation_cutoff = (
+        correlation_factors.index[-1] if not correlation_factors.empty else ""
+    )
     value_corr = pd.DataFrame()
     signal_corr = pd.DataFrame()
     if eligible_factors and config.factor_library_use_value_corr:
-        value_corr = factors[eligible_factors].replace([np.inf, -np.inf], np.nan).corr().abs()
+        value_corr = (
+            correlation_factors[eligible_factors]
+            .replace([np.inf, -np.inf], np.nan)
+            .corr()
+            .abs()
+        )
     if eligible_factors and config.factor_library_use_signal_corr:
-        signal_corr = build_signal_corr_frame(factors, eligible_factors, config).corr().abs()
+        signal_corr = (
+            build_signal_corr_frame(correlation_factors, eligible_factors, config)
+            .corr()
+            .abs()
+        )
 
     selected: list[str] = []
     selected_set: set[str] = set()
+    require_manual_approval = bool(
+        getattr(config, "factor_library_require_manual_approval", False)
+    )
+    approvals = load_manual_factor_approvals(
+        config,
+        bootstrap_existing_active=require_manual_approval,
+    )
+    approved_names = set(approvals["因子"].astype(str))
+    approval_reason_map = approvals.set_index("因子")["人工审批原因"].to_dict()
+    approval_time_map = approvals.set_index("因子")["人工审批时间"].to_dict()
     selected_family_counts: dict[str, int] = {}
     library_rows = []
     max_corr_limit = float(config.factor_library_max_corr)
@@ -627,8 +1032,16 @@ def build_factor_library(
         family_quota_limit = get_family_quota_limit(config, family)
         family_count = selected_family_counts.get(family, 0)
 
-        if factor_name not in available:
+        if factor_name in manual_excluded:
+            status = "retired"
+            reject_reason = "manual_exclusion"
+        elif factor_name not in available:
             reject_reason = "factor_not_available"
+        elif factor_name in protected_names:
+            status = "active"
+            selected.append(factor_name)
+            selected_set.add(factor_name)
+            selected_family_counts[family] = family_count + 1
         elif not bool(row.get("入库数据可追溯", False)):
             reject_reason = "missing_traceable_train_metrics"
         elif not bool(row.get("初筛有效", False)):
@@ -641,9 +1054,14 @@ def build_factor_library(
             reject_reason = "low_train_sharpe"
         elif get_numeric_value(row, "训练累计收益", -np.inf) < min_train_total_return:
             reject_reason = "low_train_total_return"
-        elif get_numeric_value(row, "训练胜率", -np.inf) <= min_train_win_rate:
+        elif (
+            min_train_win_rate is not None
+            and get_numeric_value(row, "训练胜率", -np.inf) <= min_train_win_rate
+        ):
             reject_reason = "low_train_win_rate"
         elif (
+            min_selection_win_rate is not None
+            and
             get_numeric_value(row, "入库胜率值", -np.inf)
             <= min_selection_win_rate
         ):
@@ -712,7 +1130,11 @@ def build_factor_library(
             if pd.notna(max_library_corr) and max_library_corr >= max_corr_limit:
                 reject_reason = "high_corr"
             else:
-                status = "active"
+                status = (
+                    "active"
+                    if not require_manual_approval or factor_name in approved_names
+                    else "pre_active"
+                )
                 reject_reason = ""
                 selected.append(factor_name)
                 selected_set.add(factor_name)
@@ -724,14 +1146,32 @@ def build_factor_library(
         library_row["家族数量上限"] = family_quota_limit if family_quota_limit is not None else np.nan
         library_row["因子库状态"] = status
         library_row["拒绝原因"] = reject_reason
+        library_row["人工审批原因"] = approval_reason_map.get(factor_name, "")
+        library_row["人工审批时间"] = approval_time_map.get(factor_name, "")
+        library_row["是否手工保护"] = factor_name in protected_names
+        library_row["手工保护原因"] = protection_reason_map.get(factor_name, "")
+        library_row["手工保护时间"] = protection_time_map.get(factor_name, "")
         library_row["最大因子值相关性"] = max_value_corr
         library_row["最大信号相关性"] = max_signal_corr
         library_row["最大库内相关性"] = max_library_corr
+        library_row["相关性样本范围"] = correlation_scope
+        library_row["相关性样本数"] = len(correlation_factors)
+        library_row["相关性样本截止"] = str(correlation_cutoff)
         library_rows.append(library_row)
 
     library_all = pd.DataFrame(library_rows)
-    active_library = library_all[library_all["因子"].isin(selected_set)].copy()
-    rejected_library = library_all[library_all["因子库状态"] != "active"].copy()
+    # active 逻辑审查是独立持久档案。每次重建因子库时重新附加仍与当前
+    # 构造器指纹一致的结论，避免 active_factors.csv 的审查列被覆盖。
+    from .factor_logic_review import load_factor_logic_reviews, merge_factor_logic_reviews
+
+    library_all = merge_factor_logic_reviews(
+        library_all,
+        load_factor_logic_reviews(config),
+    )
+    active_library = library_all[library_all["因子库状态"].eq("active")].copy()
+    rejected_library = library_all[
+        ~library_all["因子库状态"].isin(["active", "pre_active"])
+    ].copy()
     return active_library, library_all, rejected_library
 
 
@@ -741,11 +1181,12 @@ def save_factor_library(
     rejected_library: pd.DataFrame,
     config: BacktestConfig,
 ) -> None:
-    """保存因子库三张核心表。
+    """保存因子库核心表。
 
     active_factors.csv：当前用于综合模型候选池的因子。
-    factor_library_all.csv：所有历史出现过的因子及其最新状态。
-    rejected_factors.csv：被拒绝或退役的因子，便于复盘原因。
+    pre_active_factors.csv：规则通过、等待人工确认的候选因子。
+    factor_library_all.parquet/pkl.gz：全部因子的最新完整指标主库。
+    rejected_factors.csv：被拒绝或退役因子的精简人工诊断视图。
     """
     library_dir = get_factor_library_dir(config)
     active_library.to_csv(
@@ -753,16 +1194,36 @@ def save_factor_library(
         index=False,
         encoding="utf-8-sig",
     )
-    library_all.to_csv(
-        library_dir / "factor_library_all.csv",
+    pre_active_library = (
+        library_all[library_all["因子库状态"].eq("pre_active")].copy()
+        if "因子库状态" in library_all.columns
+        else library_all.iloc[0:0].copy()
+    )
+    pre_active_library.to_csv(
+        library_dir / "pre_active_factors.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    rejected_library.to_csv(
+    master_path = _write_factor_library_master(library_all, config)
+    rejected_output = (
+        build_compact_rejected_library(rejected_library)
+        if bool(getattr(config, "factor_library_compact_rejected_output", True))
+        else rejected_library
+    )
+    rejected_output.to_csv(
         library_dir / "rejected_factors.csv",
         index=False,
         encoding="utf-8-sig",
     )
+    if "拒绝原因" in rejected_library.columns:
+        rejected_library["拒绝原因"].fillna("未标注").value_counts(dropna=False).rename_axis(
+            "拒绝原因"
+        ).reset_index(name="因子数量").to_csv(
+            library_dir / "rejected_reason_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    print(f"全量因子主库已保存: {master_path}")
     if "因子家族" in active_library.columns:
         family_summary = (
             active_library.groupby("因子家族", dropna=False)

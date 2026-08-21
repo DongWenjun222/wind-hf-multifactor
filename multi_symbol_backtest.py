@@ -27,6 +27,16 @@ from config import BacktestConfig, report_config_validation
 from framework.factor_library import conservative_pair
 from framework.factors import get_data_cache_path, get_factor_prune_list_path, safe_symbol_name, stop_wind
 from framework.project_fingerprint import build_source_fingerprint_hash, hash_file
+from framework.output_layout import (
+    apply_frequency_runtime_defaults,
+    get_frequency_key,
+    get_frequency_scoped_dir,
+    get_multi_symbol_portfolio_dir,
+    get_multi_symbol_reports_dir,
+    get_multi_symbol_root,
+    get_multi_symbol_summary_dir,
+    get_research_output_dir,
+)
 from single_factor_backtest import calculate_metrics, infer_annual_periods, run_single_factor_pipeline
 from framework.runtime_utils import run_tracked, write_json_atomic
 
@@ -74,15 +84,20 @@ PIPELINE_SOURCE_FILES = {
 }
 
 
-def get_symbol_output_dir(base_output_dir: str, subdir: str, symbol: str) -> str:
+def get_symbol_output_dir(
+    base_output_dir: str,
+    subdir: str,
+    symbol: str,
+    symbols_subdir: str = "symbols",
+) -> str:
     """返回某个品种的独立输出目录。"""
     symbol_dir = safe_symbol_name(symbol).upper()
-    return str(Path(base_output_dir) / subdir / symbol_dir)
+    return str(Path(base_output_dir) / subdir / symbols_subdir / symbol_dir)
 
 
 def get_symbol_active_library_path(config: BacktestConfig) -> Path:
     """返回单个品种输出目录下的 active 因子库路径。"""
-    return Path(config.output_dir) / "factor_library" / "active_factors.csv"
+    return get_research_output_dir(config, "factor_library") / "active_factors.csv"
 
 
 def active_library_has_factors(config: BacktestConfig) -> bool:
@@ -106,7 +121,7 @@ def active_library_has_factors(config: BacktestConfig) -> bool:
 
 def get_symbol_composite_detail_path(config: BacktestConfig) -> Path:
     """返回单个品种综合回测明细路径。"""
-    return Path(config.output_dir) / "composite_factor" / "composite_detail.csv"
+    return get_research_output_dir(config, "composite_factor") / "composite_detail.csv"
 
 
 def build_input_file_state(path: Path) -> dict[str, Any]:
@@ -170,7 +185,8 @@ def build_pipeline_state(config: BacktestConfig, stage: str) -> dict[str, Any]:
 
 def get_pipeline_state_path(config: BacktestConfig, stage: str) -> Path:
     """返回某品种某阶段的断点状态文件。"""
-    return Path(config.output_dir) / f".{stage}_pipeline_state.json"
+    category = "single_factor" if stage == "single" else "composite_factor"
+    return get_research_output_dir(config, category) / ".pipeline_state.json"
 
 
 def pipeline_state_matches(config: BacktestConfig, stage: str) -> bool:
@@ -224,7 +240,7 @@ def should_skip_composite_pipeline(config: BacktestConfig) -> bool:
         getattr(config, "multi_symbol_require_composite_artifact_manifest", True)
     ):
         return True
-    artifact_dir = Path(config.output_dir) / "composite_factor"
+    artifact_dir = get_research_output_dir(config, "composite_factor")
     artifact, _ = load_composite_artifact_manifest(
         artifact_dir,
         expected_symbol=config.symbol,
@@ -249,24 +265,18 @@ def build_symbol_config(base_config: BacktestConfig, symbol: str) -> BacktestCon
     symbol_config = replace(base_config, symbol=symbol)
     if bool(getattr(base_config, "_validation_reported", False)):
         setattr(symbol_config, "_validation_reported", True)
-    prune_path = Path(getattr(base_config, "factor_prune_list_path", "factor_prune_list.csv"))
-    if not prune_path.is_absolute():
-        symbol_config.factor_prune_list_path = str(Path(base_config.output_dir) / prune_path)
-    progress_path = Path(
-        getattr(
-            base_config,
-            "single_factor_start_index_progress_path",
-            "factor_library/single_factor_start_index_progress.csv",
-        )
-    )
-    if not progress_path.is_absolute():
-        progress_path = Path(base_config.output_dir) / progress_path
+    symbol_config.factor_prune_list_path = str(get_factor_prune_list_path(base_config))
+    progress_path = get_research_output_dir(
+        base_config,
+        "factor_library",
+    ) / "single_factor_start_index_progress.csv"
     symbol_config.single_factor_start_index_progress_path = str(progress_path)
     if base_config.multi_symbol_separate_output_dirs:
         symbol_config.output_dir = get_symbol_output_dir(
             base_config.output_dir,
             base_config.multi_symbol_output_subdir,
             symbol,
+            getattr(base_config, "multi_symbol_symbols_subdir", "symbols"),
         )
     return symbol_config
 
@@ -333,7 +343,7 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
             row["综合因子状态"] = "完成"
         for key, value in metrics.items():
             row[f"综合_{key}"] = value
-        artifact_dir = Path(config.output_dir) / "composite_factor"
+        artifact_dir = get_research_output_dir(config, "composite_factor")
         artifact, artifact_error = load_composite_artifact_manifest(
             artifact_dir,
             expected_symbol=config.symbol,
@@ -354,9 +364,16 @@ def run_single_symbol_pipeline(config: BacktestConfig) -> dict[str, Any]:
     return row
 
 
-def load_symbol_composite_detail(symbol: str, output_dir: str) -> pd.DataFrame | None:
+def load_symbol_composite_detail(
+    symbol: str,
+    output_dir: str,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame | None:
     """读取单个品种的综合因子最终测试集明细。"""
-    detail_path = Path(output_dir) / "composite_factor" / "composite_detail.csv"
+    composite_dir = Path(output_dir) / "composite_factor"
+    if config is not None:
+        composite_dir = get_frequency_scoped_dir(composite_dir, config)
+    detail_path = composite_dir / "composite_detail.csv"
     if not detail_path.exists():
         return None
     detail = pd.read_csv(detail_path, index_col=0, parse_dates=True)
@@ -401,9 +418,16 @@ def read_factor_name_set(path: Path) -> set[str]:
     return set(table["因子"].dropna().astype(str))
 
 
-def read_single_factor_summary_for_pruning(symbol: str, output_dir: str) -> pd.DataFrame:
+def read_single_factor_summary_for_pruning(
+    symbol: str,
+    output_dir: str,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
     """读取某个品种的单因子全量汇总，用于跨品种淘汰判断。"""
-    summary_path = Path(output_dir) / "single_factor" / "single_factor_all_summary.csv"
+    single_dir = Path(output_dir) / "single_factor"
+    if config is not None:
+        single_dir = get_frequency_scoped_dir(single_dir, config)
+    summary_path = single_dir / "single_factor_all_summary.csv"
     if not summary_path.exists():
         return pd.DataFrame()
     try:
@@ -454,11 +478,11 @@ def update_factor_prune_list(
         if not symbol or not output_dir:
             continue
 
-        factor_summary = read_single_factor_summary_for_pruning(symbol, output_dir)
+        factor_summary = read_single_factor_summary_for_pruning(symbol, output_dir, config)
         if not factor_summary.empty:
             all_summary_rows.append(factor_summary)
 
-        active_path = Path(output_dir) / "factor_library" / "active_factors.csv"
+        active_path = get_frequency_scoped_dir(Path(output_dir) / "factor_library", config) / "active_factors.csv"
         for factor_name in read_factor_name_set(active_path):
             active_by_factor.setdefault(factor_name, set()).add(symbol)
 
@@ -1010,6 +1034,92 @@ def plot_multi_symbol_portfolio(
     return output_path
 
 
+def save_multi_symbol_model_report(
+    summary: pd.DataFrame,
+    config: BacktestConfig,
+    output_dir: Path,
+) -> Path | None:
+    """汇总各品种综合模型的最终测试集表现并绘制跨品种模型总览。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "multi_symbol_model_backtest_report.png"
+    summary_path = output_dir / "multi_symbol_model_backtest_summary.csv"
+    rows: list[dict[str, Any]] = []
+    series_by_symbol: dict[str, pd.DataFrame] = {}
+
+    for _, row in summary.iterrows():
+        if row.get("综合因子状态") not in {"完成", "复用已有结果"}:
+            continue
+        symbol = str(row.get("品种", "")).strip()
+        output_path = str(row.get("输出目录", "")).strip()
+        if not symbol or not output_path:
+            continue
+        detail = load_symbol_composite_detail(symbol, output_path, config)
+        if detail is None or detail.empty:
+            continue
+        strategy = detail[f"{symbol}_strategy_return"].dropna()
+        if strategy.empty:
+            continue
+        benchmark = detail[f"{symbol}_benchmark_return"].reindex(strategy.index).fillna(0.0)
+        position = detail[f"{symbol}_position"].reindex(strategy.index).fillna(0.0)
+        annual_periods = infer_annual_periods(strategy.index, config.annual_trading_days)
+        metrics = calculate_metrics(strategy, benchmark, position.abs(), annual_periods)
+        rows.append({"品种": symbol, **metrics})
+        series_by_symbol[symbol] = pd.DataFrame(
+            {
+                "nav": (1.0 + strategy.fillna(0.0)).cumprod(),
+                "benchmark_nav": (1.0 + benchmark).cumprod(),
+            },
+            index=strategy.index,
+        )
+
+    if not rows:
+        for stale_path in (report_path, summary_path):
+            if stale_path.exists():
+                stale_path.unlink()
+        print("本轮没有可用于绘图的多品种综合模型结果。")
+        return None
+
+    model_summary = pd.DataFrame(rows).sort_values("累计收益", ascending=False)
+    model_summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
+
+    fig, axes = plt.subplots(2, 2, figsize=(20, 13))
+    fig.suptitle("多品种多因子模型最终测试集回测总览", fontsize=17)
+    colors = plt.cm.tab20(np.linspace(0, 1, max(1, len(series_by_symbol))))
+    for color, (symbol, frame) in zip(colors, series_by_symbol.items()):
+        axes[0, 0].plot(frame.index, frame["nav"], label=symbol, color=color, linewidth=1.25)
+        drawdown = frame["nav"] / frame["nav"].cummax() - 1.0
+        axes[0, 1].plot(drawdown.index, drawdown, label=symbol, color=color, linewidth=1.1)
+
+    axes[0, 0].set_title("各品种综合模型净值")
+    axes[0, 0].set_ylabel("净值")
+    axes[0, 1].set_title("各品种综合模型回撤")
+    axes[0, 1].set_ylabel("回撤")
+    for axis in axes[0]:
+        axis.grid(alpha=0.25)
+        axis.legend(loc="best", ncol=min(4, max(1, len(series_by_symbol))), fontsize=8)
+
+    labels = model_summary["品种"].astype(str)
+    returns = pd.to_numeric(model_summary["累计收益"], errors="coerce").fillna(0.0)
+    sharpes = pd.to_numeric(model_summary["夏普比率"], errors="coerce").fillna(0.0)
+    axes[1, 0].bar(labels, returns, color=np.where(returns >= 0, "#2a9d8f", "#e76f51"))
+    axes[1, 0].set_title("各品种累计收益")
+    axes[1, 0].set_ylabel("累计收益")
+    axes[1, 1].bar(labels, sharpes, color=np.where(sharpes >= 0, "#457b9d", "#e63946"))
+    axes[1, 1].set_title("各品种夏普比率")
+    axes[1, 1].set_ylabel("夏普比率")
+    for axis in axes[1]:
+        axis.axhline(0, color="black", linewidth=0.8)
+        axis.tick_params(axis="x", rotation=55)
+        axis.grid(axis="y", alpha=0.25)
+
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(report_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"多品种模型指标已保存: {summary_path}")
+    print(f"多品种模型回测图已保存: {report_path}")
+    return report_path
+
+
 def save_multi_symbol_portfolio(
     summary: pd.DataFrame,
     config: BacktestConfig,
@@ -1038,7 +1148,7 @@ def save_multi_symbol_portfolio(
                 }
             )
             continue
-        artifact_dir = Path(output_dir) / "composite_factor"
+        artifact_dir = get_frequency_scoped_dir(Path(output_dir) / "composite_factor", config)
         artifact, artifact_error = load_composite_artifact_manifest(
             artifact_dir,
             expected_symbol=symbol,
@@ -1073,7 +1183,7 @@ def save_multi_symbol_portfolio(
         if require_manifest and artifact is None:
             print(f"组合层跳过 {symbol}: {artifact_error}")
             continue
-        detail = load_symbol_composite_detail(symbol, output_dir)
+        detail = load_symbol_composite_detail(symbol, output_dir, config)
         if detail is not None and not detail.empty:
             detail_frames.append(detail)
             input_row["进入组合"] = True
@@ -1401,6 +1511,8 @@ def build_manifest_output_entry(path: Path, summary_dir: Path) -> dict[str, Any]
 def collect_multi_symbol_manifest_outputs(
     summary: pd.DataFrame,
     summary_dir: Path,
+    extra_dirs: list[Path] | None = None,
+    config: BacktestConfig | None = None,
 ) -> list[dict[str, Any]]:
     """仅索引本轮汇总和每个品种的关键状态，避免递归扫描全部历史输出。"""
     root_names = {
@@ -1410,17 +1522,34 @@ def collect_multi_symbol_manifest_outputs(
         "factor_pruning_candidates.csv",
         *MULTI_SYMBOL_PORTFOLIO_OUTPUT_FILES,
     }
-    symbol_relative_paths = (
-        Path(".single_pipeline_state.json"),
-        Path(".composite_pipeline_state.json"),
-        Path("factor_library") / "active_factors.csv",
-        Path("single_factor") / "single_factor_all_summary.csv",
-        Path("composite_factor") / "active_library_oos_audit.json",
-        Path("composite_factor") / "composite_artifact_manifest.json",
-        Path("composite_factor") / "composite_detail.csv",
-        Path("composite_factor") / "composite_summary.csv",
-    )
+    if config is None:
+        # 兼容旧版目录和直接调用该工具函数的场景。
+        symbol_relative_paths = (
+            Path(".single_pipeline_state.json"),
+            Path(".composite_pipeline_state.json"),
+            Path("factor_library") / "active_factors.csv",
+            Path("single_factor") / "single_factor_all_summary.csv",
+            Path("composite_factor") / "active_library_oos_audit.json",
+            Path("composite_factor") / "composite_artifact_manifest.json",
+            Path("composite_factor") / "composite_detail.csv",
+            Path("composite_factor") / "composite_summary.csv",
+        )
+    else:
+        frequency = get_frequency_key(config)
+        symbol_relative_paths = (
+            Path("factor_library") / frequency / "active_factors.csv",
+            Path("single_factor") / frequency / ".pipeline_state.json",
+            Path("single_factor") / frequency / "single_factor_all_summary.csv",
+            Path("composite_factor") / frequency / ".pipeline_state.json",
+            Path("composite_factor") / frequency / "active_library_oos_audit.json",
+            Path("composite_factor") / frequency / "composite_artifact_manifest.json",
+            Path("composite_factor") / frequency / "composite_detail.csv",
+            Path("composite_factor") / frequency / "composite_summary.csv",
+        )
     candidates = [summary_dir / name for name in sorted(root_names)]
+    for extra_dir in extra_dirs or []:
+        if extra_dir.exists():
+            candidates.extend(path for path in extra_dir.iterdir() if path.is_file())
     if "输出目录" in summary.columns:
         for output_dir in summary["输出目录"].dropna().astype(str):
             symbol_dir = Path(output_dir)
@@ -1448,6 +1577,7 @@ def write_multi_symbol_run_manifest(
         "schema_version": 2,
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "symbols": [str(symbol) for symbol in config.symbols],
+        "bar_frequency": get_frequency_key(config),
         "bar_size": int(config.bar_size),
         "start_time": config.start_time,
         "end_time": config.end_time,
@@ -1457,13 +1587,19 @@ def write_multi_symbol_run_manifest(
         "error_count": int(len(error_rows)),
         "errors": error_rows,
         "output_index_scope": "current_root_and_symbol_key_artifacts",
-        "output_files": collect_multi_symbol_manifest_outputs(summary, summary_dir),
+        "output_files": collect_multi_symbol_manifest_outputs(
+            summary,
+            summary_dir,
+            [get_multi_symbol_portfolio_dir(config), get_multi_symbol_reports_dir(config)],
+            config,
+        ),
     }
     write_json_atomic(summary_dir / "multi_symbol_run_manifest.json", manifest)
 
 
 def run_multi_symbol_backtest(config: BacktestConfig) -> pd.DataFrame:
     """按 symbols 批量运行多品种回测，并保存跨品种汇总。"""
+    config = apply_frequency_runtime_defaults(config)
     report_config_validation(config, "multi")
     symbols = [str(symbol).strip() for symbol in config.symbols if str(symbol).strip()]
     if not symbols:
@@ -1498,7 +1634,11 @@ def run_multi_symbol_backtest(config: BacktestConfig) -> pd.DataFrame:
             print(f"{symbol} 批量回测失败: {exc}")
 
     summary = pd.DataFrame(summary_rows)
-    summary_dir = Path(config.output_dir) / config.multi_symbol_output_subdir
+    multi_root = get_multi_symbol_root(config)
+    summary_dir = get_multi_symbol_summary_dir(config)
+    portfolio_dir = get_multi_symbol_portfolio_dir(config)
+    reports_dir = get_multi_symbol_reports_dir(config)
+    multi_root.mkdir(parents=True, exist_ok=True)
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / "multi_symbol_summary.csv"
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
@@ -1510,7 +1650,9 @@ def run_multi_symbol_backtest(config: BacktestConfig) -> pd.DataFrame:
     )
     print(f"\n多品种汇总已保存: {summary_path}")
     update_factor_prune_list(config, summary, summary_dir)
-    save_multi_symbol_portfolio(summary, config, summary_dir)
+    save_multi_symbol_model_report(summary, config, reports_dir)
+    portfolio_dir.mkdir(parents=True, exist_ok=True)
+    save_multi_symbol_portfolio(summary, config, portfolio_dir)
     write_multi_symbol_run_manifest(summary, config, summary_dir, error_rows)
     return summary
 

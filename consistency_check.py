@@ -40,6 +40,7 @@ def collect_checks() -> list[tuple[bool, str]]:
         "composite": {option for action in composite_parser._actions for option in action.option_strings},
         "multi": {option for action in multi_parser._actions for option in action.option_strings},
         "pooled": {option for action in pooled_parser._actions for option in action.option_strings},
+        "signal": {option for action in signal_parser._actions for option in action.option_strings},
     }
 
     docs = {
@@ -111,6 +112,12 @@ def collect_checks() -> list[tuple[bool, str]]:
                 f"CLI {command_name} 支持最终配置打印、保存和 dry-run",
             )
         )
+    checks.append(
+        (
+            all("--frequency" in options for options in option_strings_by_parser.values()),
+            "CLI 所有研究入口均支持 --frequency 切换 30min/1d",
+        )
+    )
     for filename, text in docs.items():
         checks.append(
             (
@@ -149,9 +156,17 @@ def collect_checks() -> list[tuple[bool, str]]:
         )
         checks.append(
             (
-                ".single_pipeline_state.json" in text
-                and ".composite_pipeline_state.json" in text,
-                f"{filename} 中多品种安全断点状态文件说明完整",
+                "single_factor/<频率>/.pipeline_state.json" in text
+                and "composite_factor/<频率>/.pipeline_state.json" in text,
+                f"{filename} 中按频率隔离的多品种安全断点状态文件说明完整",
+            )
+        )
+        checks.append(
+            (
+                "--frequency 1d" in text
+                and "factor_library/1d" in text
+                and "factor_library/30min" in text,
+                f"{filename} 中独立日频模型的运行命令和目录隔离说明完整",
             )
         )
         checks.append(

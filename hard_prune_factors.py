@@ -24,11 +24,12 @@ from pathlib import Path
 
 
 DEFAULT_OUTPUT_DIR = Path("wind_hf_multifactor_output")
+DEFAULT_FACTOR_MANAGEMENT_DIR = DEFAULT_OUTPUT_DIR / "factor_management"
 DEFAULT_FACTORS_FILE = Path("framework/factors.py")
 DEFAULT_FACTOR_BUILDERS_DIR = Path("framework/factor_builders")
-DEFAULT_PRUNE_LIST = DEFAULT_OUTPUT_DIR / "factor_prune_list.csv"
-DEFAULT_HARD_DELETE_POOL = DEFAULT_OUTPUT_DIR / "factor_hard_delete_pool.csv"
-DEFAULT_REPORT = DEFAULT_OUTPUT_DIR / "factor_hard_delete_report.csv"
+DEFAULT_PRUNE_LIST = DEFAULT_FACTOR_MANAGEMENT_DIR / "30min" / "factor_prune_list.csv"
+DEFAULT_HARD_DELETE_POOL = DEFAULT_FACTOR_MANAGEMENT_DIR / "factor_hard_delete_pool.csv"
+DEFAULT_REPORT = DEFAULT_FACTOR_MANAGEMENT_DIR / "factor_hard_delete_report.csv"
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:

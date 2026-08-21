@@ -154,7 +154,7 @@ def main() -> None:
     parser.add_argument("--root", default=".", help="项目根目录。")
     parser.add_argument(
         "--output",
-        default="wind_hf_multifactor_output/leakage_audit_report.csv",
+        default="wind_hf_multifactor_output/audits/leakage_audit_report.csv",
         help="审计报告输出路径。",
     )
     args = parser.parse_args()

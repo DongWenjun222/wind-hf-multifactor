@@ -21,7 +21,7 @@ from composite_factor_backtest import (
     build_factor_signal_features,
     build_features_for_factors,
     build_training_sample_weights,
-    calculate_future_horizon_return,
+    calculate_future_target_outcomes,
     calculate_next_bar_direction,
     calculate_prediction_metrics_for_segment,
     get_xgboost_target_horizon,
@@ -50,6 +50,11 @@ from multi_symbol_backtest import (
     plot_multi_symbol_portfolio,
 )
 from framework.runtime_utils import run_tracked
+from framework.output_layout import (
+    apply_frequency_runtime_defaults,
+    get_frequency_scoped_dir,
+    get_research_output_dir,
+)
 from single_factor_backtest import calculate_metrics, infer_annual_periods, run_backtest
 
 
@@ -58,7 +63,11 @@ PROBABILITY_COLUMNS = ["prob_down", "prob_flat", "prob_up"]
 
 def get_pooled_output_dir(config: BacktestConfig) -> Path:
     """返回共享模型输出目录。"""
-    output_dir = Path(config.output_dir) / str(getattr(config, "pooled_model_output_subdir", "pooled_model"))
+    output_dir = get_frequency_scoped_dir(
+        Path(config.output_dir)
+        / str(getattr(config, "pooled_model_output_subdir", "pooled_model")),
+        config,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -73,7 +82,7 @@ def get_pooled_symbols(config: BacktestConfig) -> list[str]:
 
 def read_symbol_active_library(symbol_config: BacktestConfig) -> pd.DataFrame:
     """读取单个品种 active 因子库。"""
-    active_path = Path(symbol_config.output_dir) / "factor_library" / "active_factors.csv"
+    active_path = get_research_output_dir(symbol_config, "factor_library") / "active_factors.csv"
     if not active_path.exists():
         return pd.DataFrame()
     try:
@@ -197,12 +206,12 @@ def build_symbol_pooled_dataset(
         config=config,
     )
     target = calculate_next_bar_direction(data, features.index, symbol_config)
-    future_return = calculate_future_horizon_return(data, features.index, symbol_config)
+    target_outcomes = calculate_future_target_outcomes(data, features.index, symbol_config)
     horizon = get_xgboost_target_horizon(symbol_config)
     label_available_time = pd.Series(data.index, index=data.index).shift(-horizon).reindex(features.index)
     dataset = features.copy()
     dataset["target"] = target
-    dataset["future_horizon_return"] = future_return
+    dataset = dataset.join(target_outcomes)
     dataset["label_available_time"] = label_available_time
     dataset["timestamp"] = dataset.index
     dataset["symbol"] = symbol
@@ -312,6 +321,10 @@ def fit_predict_pooled_group(
             "group",
             "target",
             "future_horizon_return",
+            "future_horizon_round_trip_cost",
+            "future_horizon_net_return",
+            "future_horizon_target_volatility",
+            "future_horizon_standardized_net_return",
             "label_available_time",
         ]
     ].copy()
@@ -341,6 +354,14 @@ def build_symbol_signal_from_predictions(prediction_df: pd.DataFrame, config: Ba
     signal["position"] = target_position.shift(1).fillna(0.0)
     signal["target_direction"] = indexed["target"]
     signal["future_horizon_return"] = indexed["future_horizon_return"]
+    for column in (
+        "future_horizon_round_trip_cost",
+        "future_horizon_net_return",
+        "future_horizon_target_volatility",
+        "future_horizon_standardized_net_return",
+    ):
+        if column in indexed.columns:
+            signal[column] = indexed[column]
     signal["xgboost_predicted_direction"] = indexed["xgboost_predicted_direction"]
     signal["calibrated_predicted_direction"] = indexed["xgboost_predicted_direction"]
     signal["calibrated_prob_edge"] = signal["composite_score"]
@@ -587,7 +608,7 @@ def save_pooled_portfolio_outputs(
 
 def read_independent_composite_summary(symbol_config: BacktestConfig) -> dict[str, float | str]:
     """读取逐品种独立综合模型摘要；缺失时返回空字典。"""
-    summary_path = Path(symbol_config.output_dir) / "composite_factor" / "composite_summary.csv"
+    summary_path = get_research_output_dir(symbol_config, "composite_factor") / "composite_summary.csv"
     if not summary_path.exists():
         return {}
     try:
@@ -659,6 +680,7 @@ def save_pooled_vs_independent_comparison(
 
 def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
     """运行多品种共享信息模型，并保存结果。"""
+    config = apply_frequency_runtime_defaults(config)
     report_config_validation(config, "pooled")
     output_dir = get_pooled_output_dir(config)
     symbols = get_pooled_symbols(config)
@@ -741,6 +763,10 @@ def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
         metadata_columns = {
             "target",
             "future_horizon_return",
+            "future_horizon_round_trip_cost",
+            "future_horizon_net_return",
+            "future_horizon_target_volatility",
+            "future_horizon_standardized_net_return",
             "label_available_time",
             "timestamp",
             "symbol",
@@ -761,7 +787,11 @@ def run_pooled_model_backtest(config: BacktestConfig) -> pd.DataFrame:
             backtest_df.insert(0, "symbol", symbol)
             backtest_df.insert(1, "group", group_name)
             detail_frames.append(backtest_df)
-            prediction_metrics = calculate_prediction_metrics_for_segment(symbol, backtest_df) or {}
+            prediction_metrics = calculate_prediction_metrics_for_segment(
+                symbol,
+                backtest_df,
+                config,
+            ) or {}
             summary_rows.append(
                 {
                     "symbol": symbol,

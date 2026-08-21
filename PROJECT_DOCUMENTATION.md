@@ -2,7 +2,7 @@
 
 本文档用于说明当前项目的整体设计、主要文件职责、核心方法、运行流程、输出文件、风控/研究注意事项，以及后续接入 AI 自动生成因子的推荐工作流。
 
-当前项目是一个面向期货 30 分钟 K 线数据的高频/日内多因子研究框架。它的核心闭环是：
+当前项目同时支持期货 30 分钟和独立日频研究。两种频率共用研究代码，但行情缓存、因子库、单因子结果、综合模型、组合结果和交易信号严格分目录保存。它的核心闭环是：
 
 ```text
 行情数据读取
@@ -14,6 +14,40 @@
 ```
 
 重要提醒：这个框架适合做因子研究和模型验证，不建议在未充分加入成本、滑点、稳定性检验和样本外验证前直接用于实盘。
+
+## 独立日频模式
+
+第一阶段日频采用“独立模型”方案，不把 30 分钟样本和日频样本混合训练。设置 `bar_frequency="1d"` 或使用 CLI 参数 `--frequency 1d` 后，程序会通过 Wind `wsd` 获取日线，并完整运行以下闭环：
+
+```text
+日频行情 -> 日频因子 -> 日频单因子库 -> 日频综合模型 -> 日频回测与交易信号
+```
+
+推荐运行顺序：
+
+```bash
+python cli.py single --frequency 1d --symbol C.DCE --scope range --range-start 1 --range-end 100
+python cli.py composite --frequency 1d --symbol C.DCE --models xgboost,logistic_regression
+python cli.py signal --frequency 1d --symbol C.DCE --source auto
+
+# 多品种日频独立建模、组合汇总和共享模型
+python cli.py multi --frequency 1d --symbols liquid_commodity --run-single-factor --run-composite
+python cli.py pooled --frequency 1d --symbols C.DCE,M.DCE,Y.DCE,P.DCE --pooled-scope sector
+```
+
+日频与 30 分钟结果不会互相覆盖，核心目录如下：
+
+```text
+data/market/30min/                 # 30分钟行情缓存
+data/market/1d/                    # 日频行情缓存
+factor_library/30min/              # 30分钟 active/rejected/all 因子库
+factor_library/1d/                 # 日频 active/rejected/all 因子库
+single_factor/30min/ 与 /1d/       # 两套单因子研究结果
+composite_factor/30min/ 与 /1d/    # 两套综合模型结果
+trading_signals/30min/ 与 /1d/     # 两套最新交易信号
+```
+
+日频会自动采用适合日线的默认窗口：标准化 60 日、模型训练窗口 504 日、最少训练样本 120 日、每 20 个交易日重训一次；这些参数可通过 `daily_*` 配置修改。日频信号仍遵守时间顺序：仅使用当日已完成 K 线及此前信息预测下一根日线，回测仓位从下一根 K 线执行。默认 `daily_bar_ready_time="15:30"`，15:30 前自动剔除当天日线，夜盘期间也不会使用日期属于下一交易日的未完成日线。
 
 ## 0. 快速入口：文件职责与推荐运行顺序
 
@@ -35,6 +69,8 @@
 | `trading_signal.py` | 可以 | 最新交易信号导出入口。默认 compute/model 模式复用综合回测滚动模型；vote 是 active 因子加权投票基准；detail 只读取已有 `composite_detail.csv`。 |
 | `consistency_check.py` | 是，改配置/文档后推荐 | 配置、CLI 和文档一致性检查工具，用于发现默认值、命令行参数和说明文档之间的漂移。 |
 | `factor_metadata.py` | 可以 | 因子元数据导出工具。生成 `factor_metadata.csv` 和因子家族汇总，用于解释、聚类、治理和 AI 因子管理。 |
+| `factor_library_manager.py` | 可以 | active 因子人工维护工具。支持审批、保护、解除保护、持久剔除和恢复，并同步 active、完整主库及治理清单。 |
+| `factor_logic_audit.py` | 可以 | active 因子增量 AI 逻辑审查工具。调用本机 Codex 只读检查构造器，复用未变化的历史结论，并把高置信度无逻辑因子永久移出 active。 |
 | `leakage_audit.py` | 是，改代码后推荐 | 未来函数/数据泄露静态审计工具。扫描 `shift(-n)`、`bfill`、全样本统计等高风险写法并输出审计报告。 |
 | `hard_prune_factors.py` | 谨慎运行 | 因子硬删除工具。读取淘汰池，扫描 `framework/factor_builders/*.py` 中可安全定位的公式行，预演或执行源码级删除。默认先预演，不加 `--apply` 不会改代码。 |
 | `cleanup_outputs.py` | 可以 | 清理/归档历史实验输出目录。默认只生成预演报告 `output_cleanup_report.csv`；确认后加 `--apply` 才会执行。 |
@@ -48,12 +84,17 @@
 | `framework/factors.py` | 否 | 因子总装配入口。负责编号、按需构建、软淘汰过滤和因子矩阵拼装。 |
 | `framework/factor_library.py` | 否 | 因子库管理。维护 active/rejected/all 因子库并执行训练/验证筛选和相关性去重。 |
 | `framework/factor_taxonomy.py` | 否 | 因子家族、来源文件和复杂度分类。 |
+| `framework/factor_logic_review.py` | 否 | 因子逻辑审查档案、构造器指纹、增量待审列表和 active 审查列同步。 |
 | `framework/experiment_utils.py` | 否 | 实验目录、配置与关键结果快照。 |
 | `framework/runtime_utils.py` | 否 | 日志、运行状态和 `execution_manifest.json` 追踪。 |
 | `framework/project_fingerprint.py` | 否 | 计算因子相关源码哈希，使公式变化后缓存自动失效。 |
 | `framework/factor_builders/__init__.py` | 否 | 因子构造模块导出入口，把各类 `add_*_factors` 函数统一暴露给 `framework/factors.py`。 |
 | `framework/factor_builders/basic.py` | 否 | 基础量价因子，例如 `momentum`、`reversal`、`breakout`、`volume_confirm`。 |
 | `framework/factor_builders/parametric.py` | 否 | 主品种自身参数化量价因子，覆盖收益、波动、量价、K 线结构、流动性 proxy、资金流、gap 等。 |
+| `framework/factor_builders/expanded.py` | 否 | 编号 `130001-330000` 的二十万级扩展量价因子；旧家族 `130001-230000` 编号保持不变，第二代非线性与稳定性变换位于 `230001-330000`，均只计算明确请求的列。 |
+| `framework/factor_builders/family_expansion.py` | 否 | 编号 `330001-450000` 的四类按需扩展因子：parametric、calendar、non_cross_complex、cross_asset 各 30,000 个。 |
+| `framework/factor_builders/family_expansion2.py` | 否 | 编号 `450001-550000` 的五类第二批按需因子：cross_asset、non_cross_complex、expanded、parametric、calendar 各 20,000 个。 |
+| `framework/factor_builders/family_expansion3.py` | 否 | 编号 `550001-600000` 的五类第三批按需因子：cross_asset、non_cross_complex、expanded、parametric、calendar 各 10,000 个。 |
 | `framework/factor_builders/non_cross.py` | 否 | 非跨品种复杂因子，包括 `ultra_`、`hyper_`、`omega_` 等高阶量价结构。 |
 | `framework/factor_builders/cross_asset.py` | 否 | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动、成交活跃度差异等。 |
 | `framework/factor_builders/calendar.py` | 否 | 交易日历/季节性因子，包括日内时段、周/月/季度/年度位置，以及时间状态与量价状态交互。 |
@@ -86,6 +127,21 @@ python cli.py single --symbol C.DCE --scope range --range-start 1 --range-end 10
 # 2. 导出因子元数据，便于解释、治理和聚类
 python factor_metadata.py
 
+# 对当前 active 做增量 AI 逻辑审查；建议先预演，再正式运行
+python factor_logic_audit.py --frequency 1d --dry-run
+python factor_logic_audit.py --frequency 1d
+# 如果 IDE 启动的 Python 没有继承 Codex PATH，可显式指定：
+python factor_logic_audit.py --frequency 1d --codex-path "C:/path/to/codex.exe"
+
+# 仅当 factor_library_require_manual_approval=True 时执行人工审批
+python factor_library_manager.py list --frequency 1d
+python factor_library_manager.py approve 305_body_range_5 --reason "逻辑与图形复核通过" --frequency 1d
+python factor_library_manager.py revoke 305_body_range_5 --reason "暂停用于模型" --frequency 1d
+python factor_library_manager.py protect 305_body_range_5 --reason "人工确认长期保留" --frequency 1d
+python factor_library_manager.py unprotect 305_body_range_5 --frequency 1d
+python factor_library_manager.py exclude 305_body_range_5 --reason "图形不稳定" --frequency 1d
+python factor_library_manager.py restore 305_body_range_5 --frequency 1d
+
 # 3. 只使用 active 因子池做综合模型滚动预测与回测
 python cli.py composite --symbol C.DCE --models xgboost,logistic_regression
 python cli.py composite --symbol C.DCE --feature-scope selected --selected-factors factor_a,factor_b
@@ -97,6 +153,8 @@ python cli.py signal --symbols C.DCE,M.DCE,Y.DCE,P.DCE --source multi
 python cli.py signal --symbol C.DCE --mode vote --source auto
 python cli.py signal --symbol C.DCE --mode detail --source auto
 ```
+
+`factor_library_manager.py` 的 `approve/revoke/protect/unprotect/exclude/restore` 统一支持三种因子写法：纯编号（如 `305`）、完整标签（如 `305_body_range_5`）或不带编号的因子名称。审批、保护和排除清单会同时持久化编号、标签与名称；旧清单在管理器运行时自动补齐可恢复的身份信息。
 
 交易信号模式说明：
 
@@ -145,13 +203,18 @@ python multi_symbol_backtest.py
 
 ```text
 wind_hf_multifactor_output/
+  data/market/{30min,1d}/            # 按频率隔离的行情缓存
+  data/{macro,external}/             # 宏观和外部数据缓存
+  audits/                            # 数据质量和未来数据泄露审计
+  factor_management/                 # 因子元数据、软淘汰池和硬删除报告
+  maintenance/                       # 输出清理等维护报告
   logs/                              # 每次运行的控制台日志
   runs/                              # 每次运行的配置、manifest 和关键结果快照
-  factor_library/                    # 单品种 active/rejected/all 因子库
-  single_factor/                     # 单因子汇总、分组、图表
-  composite_factor/                  # 综合因子明细、摘要、模型对比、诊断图表
-  by_symbol/                         # 多品种独立结果和组合汇总
-  trading_signals/                   # 最新交易信号文件
+  factor_library/{30min,1d}/         # 各频率 active/rejected/all 因子库
+  single_factor/{30min,1d}/          # 各频率单因子汇总、分组、图表
+  composite_factor/{30min,1d}/       # 各频率综合因子明细、模型与诊断图表
+  by_symbol/                         # symbols、summary、portfolio、reports 分层多品种输出
+  trading_signals/{30min,1d}/        # 各频率最新交易信号文件
 ```
 
 ## 1. 项目结构
@@ -210,6 +273,8 @@ wind_hf_multifactor_output/
 | `cli.py` | 推荐的统一命令行入口，可在不修改 `config.py` 的情况下运行单因子、综合因子和多品种流程。 |
 | `framework/factor_builders/basic.py` | 基础量价因子，例如 momentum、reversal、breakout、volume_confirm。 |
 | `framework/factor_builders/parametric.py` | 主品种自身的参数化量价因子，包括收益、波动、量价、K线结构、流动性 proxy 等。 |
+| `framework/factor_builders/expanded.py` | 二十万级扩展量价名称空间。名称目录可完整生成，真实因子矩阵严格按 `range/new/selected/active` 请求构建，避免二十万列同时进入内存。 |
+| `framework/factor_builders/family_expansion.py` | 四类各三万的扩展名称空间；不同家族分别使用自身量价、日期季节性、复杂内部交互和关联品种聚合数据。 |
 | `framework/factor_builders/calendar.py` | 交易日历、日内时段、周/月/季度/年度季节性及其与量价状态交互的因子。 |
 | `framework/factor_builders/cross_asset.py` | 跨品种联动因子，包括相关品种收益、价差、beta、相关性、滞后联动和成交活跃度差异等。 |
 | `framework/factor_builders/macro_state.py` | 资金利率、指数、汇率、债券等 Wind 日频宏观状态代理因子。 |
@@ -236,16 +301,27 @@ wind_hf_multifactor_output/
 | --- | --- | --- |
 | `symbol` | `"C.DCE"` | 当前主预测品种。 |
 | `symbols` | `LIQUID_COMMODITY_MAIN_SYMBOLS` | 多品种批量回测时依次运行的主预测品种。默认覆盖中国商品期货中流动性较好的主力连续品种，可用 `--symbols liquid_commodity` 显式指定同一品种池。 |
-| `bar_size` | `30` | 30 分钟 K 线。 |
+| `bar_frequency` | `"30min"` | 研究频率；设为 `"1d"` 启用独立日频闭环。CLI 可用 `--frequency 1d` 覆盖。 |
+| `bar_size` | `30` | 分钟 K 线周期；日频模式下不生效。 |
+| `daily_price_fields` | `open,high,low,close,volume,amt,oi,settle` | Wind `wsd` 日频行情字段。 |
+| `daily_bar_ready_time` | `"15:30"` | 当天日线允许进入模型的最早时间；此前自动剔除当天未完成 K 线。 |
+| `daily_xgboost_train_window` | `504` | 日频综合模型每次滚动训练最多回看约两年交易日。 |
+| `daily_xgboost_min_train_samples` | `120` | 日频模型允许训练的最少历史样本。 |
+| `daily_xgboost_retrain_every` | `20` | 日频模型约每月重新训练一次。 |
 | `prefer_local_data` | `True` | 优先读取本地缓存行情，失败后再尝试 Wind。 |
-| `commission_bps` | `0` | 单边手续费，单位 bps；正式评估应按品种设置真实成本。 |
-| `slippage_bps` | `0` | 当前不计滑点。 |
+| `commission_bps` | `0.5` | 单边手续费研究占位值，单位 bps；正式评估应按品种费率校准。 |
+| `slippage_bps` | `1.0` | 单边滑点研究占位值；正式评估应按盘口、成交量和交易时段校准。 |
 | `backtest_return_mode` | `"next_open_continuous"` | 下一根开盘调仓；旧仓位承担跳空，新仓位承担开盘到收盘损益。 |
 | `cost_stress_bps_list` | `0, 0.5, 1, 2, 3` | 综合回测成本压力测试档位，表示手续费+滑点的单边总成本。 |
+| `statistical_enable_block_bootstrap` | `True` | 是否在综合交易报告中使用移动区块自助法估计收益和标准 Sharpe 的不确定性。 |
+| `statistical_bootstrap_samples / statistical_bootstrap_block_size` | `500 / 0` | 自助抽样次数与区块长度；区块长度为 0 时按样本量平方根自动确定。 |
+| `statistical_confidence_level` | `0.95` | 区块自助法报告使用的置信水平；胜率与准确率另固定报告 95% Wilson 区间。 |
+| `prediction_calibration_bins` | `10` | 多分类概率 ECE/MCE 使用的置信度分箱数。 |
 | `signal_threshold` | `0.7` | 因子 z-score 转多空信号阈值。 |
 | `zscore_window` | `120` | 因子滚动标准化窗口。 |
 | `auto_select_train_ratio` | `0.7` | 前 70% 样本作为训练段，用于判断因子方向。 |
 | `auto_select_validation_ratio` | `0.15` | 训练段之后的 15% 样本作为验证段，用于因子入库；最后 15% 作为最终测试段。 |
+| `factor_selection_covariate_scope` | `"train_validation"` | 单因子预过滤和入库相关性去重只使用训练+验证协变量；可设为 `train`，两者都排除最终测试集。 |
 | `enable_cross_asset_factors` | `True` | 启用跨品种因子。 |
 | `related_symbols` | `CS.DCE, M.DCE, Y.DCE, P.DCE` | 默认相关品种数据源。 |
 | `enable_macro_state_factors` | `True` | 启用资金利率、指数、汇率、债券等 Wind 日频宏观状态因子。 |
@@ -263,12 +339,13 @@ wind_hf_multifactor_output/
 | `composite_active_library_cutoff_policy` | `"auto"` | active 因子筛选截止审计。旧库缺元数据时警告；一旦明确检测到未来筛选则停止。严格研究可改为 error。 |
 | `use_frozen_active_library` | `False` | 是否把指定历史快照作为自动冻结的源文件，用于复现实验或严格样本外检验。 |
 | `frozen_active_library_path` | `None` | 冻结版 active 因子库路径，可用于严格样本外检验。 |
-| `single_factor_new_factor_start_index` | `126978` | 当前增量测试从第 126978 个因子开始，对应最新追加的 `macro_` 宏观状态因子。 |
+| `single_factor_new_factor_start_index` | `126978` | 当前增量测试先衔接宏观因子；宏观段完成后自动进入编号 `130001-330000` 的扩展因子段。 |
+| `single_factor_new_factor_batch_size` | `1000` | `new` 模式每轮最多测试的新增因子数；每轮结束后进度自动推进，避免十万因子一次性占满内存。 |
 | `single_factor_auto_update_start_index` | `True` | 是否自动记录并读取新增因子测试进度，避免 `single_factor_scope="new"` 重复测试已经跑完的因子。 |
 | `single_factor_start_index_progress_path` | `factor_library/single_factor_start_index_progress.csv` | 新增因子测试进度文件；相对路径默认放在总 `output_dir` 下，多品种模式共用该文件并按品种分行记录。 |
 | `single_factor_new_factor_start_index_by_symbol` | `C.DCE/M.DCE/Y.DCE/P.DCE/CS.DCE -> 126978` | 多品种模式下可为不同期货品种单独设置新增因子起始编号。 |
 | `enable_factor_pruning` | `True` | 是否启用多品种因子淘汰池机制。 |
-| `factor_prune_list_path` | `factor_prune_list.csv` | 软淘汰清单路径；相对路径默认放在 `output_dir` 下。 |
+| `factor_prune_list_path` | `factor_management/factor_prune_list.csv` | 软淘汰清单路径；相对路径默认放在 `output_dir` 下。 |
 | `factor_pruning_min_tested_symbols` | `2` | 一个因子至少在多少个品种上完成测试后，才允许进入淘汰判断。 |
 | `factor_pruning_keep_if_active_any_symbol` | `True` | 如果因子在任一品种进入 active，则默认保护，不纳入淘汰池。 |
 | `factor_pruning_keep_min_sharpe` | `0.0` | 只要任一品种初筛夏普达到该值，就暂不淘汰。 |
@@ -276,9 +353,16 @@ wind_hf_multifactor_output/
 | `factor_pruning_apply_to_build` | `True` | 构建因子矩阵时是否自动过滤软淘汰清单中的因子。 |
 | `factor_library_min_sharpe` | `1.0` | 入库初筛夏普至少大于等于 1。当前初筛会参考训练集和验证集的较弱表现。 |
 | `factor_library_min_train_sharpe` | `1.0` | 训练集夏普也至少大于等于 1 才能入库。 |
-| `factor_library_min_train_win_rate` | `0.5` | 训练集胜率必须严格大于 50% 才能入库。 |
-| `factor_library_min_selection_win_rate` | `0.5` | 入库选择样本的最低胜率；优先使用验证集，验证无有效数据时回退训练集，最终测试集不参与。 |
-| `factor_library_min_selection_trades` | `0` | 入库选择样本的最低交易次数；优先验证集、回退训练集。 |
+| `factor_library_min_train_win_rate` | `None` | 可选训练胜率硬门槛；默认关闭，避免淘汰低胜率但高盈亏比的有效因子。 |
+| `factor_library_min_selection_win_rate` | `None` | 可选验证选择段胜率门槛；默认关闭，最终测试集不参与。 |
+| `factor_library_min_selection_trades` | `10` | 入库选择样本至少需要 10 次交易；优先验证集、回退训练集。 |
+| `factor_library_min_train_trades` | `30` | 训练集至少需要 30 次交易，避免少量交易造成虚高夏普或胜率。 |
+| `single_factor_defer_expensive_diagnostics` | `True` | 先做基础回测；确定无法入库的因子跳过 qcut、分月 IC/RankIC 等昂贵诊断。 |
+| `single_factor_plot_all_active` | `True` | 筛选完成后为全部 pre_active 和 active 人工复核候选生成完整回测图。 |
+| `single_factor_reuse_existing_plots` | `True` | 当前频率 latest 目录已有非空因子图时直接复用，不重复绘制；设为 False 可强制刷新。 |
+| `factor_library_respect_manual_exclusions` | `True` | 重筛时持续尊重人工排除清单，防止已剔除因子自动重新入库。 |
+| `factor_library_require_manual_approval` | `False` | 默认规则通过即进入 active，与原逻辑一致；设为 True 后才启用 pre_active + 人工 approve。 |
+| `factor_library_write_pickle_fallback` | `True` | 保存 Parquet 主库时同时保留 gzip Pickle 兼容副本，避免更换 Python 环境后因缺少 pyarrow 而无法维护因子库。 |
 | `factor_library_min_selection_signal_coverage` | `0.0` | 入库选择样本的最低信号覆盖率；优先验证集、回退训练集。 |
 | `factor_library_max_selection_drawdown` | `None` | 入库选择样本允许的最大回撤上限；为空表示不启用该门槛。 |
 | `factor_library_max_corr` | `0.80` | 入库因子与已入库因子的最大相关性阈值。 |
@@ -288,10 +372,16 @@ wind_hf_multifactor_output/
 | `multi_symbol_opportunity_weight_power` | `1.0` | 机会评分对原组合权重的放大幂次，越大权重越集中到强机会品种。 |
 | `multi_symbol_use_group_risk_budget` | `True` | 是否启用多品种板块/产业链风险预算，限制同一板块权重过度集中。 |
 | `multi_symbol_max_group_weight` | `0.35` | 单一板块最大组合权重，默认任一板块最多 35%。 |
-| `composite_model_names` | `["xgboost", "logistic_regression", "random_forest", "extra_trees"]` | 综合因子滚动训练时依次对比的模型；如果某个 sklearn 模型依赖缺失，会自动跳过并在模型比较表中记录。 |
+| `composite_model_names` | 六模型列表 | 默认对比 XGBoost、L2/Elastic Net 逻辑回归、直方图梯度提升、随机森林和 ExtraTrees；缺少 sklearn 时相关模型会跳过。 |
 | `composite_sklearn_n_estimators` | `120` | RandomForest 和 ExtraTrees 使用的树数量。 |
 | `composite_logistic_max_iter` | `1000` | 逻辑回归最大迭代次数。 |
 | `composite_logistic_c` | `1.0` | 逻辑回归 L2 正则强度倒数，越小正则越强。 |
+| `composite_elastic_net_c / composite_elastic_net_l1_ratio` | `0.10 / 0.50` | 稀疏线性模型的总体正则强度和 L1 占比。 |
+| `composite_hist_*` | 见 `config.py` | 控制直方图梯度提升的迭代次数、学习率、叶节点数、叶节点样本和 L2 正则。 |
+| `composite_enable_probability_ensemble` | `True` | 是否融合各基础模型严格滚动产生的样本外概率。 |
+| `composite_ensemble_weight_window / composite_ensemble_min_history` | `480 / 120` | 30 分钟模式下动态评价模型质量的窗口和最低成熟方向标签数；日频自动改为 `126 / 40`。 |
+| `composite_ensemble_min_directional_accuracy / composite_ensemble_min_edge_return_corr` | `0.48 / -0.02` | 基础模型进入融合前必须满足的历史预测质量门槛。 |
+| `composite_ensemble_max_model_weight / composite_ensemble_equal_weight_shrinkage` | `0.60 / 0.35` | 限制单模型集中度，并把动态权重向合格模型等权组合收缩。 |
 | `composite_enable_validation_test_gap_report` | `True` | 是否输出验证集到最终测试集的表现衰减诊断，用于识别样本外失效和过拟合风险。 |
 | `composite_gap_warn_sharpe_retention` | `0.5` | 测试夏普低于验证夏普该比例时触发衰减预警。 |
 | `composite_gap_warn_return_retention` | `0.5` | 测试累计收益低于验证累计收益该比例时触发衰减预警。 |
@@ -318,7 +408,10 @@ wind_hf_multifactor_output/
 | `xgboost_min_position_change` | `0.10` | 同方向目标仓位变化小于 10% 时忽略，降低微调换手。 |
 | `xgboost_position_smoothing_alpha` | `1.0` | 仓位平滑系数，1 表示不平滑。 |
 | `xgboost_walk_forward_feature_selection` | `False` | 当前默认不在每个滚动窗口内重新选因。 |
-| `xgboost_target_horizon` | `1` | 默认预测下一根 K 线方向。 |
+| `xgboost_target_align_with_min_holding` | `True` | 有效预测跨度至少覆盖执行层最小持仓 K 线数。 |
+| `xgboost_target_include_round_trip_cost` | `True` | 标签中性门槛计入一次完整开平仓的双边手续费与滑点。 |
+| `xgboost_target_horizon` | `1` | 基础目标跨度；当前最小持仓为 2，因此默认有效目标跨度为 2。 |
+| `xgboost_target_neutral_bps` | `0.0` | 双边成本之外的额外固定中性缓冲。 |
 | `xgboost_target_label_mode` | `"threshold"` | XGBoost 标签生成模式。`threshold` 使用固定/动态中性阈值；`quantile` 使用已落地历史 horizon 收益滚动分位数。 |
 | `xgboost_target_quantile_window` | `1200` | `quantile` 标签模式下计算历史收益分位阈值的滚动窗口。 |
 | `xgboost_target_quantile_lower/upper` | `0.35/0.65` | `quantile` 标签模式下的下/上分位，低于下分位标为空，高于上分位标为多，中间标为中性。 |
@@ -463,6 +556,14 @@ reversal -> 2
 calendar_ 日历/季节性因子起点：106885
 macro_ 资金利率/宏观状态因子起点：126978
 当前默认 single_factor_new_factor_start_index：126978
+
+二十万级扩展因子使用固定编号 `130001-330000`：原有 `expanded_` 为 `130001-230000`，新增 `expanded2_` 为 `230001-330000`。推荐使用 `new` 分批推进，或把 `single_factor_range` 设为例如 `(230001, 231000)`；该家族不会在无边界的全量矩阵中一次生成二十万列。
+
+四类第一批新增因子使用固定编号：`paramx_ 330001-360000`、`calendarx_ 360001-390000`、`noncrossx_ 390001-420000`、`crossx_ 420001-450000`。
+
+五类第二批新增因子继续使用稳定编号：`crossy_ 450001-470000`、`noncrossy_ 470001-490000`、`expanded3_ 490001-510000`、`paramy_ 510001-530000`、`calendary_ 530001-550000`。每类由 10 个来源、10 个新变换、10 个窗口、4 个滞后和 5 个尺度组成 20,000 个，截至第二批的因子编号上限为 `550000`。所有新增家族都只计算明确请求的列。
+
+五类第三批新增因子使用后续稳定编号：`crossz_ 550001-560000`、`noncrossz_ 560001-570000`、`expanded4_ 570001-580000`、`paramz_ 580001-590000`、`calendarz_ 590001-600000`。每类由 10 个来源、10 个变换、10 个窗口、2 个滞后和 5 个尺度组成 10,000 个，项目因子编号总上限更新为 `600000`；数值仍严格按请求生成。
 ```
 
 输出里常见的“因子标签”格式是：
@@ -492,13 +593,15 @@ python single_factor_backtest.py
 -> 按 auto_select_train_ratio 和 auto_select_validation_ratio 切分训练集/验证集/最终测试集
 -> 每个因子在训练集上自动判断正向/反向
 -> 固定该方向后分别回测训练集、验证集和最终测试集
--> 计算 qcut 分组表现
+-> 对仍可能入库的因子计算 qcut、IC/RankIC 和分月预测诊断
 -> 汇总单因子结果
 -> 同时参考训练集和验证集表现更新 factor_library
 -> 为 Top 因子生成图表
 ```
 
 `range/new/selected` 属于按需模式：参数化因子会先从请求名称解析所需滚动窗口，再进入构建和标准化，不再为了测试少量编号而计算全部参数窗口。已有 active 因子只作为相关性去重参照，不会被重复回测。
+
+默认启用两阶段诊断。已经因夏普、累计收益、交易次数、覆盖率或回撤硬门槛而确定无法入库的因子，仍保存完整基础回测指标和拒绝原因，但跳过不会改变筛选结论的滚动 qcut、IC/RankIC 与分月 IC 计算。`single_factor_all_summary.csv` 的“详细诊断状态”会明确记录该情况；所有仍可能进入 active 库的因子都会完成全部预测诊断。
 
 三段式样本用途：
 
@@ -508,7 +611,7 @@ python single_factor_backtest.py
 最终测试集：只用于留存评估，不直接参与 active 因子入库。
 ```
 
-这样做的目的是消除“用最终测试集筛因子”的研究污染风险，同时避免只看训练集或只看验证集导致单段偶然表现过度影响入库。没有有效验证数据时，因子库只回退训练列；如果训练列也不存在则拒绝建立 active 库，不再兼容使用旧测试列。
+相关性预过滤和最终入库去重同样遵守该边界：默认只读取训练集+验证集的因子值，测试期因子分布不会参与决定候选集合；严格研究可把 `factor_selection_covariate_scope` 改为 `train`。这样既隔离收益标签，也隔离测试期协变量。没有有效验证数据时，因子库只回退训练列；如果训练列也不存在则拒绝建立 active 库，不再兼容使用旧测试列。
 
 每次更新因子库时，程序都会从训练/验证原始指标重新计算 `初筛夏普`、`初筛累计收益`、`初筛RankIC` 和 `初筛分组单调性`，不会直接信任旧 CSV 中已经保存的初筛值。缺少训练收益或训练夏普的历史记录会标记为 `missing_traceable_train_metrics`，需要重新运行对应单因子回测后才有资格进入 active。
 
@@ -549,10 +652,13 @@ strategy_net_return = strategy_gross_return - trading_cost
 ```text
 累计收益
 年化收益
+年化算术平均收益
 年化波动
-夏普比率
+标准夏普比率（单期平均收益 / 单期波动率后年化）
+CAGR波动比（年化复合收益 / 年化波动率）
 最大回撤
 胜率
+胜率 Wilson 置信区间
 交易次数
 样本 K 线数
 信号覆盖率
@@ -618,8 +724,13 @@ wind_hf_multifactor_output/factor_library/
 
 ```text
 active_factors.csv
-factor_library_all.csv
+pre_active_factors.csv
+factor_library_all.parquet（缺少 Parquet 引擎时为 factor_library_all.pkl.gz）
 rejected_factors.csv
+manual_factor_approvals.csv
+manual_factor_exclusions.csv
+manual_factor_protections.csv
+factor_logic_reviews.csv
 ```
 
 三类文件含义：
@@ -627,9 +738,21 @@ rejected_factors.csv
 | 文件 | 含义 |
 | --- | --- |
 | `active_factors.csv` | 当前正式进入综合模型候选池的因子。 |
-| `factor_library_all.csv` | 历史上评估过的全部因子及其最新表现。 |
-| `rejected_factors.csv` | 未通过入库条件、被相关性去重淘汰或排名靠后的因子。 |
+| `pre_active_factors.csv` | 自动规则筛选通过、等待人工复核的候选因子；不会被模型或交易信号使用。 |
+| `factor_library_all.parquet` | 历史上评估过的全部因子及其最新完整指标；使用 zstd 压缩，程序优先读取。缺少 Parquet 引擎时自动使用 `factor_library_all.pkl.gz`。 |
+| `rejected_factors.csv` | 未入库因子的精简人工诊断视图；完整指标不重复保存，可从全量主库按状态筛选。 |
+| `rejected_reason_summary.csv` | 按拒绝原因汇总的因子数量，便于快速判断主要淘汰门槛。 |
 | `active_factor_family_summary.csv` | active 因子库按因子家族统计的数量、平均初筛夏普、平均 RankIC、平均分组单调性、平均预测能力评分和平均科研综合评分。 |
+| `manual_factor_approvals.csv` | 人工批准记录；只有当前仍满足规则且在该表中的因子才能成为 active。升级前已有 active 会自动登记为存量审批。 |
+| `manual_factor_exclusions.csv` | 人工看图复核后的持久排除清单；单因子重筛会把其中因子标记为 `manual_exclusion`。 |
+| `manual_factor_protections.csv` | 手工保护的 active 因子。保护项优先于自动门槛、排名、家族配额、相关性去重和 AI 自动剔除；显式 `exclude` 仍具有最高优先级。 |
+| `factor_logic_reviews.csv` | AI 逻辑审查永久档案，记录状态、逻辑类型、说明、风险、置信度、模型、版本和构造器指纹。已审查且指纹未变化的因子不会重复调用 AI。 |
+
+不要直接编辑 `active_factors.csv`。默认自动模式下，规则筛选通过即进入 active；当 `factor_library_require_manual_approval=True` 时，候选先进入 pre_active，使用 `approve` 才转入 active，使用 `revoke` 可退回 pre_active。`exclude` 表示持久否决，会同步主库和人工排除清单并删除当前回测图；`restore` 只解除否决。人工复核应主要依据训练集、验证集、经济逻辑和稳定性；最终测试集用于一次性留存评估，不应反复看测试图挑因子。
+
+`factor_logic_audit.py` 只审查当前 active。`approved/rejected/uncertain` 都会留档；只有置信度达到 `factor_logic_review_min_reject_confidence` 的 `rejected` 默认自动剔除，低置信度拒绝自动降级为 `uncertain`。构造器源码或审查规则版本变化后，相关因子会自动重新进入待审列表。可加 `--no-exclude` 仅记录结论而不修改 active。
+
+对已经人工确认、希望长期保留的 active，使用 `factor_library_manager.py protect`。保护后即使后续统计门槛、Top N、家族配额、相关性或 AI 结论变化也不会自动移出 active；公式已经无法生成时仍会报告 `factor_not_available`，避免模型引用不存在的特征。`unprotect` 只解除保护，不立即删除；下次重筛恢复普通规则。显式 `exclude` 会解除保护并永久剔除，是最高优先级人工决定。
 
 当前入库逻辑：
 
@@ -641,6 +764,8 @@ rejected_factors.csv
 验证集和训练集满足可选交易次数、信号覆盖率和最大回撤约束
 与已入库因子的最大相关性 < factor_library_max_corr
 若启用家族配额，则同一因子家族 active 数量不能超过 factor_library_family_max_counts
+默认模式：规则通过 -> active
+人工审批模式：规则通过 -> pre_active -> 人工approve -> active
 初筛预测能力评分 >= factor_library_min_predictive_score
 按初筛预测能力评分、初筛科研综合评分、训练/验证一致性、夏普、RankIC、累计收益排序
 active 因子最多保留 single_factor_keep_top_n 个
@@ -728,8 +853,8 @@ factor_library/active_factors.csv
 然后生成或更新：
 
 ```text
-wind_hf_multifactor_output/factor_prune_list.csv
-wind_hf_multifactor_output/by_symbol/factor_pruning_candidates.csv
+wind_hf_multifactor_output/factor_management/factor_prune_list.csv
+wind_hf_multifactor_output/by_symbol/summary/factor_pruning_candidates.csv
 ```
 
 默认淘汰逻辑比较保守：
@@ -899,7 +1024,7 @@ factor_signal 是 -1/0/1 多空信号
 state features 用于描述因子信号是否刚翻转、是否持续、是否增强或衰减
 ```
 
-预测目标是未来 horizon 根 K 线收益方向：
+预测目标是与执行层最小持仓期对齐后的未来收益方向：
 
 ```text
 future_horizon_return = close[t+horizon] / open[t+1] - 1
@@ -913,16 +1038,21 @@ future_horizon_return < -neutral_threshold -> -1
 否则 -> 0
 ```
 
+中性门槛由一次完整开平仓的双边成本、额外固定缓冲和事前持有期波动缓冲相加得到。由此，非中性类表示成本后、波动率标准化意义下值得交易的方向，而不只是价格正负号。
+
 当前默认：
 
 ```text
 xgboost_target_label_mode = "threshold"
 xgboost_target_horizon = 1
-xgboost_target_neutral_bps = 3.0
-neutral_threshold = 3.0 bps
+xgboost_target_align_with_min_holding = True
+xgboost_min_holding_bars = 2
+xgboost_target_neutral_bps = 0.0
+effective_horizon = 2
+static_neutral_threshold = 2 * (0.5 + 1.0) = 3.0 bps
 ```
 
-如果 `xgboost_target_neutral_bps=None`，才会退回使用 `commission_bps + slippage_bps` 作为中性阈值。
+`xgboost_target_neutral_bps` 是双边成本之外的额外缓冲；`None` 与 `0` 等价。明细同时保存未来毛收益、成本后净机会收益、事前目标波动率和波动率标准化净收益。
 
 也可以把 `xgboost_target_label_mode` 设置为 `"quantile"`。这种模式不会用全样本未来收益分位，而是使用已经完全落地的历史 horizon 收益滚动计算上下分位阈值；预测 t 时，阈值只依赖 t 时刻之前已经可知的数据。它更适合波动状态变化明显、固定 bps 阈值过松或过严的品种。
 
@@ -982,7 +1112,7 @@ xgboost_position_smoothing_alpha：可选仓位平滑，1 表示不平滑。
 预测第 t 根 K 线时，
 训练标签必须已经在 t 时刻之前完全落地。
 
-训练结束位置 = t - xgboost_target_horizon
+训练结束位置 = t - effective_target_horizon
 
 例如 xgboost_target_horizon = 3：
 目标收益使用 open[t+1] -> close[t+3]
@@ -990,7 +1120,7 @@ xgboost_position_smoothing_alpha：可选仓位平滑，1 表示不平滑。
 不能使用 t-2 / t-1 的标签
 ```
 
-这相当于在每个滚动训练窗口尾部加入 `xgboost_target_horizon - 1` 根 K 线的标签隔离，避免模型训练时看到预测时点之后才会完整出现的未来收益。
+这相当于在每个滚动训练窗口尾部加入 `effective_target_horizon - 1` 根 K 线的标签隔离；有效跨度会自动考虑最小持仓期，避免模型训练时看到预测时点之后才会完整出现的未来收益。
 
 当前默认：
 
@@ -1025,15 +1155,16 @@ wind_hf_multifactor_output/composite_factor/
 | --- | --- |
 | `composite_detail.csv` | 最终测试集逐 K 线明细，包含预测、概率、信号、持仓、收益和净值。 |
 | `composite_summary.csv` | XGBoost 测试集绩效与关键配置摘要，包含预测目标跨度、训练标签隔离K线数、阈值和仓位配置。 |
-| `composite_model_comparison.csv` | XGBoost、LogisticRegression、RandomForest、ExtraTrees 的训练/验证/最终测试表现，以及等权投票基准表现对比。 |
+| `composite_model_comparison.csv` | 六类基础模型、动态概率融合和等权投票基准的训练/验证/最终测试表现对比。 |
 | `composite_validation_test_gap.csv` | 各模型验证集到最终测试集的收益、夏普、回撤、胜率等指标衰减诊断，用于发现验证有效但最终测试明显失效的模型。 |
-| `composite_report.png` | XGBoost 训练集、验证集和最终测试集三栏图；其他模型会输出 `composite_report_{model_name}.png`。 |
+| `composite_report.png` | XGBoost 训练集、验证集和最终测试集三栏图；其他模型输出 `composite_report_{model_name}.png`，融合模型输出 `composite_report_probability_ensemble.png`。 |
+| `composite_model_ensemble_weights.csv` | 每个时点各模型的严格历史权重、方向准确率、概率收益相关性、成熟样本数和资格状态。 |
 | `benchmark_vote_report.png` | 等权投票基准训练集、验证集和最终测试集三栏图。 |
 | `composite_xgboost_feature_importance.csv` | XGBoost 特征重要性。 |
 | `composite_factor_contribution.csv` | 把模型特征重要性聚合回基础因子后的贡献表，可用于判断 active 因子是否真的被模型使用。 |
 | `composite_xgboost_feature_selection.csv` | 每次滚动重训时的选因明细。 |
-| `composite_prediction_report.csv` | 纯预测质量报告，按训练集、验证集、最终测试集拆分，包含三分类准确率、方向准确率、类别召回率、LogLoss、BrierScore、概率差与未来收益相关性等。 |
-| `composite_trading_report.csv` | 交易结果报告，按训练集、验证集、最终测试集拆分，包含收益、夏普、回撤、换手、仓位覆盖率和交易过滤后覆盖率等。 |
+| `composite_prediction_report.csv` | 纯预测质量报告，按训练集、验证集、最终测试集拆分，包含 Accuracy、Balanced Accuracy、MCC、Wilson 区间、LogLoss、BrierScore、ECE/MCE 及概率差与未来净收益相关性。 |
+| `composite_trading_report.csv` | 交易结果报告，按训练集、验证集、最终测试集拆分，包含标准 Sharpe、CAGR/Vol、胜率区间、block-bootstrap Sharpe/收益置信区间与显著性、回撤、换手和仓位覆盖率。 |
 | `composite_prediction_diagnostics.csv` | 预测准确率、方向准确率、概率差相关性等诊断。 |
 | `composite_prediction_confusion_matrix.csv` | 校准后预测方向与真实方向的混淆矩阵。 |
 | `composite_xgboost_edge_diagnostics.csv` | 按概率优势分桶统计未来收益。 |
@@ -1077,7 +1208,7 @@ python cli.py multi --symbols liquid_commodity
 | --- | --- |
 | `symbols` | 批量运行的主预测品种列表。默认使用中国商品期货中流动性较好的主力连续品种池，也可以手工传入逗号分隔列表。 |
 | `multi_symbol_run_single_factor` | 是否先为每个品种运行单因子流程并更新该品种自己的 active 因子库。 |
-| `multi_symbol_run_composite` | 是否为每个品种运行 XGBoost 综合因子流程。 |
+| `multi_symbol_run_composite` | 是否为每个品种运行综合因子流程；默认开启，以生成模型总览和组合图。 |
 | `multi_symbol_separate_output_dirs` | 是否为每个品种使用独立输出目录。建议保持开启。 |
 | `multi_symbol_output_subdir` | 多品种结果放在 `output_dir` 下的哪个子目录，默认是 `by_symbol`。 |
 | `multi_symbol_skip_existing` | 是否复用有效的单因子库和综合回测明细。只有配置、源码指纹、本地行情及关键输入均未变化时才跳过；单因子阶段跟踪淘汰清单，综合阶段跟踪 active 因子库内容哈希。 |
@@ -1107,45 +1238,44 @@ python cli.py multi --symbols liquid_commodity
 ```text
 wind_hf_multifactor_output/
   by_symbol/
-    C_DCE/
-      run_config.json
-      factor_library/
-        active_factors.csv
-        factor_library_all.csv
-        rejected_factors.csv
-      .single_pipeline_state.json
-      .composite_pipeline_state.json
-      single_factor/
-        single_factor_summary.csv
-        single_factor_all_summary.csv
-        qcut_group_summary.csv
-      composite_factor/
-        composite_detail.csv
-        composite_summary.csv
-        active_library_oos_audit.json
-        composite_artifact_manifest.json
-        composite_model_comparison.csv
-        composite_report.png
-        benchmark_vote_report.png
-    M_DCE/
-      ...
-    multi_symbol_summary.csv
-    multi_symbol_portfolio_inputs.csv
-    multi_symbol_portfolio_detail.csv
-    multi_symbol_portfolio_summary.csv
-    multi_symbol_portfolio_weights.csv
-    multi_symbol_opportunity_scores.csv
-    multi_symbol_opportunity_selection.csv
-    multi_symbol_group_weights.csv
-    multi_symbol_group_contribution.csv
-    multi_symbol_portfolio_contribution.csv
-    multi_symbol_strategy_return_corr.csv
-    multi_symbol_run_manifest.json
-    multi_symbol_portfolio_report.png
-    factor_pruning_candidates.csv
-  factor_prune_list.csv
-  factor_hard_delete_pool.csv
-  factor_hard_delete_report.csv
+    symbols/
+      C_DCE/
+        factor_library/
+          30min/
+          1d/
+        single_factor/
+          30min/.pipeline_state.json
+          1d/.pipeline_state.json
+        composite_factor/
+          30min/.pipeline_state.json
+          1d/.pipeline_state.json
+        runs/
+      M_DCE/
+        ...
+    summary/<频率>/
+      multi_symbol_summary.csv
+      multi_symbol_errors.csv
+      multi_symbol_run_manifest.json
+      factor_pruning_candidates.csv
+    reports/<频率>/
+      multi_symbol_model_backtest_summary.csv
+      multi_symbol_model_backtest_report.png
+    portfolio/<频率>/
+      multi_symbol_portfolio_inputs.csv
+      multi_symbol_portfolio_detail.csv
+      multi_symbol_portfolio_summary.csv
+      multi_symbol_portfolio_weights.csv
+      multi_symbol_opportunity_scores.csv
+      multi_symbol_opportunity_selection.csv
+      multi_symbol_group_weights.csv
+      multi_symbol_group_contribution.csv
+      multi_symbol_portfolio_contribution.csv
+      multi_symbol_strategy_return_corr.csv
+      multi_symbol_portfolio_report.png
+  factor_management/
+    <频率>/factor_prune_list.csv
+    factor_hard_delete_pool.csv
+    factor_hard_delete_report.csv
 ```
 
 `multi_symbol_summary.csv` 是跨品种汇总表，主要包含：
@@ -1183,6 +1313,8 @@ active最高入库夏普
 | `multi_symbol_strategy_return_corr.csv` | 各品种综合策略最终测试集收益相关矩阵。 |
 | `multi_symbol_run_manifest.json` | 多品种批量运行清单，包含配置快照、品种状态、错误信息，以及本轮根级输出和各品种关键状态/产物的有界索引；不会递归收录全部历史 runs。 |
 | `multi_symbol_portfolio_report.png` | 多组合方法图表，对比净值、回撤、累计收益和平均绝对仓位。 |
+| `multi_symbol_model_backtest_report.png` | 各品种多因子综合模型最终测试集总览，对比净值、回撤、累计收益和夏普。 |
+| `multi_symbol_model_backtest_summary.csv` | 与模型总览图对应的逐品种最终测试集指标。 |
 | `factor_pruning_candidates.csv` | 本轮多品种回测识别出的新增淘汰候选因子。 |
 | `factor_prune_list.csv` | 全局软淘汰清单，后续构建因子时可自动过滤。 |
 | `factor_hard_delete_pool.csv` | 硬删除池，由 `hard_prune_factors.py` 从软淘汰清单合并生成。 |
@@ -1232,7 +1364,7 @@ python cli.py pooled --symbols C.DCE,M.DCE,Y.DCE,P.DCE,CU.SHF,AL.SHF --pooled-sc
 | `pooled_model_max_train_rows` | 每次滚动训练最多使用多少条 long-format 样本，用作内存和速度上限。 |
 | `pooled_model_include_symbol_features` | 是否加入品种 one-hot 特征，让共享模型学习品种专属修正。 |
 | `pooled_model_include_group_features` | 是否加入板块 one-hot 特征，`market` 模式下更有用。 |
-| `pooled_model_name` | pooled 分类器，支持 `xgboost`、`logistic_regression`、`random_forest`、`extra_trees`。 |
+| `pooled_model_name` | pooled 分类器，支持六类综合模型，包括 `elastic_net_logistic` 和 `hist_gradient_boosting`。 |
 
 主要输出：
 
@@ -1347,6 +1479,8 @@ wind_hf_multifactor_output/
       active_factors_snapshot_manifest.json
 ```
 
+断点状态文件分别位于 `single_factor/<频率>/.pipeline_state.json` 和 `composite_factor/<频率>/.pipeline_state.json`，因此同一品种的日频运行不会覆盖 30 分钟运行状态。
+
 其中 `run_config.json` 记录用户提交给执行器的原始配置；综合回测启用自动冻结后，`effective_run_config.json` 记录实际建模配置，包括本轮冻结快照的绝对路径。两者分开保存，避免执行器收尾时覆盖真实建模口径。
 
 `execution_manifest.json` 记录：
@@ -1373,8 +1507,8 @@ Python 与操作系统版本
 
 ```text
 factor_metadata.py
-  生成 wind_hf_multifactor_output/factor_metadata.csv
-  生成 wind_hf_multifactor_output/factor_metadata_family_summary.csv
+  生成 wind_hf_multifactor_output/factor_management/factor_metadata.csv
+  生成 wind_hf_multifactor_output/factor_management/factor_metadata_family_summary.csv
   记录因子编号、标签、家族、来源文件、是否跨品种、是否宏观、是否日历、估计窗口和复杂度。
 
 data_quality_report.py
@@ -1383,7 +1517,7 @@ data_quality_report.py
   注意：K线间隔异常会包含夜盘/午休/节假日等自然断点，主要用于提示时间轴断点，不等同于数据错误。
 
 leakage_audit.py
-  生成 wind_hf_multifactor_output/leakage_audit_report.csv
+  生成 wind_hf_multifactor_output/audits/leakage_audit_report.csv
   扫描 shift(-n)、bfill、expanding、全样本统计、fit_transform 等高风险写法。
   报告中的“白名单说明”不是自动放行，只表示该处有已知用途，仍建议人工复核。
 
@@ -1462,20 +1596,23 @@ python hard_prune_factors.py --apply
 ```text
 wind_hf_multifactor_output/
   by_symbol/
-    C_DCE/
-      factor_library/
-      single_factor/
-      composite_factor/
-    M_DCE/
-      factor_library/
-      single_factor/
-      composite_factor/
-    multi_symbol_summary.csv
+    symbols/
+      C_DCE/
+        factor_library/<频率>/
+        single_factor/<频率>/.pipeline_state.json
+        composite_factor/<频率>/.pipeline_state.json
+      M_DCE/
+        factor_library/<频率>/
+        single_factor/<频率>/
+        composite_factor/<频率>/
+    summary/<频率>/multi_symbol_summary.csv
+    reports/<频率>/multi_symbol_model_backtest_report.png
+    portfolio/<频率>/multi_symbol_portfolio_report.png
 ```
 
 默认情况下，每个品种都会先运行单因子流程，更新该品种自己的 active 因子库，然后再运行综合因子流程。这样不同品种的因子库、模型结果和图表不会互相覆盖。
 
-如果启用了因子淘汰机制，多品种流程结束后还会更新全局 `factor_prune_list.csv`。建议先运行 `hard_prune_factors.py` 预演并检查报告，再决定是否用 `--apply` 真正清理因子构造源码。
+如果启用了因子淘汰机制，多品种流程结束后还会更新当前频率的 `factor_management/<频率>/factor_prune_list.csv`。建议先运行 `hard_prune_factors.py` 预演并检查报告，再决定是否用 `--apply` 真正清理因子构造源码。
 
 新增一批 AI 因子后的流程：
 
@@ -1523,11 +1660,11 @@ AI 只生成候选因子公式
 
 第三，XGBoost 是非线性合成工具，不是预测力来源本身。真正的预测力仍然来自高质量、稳定、低冗余的因子。
 
-第四，当前成本默认是 0。最终判断策略可用性时必须纳入手续费、滑点、冲击成本、交易限制和真实可成交性。
+第四，当前默认使用 0.5 bps 手续费和 1 bps 滑点作为非零研究占位值，但它不是所有品种的真实成本。最终判断策略可用性时仍必须按合约纳入手续费、滑点、冲击成本、交易限制和真实可成交性。
 
 第五，训练窗口非常关键。你之前观察到“拉长 XGBoost 训练窗口后效果明显改善”，这通常说明短窗口噪声太大，模型需要更多样本才能稳定识别弱信号。
 
-第六，XGBoost 多周期预测目标已经做了训练标签隔离。预测第 t 根 K 线时，训练集不会使用尚未完全落地的尾部标签；隔离长度为 `xgboost_target_horizon - 1`。例如 `horizon=3` 时，训练集最多用到 `t-3` 的标签，避免 `t-2`、`t-1` 标签中包含预测时点之后的未来收益。
+第六，XGBoost 多周期预测目标已经做了训练标签隔离。预测第 t 根 K 线时，训练集不会使用尚未完全落地的尾部标签；隔离长度为 `effective_target_horizon - 1`，有效跨度还会覆盖最小持仓期。例如有效 `horizon=3` 时，训练集最多用到 `t-3` 的标签，避免 `t-2`、`t-1` 标签包含预测时点之后的未来收益。
 
 第七，active 因子库仍然需要注意时间冻结。如果 active 因子库是根据同一段最终测试集表现筛出来的，再用于综合模型测试，会形成研究流程层面的样本外污染。更严格的做法是在某个时间点冻结 active 因子库，再测试冻结之后的未来区间。
 

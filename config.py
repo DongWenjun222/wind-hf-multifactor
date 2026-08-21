@@ -153,15 +153,24 @@ class BacktestConfig:
     # 多品种批量回测时是否先为每个品种运行单因子流程并更新该品种自己的 active 因子库。
     multi_symbol_run_single_factor: bool = True
 
-    # 多品种批量回测时是否为每个品种运行 XGBoost 综合因子流程。
-    multi_symbol_run_composite: bool = False
+    # 多品种批量回测时是否为每个品种运行综合因子模型流程。
+    # 默认开启，以便生成逐品种模型结果、跨品种模型总览图和组合层回测图；
+    # 只想更新单因子库时可临时设为 False 或使用 CLI --no-run-composite。
+    multi_symbol_run_composite: bool = True
 
     # 多品种批量回测时，每个品种是否使用独立输出目录。
-    # 开启后输出目录形如 output_dir/by_symbol/C_DCE/，避免不同品种的因子库和结果互相覆盖。
+    # 开启后输出目录形如 output_dir/by_symbol/symbols/C_DCE/，避免不同品种结果互相覆盖。
     multi_symbol_separate_output_dirs: bool = True
 
     # 多品种批量回测的品种子目录名。仅在 multi_symbol_separate_output_dirs=True 时生效。
     multi_symbol_output_subdir: str = "by_symbol"
+
+    # 多品种输出根目录下的分层子目录。品种结果、批量摘要、组合结果和跨品种图表
+    # 分开保存，避免所有 CSV、PNG 与几十个品种目录混在同一层。
+    multi_symbol_symbols_subdir: str = "symbols"
+    multi_symbol_summary_subdir: str = "summary"
+    multi_symbol_portfolio_subdir: str = "portfolio"
+    multi_symbol_reports_subdir: str = "reports"
 
     # 多品种批量回测是否跳过已经完成的品种流程。
     # 开启后，如果品种目录中已经存在对应结果文件，就直接复用，适合长任务中断后的断点续跑。
@@ -368,17 +377,44 @@ class BacktestConfig:
     pooled_model_name: str = "xgboost"
 
     # 回测开始时间。格式建议使用 "YYYY-MM-DD HH:MM:SS"。
-    start_time: str = "2025-01-02 09:00:00"
+    start_time: str = "2021-01-02 09:00:00"
 
     # 回测结束时间。默认使用运行脚本时的当前时间，适合持续增量更新数据。
     end_time: str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # K线周期，单位为分钟。当前为 30 分钟线。
+    # 研究频率。支持 "30min" 等分钟周期和 "1d" 日频。
+    # 日频会使用 Wind wsd，分钟频率使用 Wind wsi；因子库和结果会按频率隔离。
+    bar_frequency: str = "1d"#"30min"
+
+    # 分钟 K 线周期，仅当 bar_frequency 不是日频时生效。
     bar_size: int = 30
 
     # 从万得或本地数据中需要使用的行情字段。
     # 开盘价/最高价/最低价/收盘价用于收益和形态类因子，成交量/成交额用于量价类因子。
     price_fields: str = "open,high,low,close,volume,amt"
+
+    # 日频行情字段。持仓量和结算价会保留供后续日频因子扩展；如果数据源缺少
+    # 可选字段，标准化阶段仍至少要求 open/high/low/close。
+    daily_price_fields: str = "open,high,low,close,volume,amt,oi,settle"
+
+    # 当天日线可被研究和交易信号使用的最早本地时间（Asia/Shanghai）。
+    # 默认等待至 15:30，避免盘中或结算数据尚未稳定时使用未完成日线；
+    # 夜盘期间 Wind 若已出现下一交易日的临时日线，也会因日期晚于当天而被排除。
+    daily_bar_ready_time: str = "15:30"
+
+    # 日频独立模型使用的窗口参数。切换到 1d 后会自动覆盖对应通用参数，
+    # 避免沿用 30 分钟的 1200/600 根窗口导致日频样本长期无法训练。
+    daily_zscore_window: int = 60
+    daily_xgboost_train_window: int = 504
+    daily_xgboost_min_train_samples: int = 252#120
+    daily_xgboost_retrain_every: int = 20
+    daily_qcut_window: int = 120
+    daily_qcut_min_periods: int = 60
+
+    # 日频概率融合的历史评价窗口和最低成熟样本数。
+    # 126 个交易日约为半年；至少积累 40 个已经实现的标签后才允许动态定权。
+    daily_composite_ensemble_weight_window: int = 126
+    daily_composite_ensemble_min_history: int = 40
 
     # 单因子信号阈值。因子标准化分数高于该值做多，低于负该值做空，中间为空仓。
     # 调大：信号更少、更保守；调小：信号更多、交易更频繁。
@@ -388,11 +424,13 @@ class BacktestConfig:
     # 调大：因子更平滑、更慢；调小：因子更灵敏、噪声也可能更多。
     zscore_window: int = 120
 
-    # 单边手续费，单位 bps。1 bps = 0.01%。当前设为 0，表示不考虑手续费。
-    commission_bps: float = 0.0
+    # 单边手续费，单位 bps。1 bps = 0.01%。
+    # 默认 0.5 bps 是跨品种研究的保守占位值；正式使用时应按品种、合约和费率表校准。
+    commission_bps: float = 0.5
 
-    # 单边滑点，单位 bps。当前设为 0，表示不考虑滑点。
-    slippage_bps: float = 0.0
+    # 单边滑点，单位 bps。
+    # 默认 1 bps 避免把零摩擦毛收益误当成可交易收益；实盘前应按成交量和盘口回放校准。
+    slippage_bps: float = 1.0
 
     # 策略收益的执行口径。
     # "next_open_continuous"：信号在下一根开盘调仓，旧仓位承担跳空，新仓位承担开盘到收盘收益。
@@ -404,6 +442,25 @@ class BacktestConfig:
     cost_stress_bps_list: list[float] = field(
         default_factory=lambda: [0.0, 0.5, 1.0, 2.0, 3.0]
     )
+
+    # 是否在综合策略统计报告中运行移动区块自助法。
+    # 该检验保留收益序列的短期自相关，用于给标准 Sharpe 和平均收益提供置信区间。
+    statistical_enable_block_bootstrap: bool = True
+
+    # 区块自助法重复抽样次数。数值越大区间越稳定，但报告生成时间也越长。
+    statistical_bootstrap_samples: int = 500
+
+    # 区块长度，单位为 K 线；0 表示按样本量平方根自动确定。
+    statistical_bootstrap_block_size: int = 0
+
+    # 统计置信水平。0.95 表示输出 95% 置信区间。
+    statistical_confidence_level: float = 0.95
+
+    # 区块自助法随机种子，固定后相同输入可复现相同统计结果。
+    statistical_bootstrap_seed: int = 20260715
+
+    # 概率校准误差使用的等宽置信度分箱数量。
+    prediction_calibration_bins: int = 10
 
     # 年化交易日数量。用于把单根K线收益年化成夏普、年化收益、年化波动。
     annual_trading_days: int = 252
@@ -418,8 +475,9 @@ class BacktestConfig:
     # 手工指定实验编号。留空表示运行时自动用当前时间生成。
     run_id: Optional[str] = None
 
-    # 行情数据缓存目录。优先复用本地缓存，避免每次从万得重新拉取。
-    data_cache_dir: str = "wind_hf_multifactor_output"
+    # 数据缓存根目录。分钟行情、宏观数据和外部日频数据会继续按类别放入
+    # market/、macro/、external/ 子目录；读取端兼容旧版输出根目录中的缓存。
+    data_cache_dir: str = "wind_hf_multifactor_output/data"
 
     # 是否优先读取本地缓存数据。开启表示先找本地 CSV，找不到再尝试万得。
     prefer_local_data: bool = True
@@ -525,7 +583,9 @@ class BacktestConfig:
 
     # 当 single_factor_scope="range" 时使用的因子编号区间，起止都包含。
     # 因子编号从 1 开始；如果写成 [0, 10000]，程序会自动按 [1, 10000] 处理。
-    single_factor_range: tuple[int, int] = (1, 1000)
+    # 当前仍测试上一批扩展区间；已有四类因子编号为 330001-450000，
+    # 新增五类第二批因子编号为 450001-550000；程序仍只按需构建指定列。
+    single_factor_range: tuple[int, int] = (550001, 600000)
 
     # 当 single_factor_scope="selected" 时使用的单因子名单。
     # 留空表示不额外指定；如果启用 selected，建议填入因子列名列表。
@@ -546,6 +606,7 @@ class BacktestConfig:
             "basic": 10,
             "parametric": 60,
             "non_cross_complex": 45,
+            "expanded": 40,
             "cross_asset": 45,
             "calendar": 25,
             "macro_state": 15,
@@ -559,11 +620,67 @@ class BacktestConfig:
     single_factor_plot_all: bool = False
 
     # 当不全量出图时，只给入库排名前 N 的因子生成图表。
-    # 设为 0 可完全关闭单因子图表生成。
+    # 仅当 single_factor_plot_all_active=False 时生效；设为 0 可完全关闭补充图表生成。
     single_factor_plot_top_n: int = 1#50
+
+    # 是否为最终进入 active_factors.csv 的每一个因子生成单因子回测图。
+    # 默认开启；只对 active 因子补图，不会为数千个 rejected 因子生成图片。
+    single_factor_plot_all_active: bool = True
+
+    # 补充生成 active/pre_active 因子图时，是否复用当前 single_factor/<频率>/
+    # 目录中已经存在的非空 PNG。默认开启，避免每次更新因子库都重复回测和绘图。
+    # 若行情区间发生变化且需要刷新历史图，可临时设为 False 或删除对应图片。
+    single_factor_reuse_existing_plots: bool = True
+
+    # 是否对单因子采用两阶段诊断。
+    # 开启后先计算收益、夏普、交易次数等基础指标；已经确定无法通过入库硬门槛的因子，
+    # 不再计算滚动 qcut、分月 IC/RankIC 等昂贵诊断。该优化不会跳过任何仍可能入库的因子。
+    single_factor_defer_expensive_diagnostics: bool = True
 
     # 因子库子目录名。如果是相对路径，会放在 output_dir 下面。
     factor_library_dir: str = "factor_library"
+
+    # 全量因子主库的存储格式。auto 优先使用压缩 Parquet，缺少引擎时自动
+    # 回退到 gzip Pickle；csv 仅用于兼容旧流程，不建议用于十万级因子库。
+    factor_library_storage_format: str = "auto"
+
+    # 主库成功写成 Parquet 后，是否同时保留 gzip Pickle 兼容副本。
+    # 建议开启：Parquet 依赖 pyarrow/fastparquet，而 Pickle 可保证项目换到没有这些
+    # 可选依赖的 Python 环境后，人工审批和后续单因子更新仍能读取完整主库。
+    factor_library_write_pickle_fallback: bool = True
+
+    # 新主库成功写入后是否删除重复的旧 factor_library_all.csv。
+    # 完整指标仍保存在 Parquet/Pickle 主库中，不会丢失历史记录。
+    factor_library_remove_legacy_csv_after_migration: bool = True
+
+    # rejected_factors.csv 是否只保留人工诊断需要的核心字段。
+    # 完整拒绝因子指标仍可在全量主库中按状态筛选得到。
+    factor_library_compact_rejected_output: bool = True
+
+    # 因子库重筛时是否永久尊重 manual_factor_exclusions.csv 中的人工排除决定。
+    # 建议保持开启，避免人工看图剔除的因子在下一轮因历史指标较好而自动重新入库。
+    factor_library_respect_manual_exclusions: bool = True
+
+    # 是否启用“规则候选 + 人工审批”的两阶段因子治理。
+    # False（默认）：规则筛选通过后直接进入 active_factors.csv，与原有逻辑一致。
+    # True：筛选通过后先进入 pre_active_factors.csv，只有使用
+    # factor_library_manager.py approve 人工确认后才进入 active，并被模型和信号使用。
+    factor_library_require_manual_approval: bool = False
+
+    # active 因子逻辑审查每批交给 Codex 的因子数量。批次越大调用次数越少，
+    # 但单次上下文更长；默认 20 兼顾审查质量和运行速度。
+    factor_logic_review_batch_size: int = 100
+
+    # 因子逻辑审查使用的 Codex 模型。None 表示沿用本机 Codex 默认模型。
+    factor_logic_review_model: Optional[str] = None
+
+    # Codex CLI 可执行文件的显式路径。None 时依次从 CODEX_CLI_PATH、系统 PATH
+    # 和 VS Code Codex 扩展目录自动查找；IDE 启动环境找不到 codex 时可填写完整 exe 路径。
+    factor_logic_review_codex_path: Optional[str] = None
+
+    # AI 判为 rejected 后允许自动剔除 active 的最低置信度。
+    # 低于该值的 rejected 会自动降级为 uncertain，避免主观判断误删有效因子。
+    factor_logic_review_min_reject_confidence: float = 0.85
 
     # 综合回测开始时是否自动冻结当前 active 因子库。
     # 建议保持开启：程序会在构建因子前复制一份不可变输入快照，本轮缓存、选因、
@@ -597,24 +714,28 @@ class BacktestConfig:
     # 因子入库的最低训练累计收益要求。
     factor_library_min_train_total_return: float = 0.0
 
-    # 因子入库的最低训练胜率要求。
-    # 使用严格大于判断，例如 0.5 表示训练胜率必须大于 50%，等于 50% 不入库。
-    factor_library_min_train_win_rate: float = 0.5
+    # 因子入库的最低训练胜率要求；None 表示不把胜率作为硬门槛。
+    # 默认关闭：低胜率、高盈亏比的趋势因子也可能具有正期望，不能仅因胜率低于 50% 被淘汰。
+    # 如确有需要可设为 0.45、0.50 等值，届时仍使用严格大于判断。
+    factor_library_min_train_win_rate: Optional[float] = None
 
-    # 入库选择样本的最低胜率：优先验证，验证无数据时回退训练。
-    factor_library_min_selection_win_rate: float = 0.5
+    # 入库选择样本的最低胜率：优先验证，验证无数据时回退训练；None 表示不限制。
+    # 胜率仍保留在科研评分和诊断报表中，但默认不再与夏普门槛机械地同时过滤。
+    factor_library_min_selection_win_rate: Optional[float] = None
 
     # 已弃用兼容字段。非 None 时覆盖 min_selection_win_rate；不会读取最终测试指标。
     factor_library_min_test_win_rate: Optional[float] = None
 
-    # 入库选择样本的最低交易次数；0 表示不限制。
-    factor_library_min_selection_trades: int = 0
+    # 入库选择样本的最低交易次数；优先验证，验证无数据时回退训练。
+    # 默认至少 10 次，避免少数几笔偶然盈利造成虚高胜率或夏普。
+    factor_library_min_selection_trades: int = 10
 
     # 已弃用兼容字段。非 None 时覆盖 min_selection_trades。
     factor_library_min_test_trades: Optional[int] = None
 
-    # 因子入库的最低训练交易次数要求；0 表示不限制。
-    factor_library_min_train_trades: int = 0
+    # 因子入库的最低训练交易次数要求。
+    # 默认至少 30 次，为收益、夏普和胜率提供最基本的统计样本；可按频率和样本长度调高。
+    factor_library_min_train_trades: int = 30
 
     # 入库选择样本的最低信号覆盖率；0 表示不限制。
     factor_library_min_selection_signal_coverage: float = 0.0
@@ -682,6 +803,10 @@ class BacktestConfig:
     # 适合自动生成新因子后，只增量回测新加入的一批因子。
     single_factor_new_factor_start_index: int = 126978
 
+    # new 模式每次最多测试多少个新增因子。
+    # 二十万级扩展因子必须分批运行；每批完成后进度文件会自动推进起始编号。
+    single_factor_new_factor_batch_size: int = 1000
+
     # 单因子正式回测前，是否先用因子值相关性做预过滤。
     # 开启后，和已保留代表因子高度相关的候选因子会被直接跳过，不进入单因子回测，可显著减少海量重复因子的耗时。
     single_factor_enable_corr_prefilter: bool = True
@@ -726,8 +851,9 @@ class BacktestConfig:
     # 后续 framework/factors.py 构建因子矩阵时会自动跳过这些因子，避免候选库越来越臃肿。
     enable_factor_pruning: bool = True
 
-    # 因子淘汰清单文件。相对路径会放在 output_dir 下；多品种独立目录运行时仍使用总 output_dir 下的全局清单。
-    factor_prune_list_path: str = "factor_prune_list.csv"
+    # 因子淘汰清单文件。相对路径会放在 output_dir 下，并自动追加 30min/1d 频率层；
+    # 多品种独立目录运行时仍共享“当前频率”的总清单，不会跨频率淘汰因子。
+    factor_prune_list_path: str = "factor_management/factor_prune_list.csv"
 
     # 至少需要在多少个品种上完成单因子测试，才允许判断该因子是否应该淘汰。
     # 设置得越大越保守，避免因为少数品种短样本表现差就过早删除。
@@ -768,17 +894,25 @@ class BacktestConfig:
     # 因子入库优先使用验证集表现，最终测试集只作为留存评估，降低测试集污染。
     auto_select_validation_ratio: float = 0.15
 
+    # 单因子相关性预过滤和最终因子库相关性去重允许使用的样本范围。
+    # "train"：只使用训练集；"train_validation"：使用训练集和验证集。
+    # 两种模式都严格排除最终测试集，防止测试期因子分布参与候选集合选择。
+    factor_selection_covariate_scope: str = "train_validation"
+
     # ----------------------------
     # XGBoost 综合因子模型设置。
     # ----------------------------
 
     # 综合因子滚动训练时要对比的模型列表。
-    # xgboost 是原主模型；logistic_regression 是线性基准；
-    # random_forest 和 extra_trees 是两类不依赖额外安装包的树集成模型。
+    # xgboost 是原主模型；logistic_regression 是 L2 线性基准；
+    # elastic_net_logistic 使用 L1+L2 正则做稀疏稳健线性预测；
+    # hist_gradient_boosting、random_forest、extra_trees 提供不同偏差结构的非线性对照。
     composite_model_names: list[str] = field(
         default_factory=lambda: [
             "xgboost",
             "logistic_regression",
+            "elastic_net_logistic",
+            "hist_gradient_boosting",
             "random_forest",
             "extra_trees",
         ]
@@ -795,6 +929,54 @@ class BacktestConfig:
 
     # 逻辑回归的 L2 正则强度倒数。越小正则越强，越不容易过拟合。
     composite_logistic_c: float = 1.0
+
+    # Elastic Net 逻辑回归的正则强度倒数。默认比普通逻辑回归更保守。
+    composite_elastic_net_c: float = 0.10
+
+    # Elastic Net 中 L1 正则占比，0 表示纯 L2，1 表示纯 L1。
+    composite_elastic_net_l1_ratio: float = 0.50
+
+    # 直方图梯度提升模型的最大迭代轮数。
+    composite_hist_max_iter: int = 120
+
+    # 直方图梯度提升模型的学习率。
+    composite_hist_learning_rate: float = 0.05
+
+    # 直方图梯度提升模型单棵树的最大叶节点数，越小越保守。
+    composite_hist_max_leaf_nodes: int = 15
+
+    # 直方图梯度提升模型的 L2 正则强度。
+    composite_hist_l2_regularization: float = 2.0
+
+    # 直方图梯度提升模型叶节点所需的最少样本数。
+    composite_hist_min_samples_leaf: int = 20
+
+    # 是否构建基础模型的动态概率融合。融合只使用各模型已经产生的滚动样本外概率。
+    composite_enable_probability_ensemble: bool = True
+
+    # 参与概率融合的模型；空列表表示使用本次成功运行的全部基础模型。
+    composite_ensemble_model_names: list[str] = field(default_factory=list)
+
+    # 至少有多少个合格基础模型时才输出融合预测，避免退化成单模型伪融合。
+    composite_ensemble_min_models: int = 2
+
+    # 30 分钟模式下评价基础模型近期预测质量的滚动窗口，单位为 K 线根数。
+    composite_ensemble_weight_window: int = 480
+
+    # 动态定权所需的最低已成熟方向标签数量。
+    composite_ensemble_min_history: int = 120
+
+    # 基础模型进入动态融合的最低历史方向准确率。
+    composite_ensemble_min_directional_accuracy: float = 0.48
+
+    # 基础模型概率边际与未来收益相关性的最低要求。
+    composite_ensemble_min_edge_return_corr: float = -0.02
+
+    # 单个基础模型在融合中的权重上限，防止组合再次退化为单模型。
+    composite_ensemble_max_model_weight: float = 0.60
+
+    # 动态绩效权重向合格模型等权组合收缩的比例，越大越稳健。
+    composite_ensemble_equal_weight_shrinkage: float = 0.35
 
     # 是否输出验证集到最终测试集的表现衰减诊断。
     # 该报告用于识别模型是否只在验证段表现好，到了最终留存测试段明显失效。
@@ -823,7 +1005,7 @@ class BacktestConfig:
     xgboost_progress_every: int = 25
 
     # XGBoost 树的数量。调大可能提升拟合能力，但更慢且更容易过拟合。
-    xgboost_n_estimators: int = 80
+    xgboost_n_estimators: int = 250#80
 
     # XGBoost 树构建算法。"hist" 通常比默认精确算法更快，适合当前滚动训练场景。
     xgboost_tree_method: str = "hist"
@@ -891,7 +1073,7 @@ class BacktestConfig:
     xgboost_include_factor_state_features: bool = False
 
     # 当 xgboost_feature_scope="best" 时，候选因子数量上限。
-    xgboost_best_top_n: int = 50
+    xgboost_best_top_n: int = 200#140 # 50
 
     # 是否在每个滚动训练窗口内重新做特征选择。
     # 开启更符合样本外逻辑，也能适应阶段变化；关闭更快，但特征集合更静态。
@@ -1053,11 +1235,11 @@ class BacktestConfig:
 
     # XGBoost 训练时施加给非中性标签（-1 和 1）的类别权重。
     # 大于 1 有助于避免模型过度偏向中性类别。
-    xgboost_train_nonzero_class_weight: float = 1.5
+    xgboost_train_nonzero_class_weight: float = 1.1#1.5
 
     # XGBoost 训练时施加给中性标签（0）的类别权重。
     # 小于 1 可以降低中性类别在噪声数据中的主导性。
-    xgboost_train_neutral_class_weight: float = 0.8
+    xgboost_train_neutral_class_weight: float = 1.0#0.8
 
     # 是否启用训练样本时间衰减权重。
     # 开启后，越靠近当前预测时点的训练样本权重越高，较早历史样本权重逐步降低。
@@ -1069,7 +1251,7 @@ class BacktestConfig:
 
     # 时间衰减的最低权重下限。
     # 避免过早历史样本权重过低，导致训练有效样本数骤降。
-    xgboost_train_time_decay_min_weight: float = 0.25
+    xgboost_train_time_decay_min_weight: float = 0.2#0.25
 
     # 是否把时间衰减后的样本权重均值重新归一到 1。
     # 建议保持开启，这样主要改变新旧样本相对重要性，而不是整体改变模型学习强度。
@@ -1086,8 +1268,17 @@ class BacktestConfig:
     # 是否在训练窗口内自动校准等权投票基准的信号方向。
     benchmark_vote_auto_calibrate_direction: bool = True
 
-    # XGBoost 预测目标的未来收益跨度，单位为 K线根数。
-    # 1 表示预测下一根 K 线从开盘到收盘的收益方向；3/5 通常比单根方向有更高信噪比。
+    # 是否让预测目标跨度至少覆盖策略最小持仓期。
+    # 开启后，有效目标跨度=max(xgboost_target_horizon, xgboost_min_holding_bars)，
+    # 避免模型只预测一根 K 线、执行层却强制持有多根 K 线的目标错配。
+    xgboost_target_align_with_min_holding: bool = True
+
+    # 标签的可交易门槛是否计入一次完整开仓和平仓的双边成本。
+    # 开启后，中性区间至少覆盖 2*(commission_bps+slippage_bps)。
+    xgboost_target_include_round_trip_cost: bool = True
+
+    # XGBoost 预测目标的基础未来收益跨度，单位为 K线根数。
+    # 最终有效跨度还可能由 xgboost_target_align_with_min_holding 自动提高。
     xgboost_target_horizon: int = 1
 
     # XGBoost 标签生成模式。
@@ -1095,10 +1286,10 @@ class BacktestConfig:
     # "quantile"：使用已经落地的历史 horizon 收益滚动分位数作为上下边界，更适合波动状态变化明显的品种。
     xgboost_target_label_mode: str = "threshold"
 
-    # XGBoost 分类目标中的中性区间，单位 bps。
-    # 留空表示使用手续费和滑点之和作为涨跌中性阈值；
-    # 设为 0 则只按未来 horizon 根累计收益正负号分类为 -1/0/1。
-    xgboost_target_neutral_bps: Optional[float] = 3.0  # 留空表示使用手续费和滑点之和
+    # XGBoost 分类目标中超出交易成本之外的额外中性缓冲，单位 bps。
+    # 0 表示仅要求覆盖双边成本；正数可进一步过滤微弱且不稳定的收益机会。
+    # None 与 0 等价，仅为兼容旧配置保留。
+    xgboost_target_neutral_bps: Optional[float] = 0.0
 
     # 是否为 XGBoost 标签启用动态中性区间。
     # 开启后，中性阈值会取“固定 bps 阈值”和“近期波动率阈值”的较大者，
@@ -1109,8 +1300,8 @@ class BacktestConfig:
     # 只使用当前及过去 K 线信息，不会使用未来收益。
     xgboost_target_dynamic_neutral_window: int = 240
 
-    # 动态中性阈值 = 近期 open-to-close 收益波动率 * 该倍率。
-    # 值越大，标签中 0 类越多，模型更保守；值越小，方向样本更多但噪声更大。
+    # 动态中性缓冲 = 事前持有期收益波动率 * 该倍率，并叠加到双边成本和固定缓冲上。
+    # 因而非中性标签代表“波动率标准化后的净收益值得交易”，而不只是价格正负号。
     xgboost_target_dynamic_neutral_multiplier: float = 0.25
 
     # quantile 标签模式使用的历史窗口，单位为 K线根数。
@@ -1163,8 +1354,27 @@ def validate_backtest_config(
         and str(config.trading_signal_mode).lower() in {"compute", "model"}
     )
 
+    frequency = str(getattr(config, "bar_frequency", "") or "").strip().lower()
+    daily_aliases = {"1d", "d", "day", "daily", "日频", "日线"}
+    valid_minute_frequency = (
+        frequency.endswith("min")
+        and frequency[:-3].isdigit()
+        and int(frequency[:-3]) > 0
+    )
+    if frequency not in daily_aliases and not valid_minute_frequency:
+        errors.append("bar_frequency 只能是 '1d' 或形如 '30min' 的分钟频率。")
+    if valid_minute_frequency and int(frequency[:-3]) != int(config.bar_size):
+        errors.append("分钟 bar_frequency 与 bar_size 不一致，请保持两者周期相同。")
     if int(config.bar_size) <= 0:
         errors.append("bar_size 必须大于 0。")
+    if int(config.factor_logic_review_batch_size) <= 0:
+        errors.append("factor_logic_review_batch_size 必须大于 0。")
+    if not 0.0 <= float(config.factor_logic_review_min_reject_confidence) <= 1.0:
+        errors.append("factor_logic_review_min_reject_confidence 必须位于 0 和 1 之间。")
+    try:
+        dt.time.fromisoformat(str(config.daily_bar_ready_time))
+    except (TypeError, ValueError):
+        errors.append("daily_bar_ready_time 必须是有效时间，例如 '15:30'。")
     if str(config.backtest_return_mode).lower() not in {
         "next_open_continuous",
         "intrabar_only",
@@ -1172,6 +1382,21 @@ def validate_backtest_config(
         errors.append(
             "backtest_return_mode 只能是 'next_open_continuous' 或 'intrabar_only'。"
         )
+    if float(config.commission_bps) < 0 or float(config.slippage_bps) < 0:
+        errors.append("commission_bps 和 slippage_bps 不能小于 0。")
+    covariate_scope = str(config.factor_selection_covariate_scope).strip().lower()
+    if covariate_scope not in {"train", "train_validation"}:
+        errors.append(
+            "factor_selection_covariate_scope 只能是 train 或 train_validation。"
+        )
+    if int(config.statistical_bootstrap_samples) <= 0:
+        errors.append("statistical_bootstrap_samples 必须大于 0。")
+    if int(config.statistical_bootstrap_block_size) < 0:
+        errors.append("statistical_bootstrap_block_size 不能小于 0。")
+    if not 0.0 < float(config.statistical_confidence_level) < 1.0:
+        errors.append("statistical_confidence_level 必须位于 0 和 1 之间。")
+    if int(config.prediction_calibration_bins) < 2:
+        errors.append("prediction_calibration_bins 不能小于 2。")
 
     train_ratio = float(config.auto_select_train_ratio)
     validation_ratio = float(config.auto_select_validation_ratio)
@@ -1186,6 +1411,11 @@ def validate_backtest_config(
         normalized_command == "multi" and config.multi_symbol_run_single_factor
     )
     if validate_single_scope:
+        storage_format = str(config.factor_library_storage_format).strip().lower()
+        if storage_format not in {"auto", "parquet", "pickle", "csv"}:
+            errors.append(
+                "factor_library_storage_format 只能是 auto/parquet/pickle/csv。"
+            )
         scope = str(config.single_factor_scope).lower()
         if scope not in {"all", "new", "range", "selected"}:
             errors.append("single_factor_scope 只能是 all/new/range/selected。")
@@ -1227,6 +1457,8 @@ def validate_backtest_config(
             ),
             ("factor_library_min_selection_signal_coverage", selection_coverage),
         ):
+            if value is None:
+                continue
             if not 0.0 <= float(value) <= 1.0:
                 errors.append(f"{name} 必须位于 0 和 1 之间。")
         for name, value in (
@@ -1261,6 +1493,32 @@ def validate_backtest_config(
         normalized_command == "multi" and config.multi_symbol_run_composite
     )
     if validate_model:
+        supported_models = {
+            "xgboost",
+            "logistic_regression",
+            "logistic",
+            "lr",
+            "elastic_net_logistic",
+            "elastic_net",
+            "elasticnet",
+            "enet",
+            "hist_gradient_boosting",
+            "hist_gb",
+            "histgb",
+            "random_forest",
+            "rf",
+            "extra_trees",
+            "et",
+        }
+        unknown_models = sorted(
+            {
+                str(name).strip().lower()
+                for name in (config.composite_model_names or [])
+                if str(name).strip().lower() not in supported_models
+            }
+        )
+        if unknown_models:
+            errors.append("composite_model_names 含不支持的模型: " + ", ".join(unknown_models))
         if int(config.xgboost_train_window) <= 0:
             errors.append("xgboost_train_window 必须大于 0。")
         if int(config.xgboost_min_train_samples) <= 0:
@@ -1269,6 +1527,36 @@ def validate_backtest_config(
             errors.append("xgboost_retrain_every 必须大于 0。")
         if int(config.xgboost_target_horizon) <= 0:
             errors.append("xgboost_target_horizon 必须大于 0。")
+        target_label_mode = str(config.xgboost_target_label_mode).strip().lower()
+        if target_label_mode not in {"threshold", "quantile"}:
+            errors.append("xgboost_target_label_mode 只能是 threshold 或 quantile。")
+        if (
+            config.xgboost_target_neutral_bps is not None
+            and float(config.xgboost_target_neutral_bps) < 0
+        ):
+            errors.append("xgboost_target_neutral_bps 不能小于 0。")
+        if int(config.xgboost_target_dynamic_neutral_window) <= 0:
+            errors.append("xgboost_target_dynamic_neutral_window 必须大于 0。")
+        if float(config.xgboost_target_dynamic_neutral_multiplier) < 0:
+            errors.append("xgboost_target_dynamic_neutral_multiplier 不能小于 0。")
+        if int(config.composite_ensemble_min_models) < 2:
+            errors.append("composite_ensemble_min_models 不能小于 2。")
+        if int(config.composite_ensemble_weight_window) <= 1:
+            errors.append("composite_ensemble_weight_window 必须大于 1。")
+        if int(config.composite_ensemble_min_history) <= 1:
+            errors.append("composite_ensemble_min_history 必须大于 1。")
+        if int(config.composite_ensemble_min_history) > int(
+            config.composite_ensemble_weight_window
+        ):
+            errors.append("composite_ensemble_min_history 不能大于融合评价窗口。")
+        if not 0.0 <= float(config.composite_ensemble_min_directional_accuracy) <= 1.0:
+            errors.append("composite_ensemble_min_directional_accuracy 必须位于 [0, 1]。")
+        if not -1.0 <= float(config.composite_ensemble_min_edge_return_corr) <= 1.0:
+            errors.append("composite_ensemble_min_edge_return_corr 必须位于 [-1, 1]。")
+        if not 0.0 < float(config.composite_ensemble_max_model_weight) <= 1.0:
+            errors.append("composite_ensemble_max_model_weight 必须位于 (0, 1]。")
+        if not 0.0 <= float(config.composite_ensemble_equal_weight_shrinkage) <= 1.0:
+            errors.append("composite_ensemble_equal_weight_shrinkage 必须位于 [0, 1]。")
 
     if normalized_command in {"", "pooled"}:
         pooled_window = config.pooled_model_train_time_window

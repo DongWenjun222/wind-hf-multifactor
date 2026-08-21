@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
+from .output_layout import get_frequency_scoped_dir, get_research_output_dir
 from .data_loader import (
     ensure_wind_started as data_ensure_wind_started,
     fetch_external_daily_data as data_fetch_external_daily_data,
@@ -40,13 +41,21 @@ from .factor_builders import (
     add_complex_cross_asset_factors,
     add_complex_non_cross_factors,
     add_cross_asset_factors,
+    add_expanded_factors,
     add_external_daily_factors,
+    add_family_expansion_factors,
+    add_second_family_expansion_factors,
+    add_third_family_expansion_factors,
     add_hyper_cross_asset_factors,
     add_hyper_non_cross_factors,
     add_macro_state_factors,
     add_omega_cross_asset_factors,
     add_omega_non_cross_factors,
     add_parametric_factors,
+    get_expanded_factor_names,
+    get_family_expansion_names,
+    get_second_family_expansion_names,
+    get_third_family_expansion_names,
 )
 from .factor_builders.cross_asset import get_last_related_data_coverage as get_cross_asset_data_coverage
 
@@ -54,6 +63,36 @@ from .factor_builders.cross_asset import get_last_related_data_coverage as get_c
 LAST_RELATED_DATA_COVERAGE = pd.DataFrame()
 CALENDAR_FACTOR_START_INDEX = 106885
 MACRO_FACTOR_START_INDEX = 126978
+EXPANDED_FACTOR_START_INDEX = 130001
+EXPANDED_FACTOR_END_INDEX = 330000
+FAMILY_EXPANSION_START_INDEX = 330001
+PARAMX_FACTOR_END_INDEX = 360000
+CALENDARX_FACTOR_END_INDEX = 390000
+NONCROSSX_FACTOR_END_INDEX = 420000
+FAMILY_EXPANSION_END_INDEX = 450000
+SECOND_FAMILY_EXPANSION_START_INDEX = 450001
+CROSSY_FACTOR_END_INDEX = 470000
+NONCROSSY_FACTOR_END_INDEX = 490000
+EXPANDED3_FACTOR_END_INDEX = 510000
+PARAMY_FACTOR_END_INDEX = 530000
+SECOND_FAMILY_EXPANSION_END_INDEX = 550000
+THIRD_FAMILY_EXPANSION_START_INDEX = 550001
+CROSSZ_FACTOR_END_INDEX = 560000
+NONCROSSZ_FACTOR_END_INDEX = 570000
+EXPANDED4_FACTOR_END_INDEX = 580000
+PARAMZ_FACTOR_END_INDEX = 590000
+THIRD_FAMILY_EXPANSION_END_INDEX = 600000
+TOTAL_FACTOR_END_INDEX = THIRD_FAMILY_EXPANSION_END_INDEX
+
+
+def get_on_demand_factor_names() -> tuple[str, ...]:
+    """返回编号 130001 起的全部按需因子，旧扩展名称始终位于最前。"""
+    return (
+        get_expanded_factor_names()
+        + get_family_expansion_names()
+        + get_second_family_expansion_names()
+        + get_third_family_expansion_names()
+    )
 
 
 # 数据读取逻辑位于 framework/data_loader.py；这里转导常用入口供上层脚本使用。
@@ -219,6 +258,8 @@ def get_single_factor_start_index_progress_path(config: Any) -> Path:
     )
     if progress_path.is_absolute():
         return progress_path
+    if progress_path.parts and progress_path.parts[0] == "factor_library":
+        return get_research_output_dir(config, "factor_library") / progress_path.name
     return Path(getattr(config, "output_dir", ".")) / progress_path
 
 
@@ -354,11 +395,14 @@ def update_single_factor_start_index_progress(
 
 
 def get_factor_prune_list_path(config: Any) -> Path:
-    """返回全局因子淘汰清单路径。"""
-    prune_path = Path(getattr(config, "factor_prune_list_path", "factor_prune_list.csv"))
+    """返回按频率隔离的全局因子淘汰清单路径。"""
+    prune_path = Path(
+        getattr(config, "factor_prune_list_path", "factor_management/factor_prune_list.csv")
+    )
     if prune_path.is_absolute():
         return prune_path
-    return Path(getattr(config, "output_dir", ".")) / prune_path
+    full_path = Path(getattr(config, "output_dir", ".")) / prune_path
+    return get_frequency_scoped_dir(full_path.parent, config) / full_path.name
 
 
 def load_pruned_factor_names(config: Any) -> set[str]:
@@ -619,37 +663,87 @@ def resolve_single_factor_requested_factors(
         return selected, None
     if scope == "range":
         start_factor_id, end_factor_id = get_single_factor_range(config)
-        catalog_columns = build_factor_name_catalog(data, config, max_count=end_factor_id)
-        requested = catalog_columns[start_factor_id - 1 : end_factor_id]
+        expanded_names = get_on_demand_factor_names()
+        if start_factor_id >= EXPANDED_FACTOR_START_INDEX:
+            start_offset = start_factor_id - EXPANDED_FACTOR_START_INDEX
+            end_offset = min(len(expanded_names), end_factor_id - EXPANDED_FACTOR_START_INDEX + 1)
+            requested = list(expanded_names[start_offset:end_offset])
+            factor_id_map = {
+                factor_name: EXPANDED_FACTOR_START_INDEX + start_offset + relative_offset
+                for relative_offset, factor_name in enumerate(requested)
+            }
+        else:
+            legacy_end = min(end_factor_id, EXPANDED_FACTOR_START_INDEX - 1)
+            catalog_columns = build_factor_name_catalog(data, config, max_count=legacy_end)
+            requested = catalog_columns[start_factor_id - 1 : legacy_end]
+            factor_id_map = {
+                factor_name: factor_id
+                for factor_id, factor_name in enumerate(catalog_columns, start=1)
+            }
+            if end_factor_id >= EXPANDED_FACTOR_START_INDEX:
+                expanded_end = min(
+                    len(expanded_names),
+                    end_factor_id - EXPANDED_FACTOR_START_INDEX + 1,
+                )
+                requested.extend(expanded_names[:expanded_end])
+                factor_id_map.update(
+                    {
+                        factor_name: EXPANDED_FACTOR_START_INDEX + offset
+                        for offset, factor_name in enumerate(expanded_names[:expanded_end])
+                    }
+                )
         pruned_names = load_pruned_factor_names(config)
         if pruned_names:
             requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
-        factor_id_map = {
-            factor_name: factor_id
-            for factor_id, factor_name in enumerate(catalog_columns, start=1)
-        }
         return requested, factor_id_map
     if scope != "new":
         return None, None
 
     start_factor_id = get_single_factor_new_factor_start_index(config)
-    if start_factor_id >= MACRO_FACTOR_START_INDEX:
-        macro_columns = build_macro_factor_name_catalog(data, config)
-        offset = start_factor_id - MACRO_FACTOR_START_INDEX
-        requested = macro_columns[offset:]
+    batch_size = max(
+        1,
+        int(getattr(config, "single_factor_new_factor_batch_size", 1000) or 1000),
+    )
+    if start_factor_id >= EXPANDED_FACTOR_START_INDEX:
+        expanded_names = get_on_demand_factor_names()
+        start_offset = start_factor_id - EXPANDED_FACTOR_START_INDEX
+        end_offset = min(len(expanded_names), start_offset + batch_size)
+        requested = list(expanded_names[start_offset:end_offset])
+        factor_id_map = {
+            factor_name: EXPANDED_FACTOR_START_INDEX + start_offset + relative_offset
+            for relative_offset, factor_name in enumerate(requested)
+        }
         pruned_names = load_pruned_factor_names(config)
         if pruned_names:
             requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
+        return requested, factor_id_map
+    if start_factor_id >= MACRO_FACTOR_START_INDEX:
+        macro_columns = build_macro_factor_name_catalog(data, config)
+        offset = start_factor_id - MACRO_FACTOR_START_INDEX
+        requested = macro_columns[offset : offset + batch_size]
         factor_id_map = {
             factor_name: MACRO_FACTOR_START_INDEX + factor_offset
             for factor_offset, factor_name in enumerate(macro_columns)
         }
+        if len(requested) < batch_size:
+            expanded_names = get_on_demand_factor_names()
+            expanded_requested = expanded_names[: batch_size - len(requested)]
+            requested.extend(expanded_requested)
+            factor_id_map.update(
+                {
+                    factor_name: EXPANDED_FACTOR_START_INDEX + factor_offset
+                    for factor_offset, factor_name in enumerate(expanded_requested)
+                }
+            )
+        pruned_names = load_pruned_factor_names(config)
+        if pruned_names:
+            requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
         return requested, factor_id_map
 
     if start_factor_id >= CALENDAR_FACTOR_START_INDEX:
         calendar_columns = build_calendar_factor_name_catalog(data, config)
         offset = start_factor_id - CALENDAR_FACTOR_START_INDEX
-        requested = calendar_columns[offset:]
+        requested = calendar_columns[offset : offset + batch_size]
         pruned_names = load_pruned_factor_names(config)
         if pruned_names:
             requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
@@ -660,7 +754,7 @@ def resolve_single_factor_requested_factors(
         return requested, factor_id_map
 
     catalog_columns = build_factor_name_catalog(data, config)
-    requested = catalog_columns[start_factor_id - 1 :]
+    requested = catalog_columns[start_factor_id - 1 : start_factor_id - 1 + batch_size]
     pruned_names = load_pruned_factor_names(config)
     if pruned_names:
         requested = [factor_name for factor_name in requested if factor_name not in pruned_names]
@@ -675,7 +769,7 @@ def load_existing_active_factor_metadata(config: Any) -> pd.DataFrame:
     """读取已有 active 因子的名称和稳定编号，供增量相关性复核使用。"""
     library_dir = Path(getattr(config, "factor_library_dir", "factor_library"))
     if not library_dir.is_absolute():
-        library_dir = Path(getattr(config, "output_dir", ".")) / library_dir
+        library_dir = get_research_output_dir(config, str(library_dir))
     active_path = library_dir / "active_factors.csv"
     if not active_path.exists():
         return pd.DataFrame(columns=["因子", "因子编号"])
@@ -828,6 +922,22 @@ def build_factors(
                 "ultra_",
                 "hyper_",
                 "omega_",
+                "expanded_",
+                "expanded2_",
+                "paramx_",
+                "calendarx_",
+                "noncrossx_",
+                "crossx_",
+                "crossy_",
+                "noncrossy_",
+                "expanded3_",
+                "paramy_",
+                "calendary_",
+                "crossz_",
+                "noncrossz_",
+                "expanded4_",
+                "paramz_",
+                "calendarz_",
             )
         )
     )
@@ -945,6 +1055,74 @@ def build_factors(
         if not omega_cross_asset_factors.empty:
             print(f"终极跨品种因子数量: {omega_cross_asset_factors.shape[1]}")
             factor_parts.append(omega_cross_asset_factors)
+
+    expanded_factors = pd.DataFrame(index=df.index)
+    if has_requested_prefix(("expanded_", "expanded2_")):
+        expanded_factors = filter_requested(
+            add_expanded_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+            )
+        )
+    if not expanded_factors.empty:
+        print(f"扩展量价因子数量: {expanded_factors.shape[1]}")
+        factor_parts.append(expanded_factors)
+
+    family_expansion_factors = pd.DataFrame(index=df.index)
+    family_prefixes = ("paramx_", "calendarx_", "noncrossx_", "crossx_")
+    if has_requested_prefix(family_prefixes):
+        if has_requested_prefix(("crossx_",)) and related_data_map is None:
+            related_data_map = fetch_related_intraday_data(config)
+        family_expansion_factors = filter_requested(
+            add_family_expansion_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+                related_data_map=related_data_map,
+            )
+        )
+    if not family_expansion_factors.empty:
+        print(f"四类扩展因子数量: {family_expansion_factors.shape[1]}")
+        factor_parts.append(family_expansion_factors)
+
+    second_family_factors = pd.DataFrame(index=df.index)
+    second_family_prefixes = (
+        "crossy_", "noncrossy_", "expanded3_", "paramy_", "calendary_"
+    )
+    if has_requested_prefix(second_family_prefixes):
+        if has_requested_prefix(("crossy_",)) and related_data_map is None:
+            related_data_map = fetch_related_intraday_data(config)
+        second_family_factors = filter_requested(
+            add_second_family_expansion_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+                related_data_map=related_data_map,
+            )
+        )
+    if not second_family_factors.empty:
+        print(f"五类第二批扩展因子数量: {second_family_factors.shape[1]}")
+        factor_parts.append(second_family_factors)
+
+    third_family_factors = pd.DataFrame(index=df.index)
+    third_family_prefixes = (
+        "crossz_", "noncrossz_", "expanded4_", "paramz_", "calendarz_"
+    )
+    if has_requested_prefix(third_family_prefixes):
+        if has_requested_prefix(("crossz_",)) and related_data_map is None:
+            related_data_map = fetch_related_intraday_data(config)
+        third_family_factors = filter_requested(
+            add_third_family_expansion_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+                related_data_map=related_data_map,
+            )
+        )
+    if not third_family_factors.empty:
+        print(f"五类第三批扩展因子数量: {third_family_factors.shape[1]}")
+        factor_parts.append(third_family_factors)
 
     calendar_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("calendar_",)):

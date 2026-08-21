@@ -34,6 +34,15 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     if factor_name in BASIC_FACTORS:
         family = "basic"
         source_file = "framework/factor_builders/basic.py"
+    elif factor_name.startswith("calendarz_"):
+        family = "calendar"
+        source_file = "framework/factor_builders/family_expansion3.py"
+    elif factor_name.startswith("calendary_"):
+        family = "calendar"
+        source_file = "framework/factor_builders/family_expansion2.py"
+    elif factor_name.startswith("calendarx_"):
+        family = "calendar"
+        source_file = "framework/factor_builders/family_expansion.py"
     elif factor_name.startswith("calendar_"):
         family = "calendar"
         source_file = "framework/factor_builders/calendar.py"
@@ -43,18 +52,54 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith("external_"):
         family = "external_daily"
         source_file = "framework/factor_builders/external_daily.py"
+    elif factor_name.startswith("crossz_"):
+        family = "cross_asset"
+        source_file = "framework/factor_builders/family_expansion3.py"
+    elif factor_name.startswith("crossy_"):
+        family = "cross_asset"
+        source_file = "framework/factor_builders/family_expansion2.py"
+    elif factor_name.startswith("crossx_"):
+        family = "cross_asset"
+        source_file = "framework/factor_builders/family_expansion.py"
     elif factor_name.startswith(("cross_", "crossmega_", "crossultra_", "crosshyper_", "crossomega_")):
         family = "cross_asset"
         source_file = "framework/factor_builders/cross_asset.py"
+    elif factor_name.startswith("noncrossz_"):
+        family = "non_cross_complex"
+        source_file = "framework/factor_builders/family_expansion3.py"
+    elif factor_name.startswith("noncrossy_"):
+        family = "non_cross_complex"
+        source_file = "framework/factor_builders/family_expansion2.py"
+    elif factor_name.startswith("noncrossx_"):
+        family = "non_cross_complex"
+        source_file = "framework/factor_builders/family_expansion.py"
     elif factor_name.startswith(("ultra_", "hyper_", "omega_")):
         family = "non_cross_complex"
         source_file = "framework/factor_builders/non_cross.py"
+    elif factor_name.startswith("expanded4_"):
+        family = "expanded"
+        source_file = "framework/factor_builders/family_expansion3.py"
+    elif factor_name.startswith("expanded3_"):
+        family = "expanded"
+        source_file = "framework/factor_builders/family_expansion2.py"
+    elif factor_name.startswith(("expanded_", "expanded2_")):
+        family = "expanded"
+        source_file = "framework/factor_builders/expanded.py"
+    elif factor_name.startswith("paramz_"):
+        family = "parametric"
+        source_file = "framework/factor_builders/family_expansion3.py"
+    elif factor_name.startswith("paramy_"):
+        family = "parametric"
+        source_file = "framework/factor_builders/family_expansion2.py"
+    elif factor_name.startswith("paramx_"):
+        family = "parametric"
+        source_file = "framework/factor_builders/family_expansion.py"
     else:
         family = "parametric"
         source_file = "framework/factor_builders/parametric.py"
 
     tokens = factor_name.split("_")
-    window_match = re.search(r"_(\d+)$", factor_name)
+    window_match = re.search(r"_w(\d+)_", factor_name) or re.search(r"_(\d+)$", factor_name)
     window = int(window_match.group(1)) if window_match else None
     return {
         "因子": factor_name,

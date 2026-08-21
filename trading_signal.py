@@ -24,8 +24,15 @@ from composite_factor_backtest import (
 )
 from config import BacktestConfig, resolve_symbol_universe
 from framework.factor_library import conservative_pair, get_factor_library_dir
-from framework.factors import build_factors, fetch_intraday_data, safe_symbol_name, score_to_raw_signal, stop_wind
+from framework.factors import build_factors, fetch_intraday_data, score_to_raw_signal, stop_wind
 from framework.runtime_utils import configure_warning_output
+from framework.output_layout import (
+    apply_frequency_runtime_defaults,
+    get_research_output_dir,
+    get_symbol_output_dir as get_organized_symbol_output_dir,
+    get_trading_signal_output_dir,
+    resolve_existing_symbol_output_dir,
+)
 from single_factor_backtest import split_train_validation_test_index
 
 
@@ -82,16 +89,15 @@ def normalize_signal_symbols(symbols: str | list[str] | None, config: BacktestCo
 def get_symbol_composite_detail_path(config: BacktestConfig, symbol: str, source: str) -> Path:
     """根据来源模式返回某个品种的综合回测明细路径。"""
     source = str(source).lower()
-    single_path = Path(config.output_dir) / "composite_factor" / "composite_detail.csv"
+    single_path = get_research_output_dir(config, "composite_factor") / "composite_detail.csv"
     if source == "single":
         return single_path
 
-    symbol_dir = safe_symbol_name(symbol).upper()
     multi_path = (
-        Path(config.output_dir)
-        / getattr(config, "multi_symbol_output_subdir", "by_symbol")
-        / symbol_dir
-        / "composite_factor"
+        get_research_output_dir(
+            replace(config, output_dir=str(resolve_existing_symbol_output_dir(config, symbol))),
+            "composite_factor",
+        )
         / "composite_detail.csv"
     )
     if source == "multi":
@@ -108,18 +114,16 @@ def get_symbol_composite_detail_path(config: BacktestConfig, symbol: str, source
 
 def get_symbol_output_dir(config: BacktestConfig, symbol: str) -> Path:
     """返回多品种模式下某个品种自己的输出目录。"""
-    return (
-        Path(config.output_dir)
-        / getattr(config, "multi_symbol_output_subdir", "by_symbol")
-        / safe_symbol_name(symbol).upper()
-    )
+    return get_organized_symbol_output_dir(config, symbol)
 
 
 def build_symbol_compute_config(config: BacktestConfig, symbol: str, source: str) -> BacktestConfig:
     """为现场计算交易信号创建单品种配置。"""
     source = str(source).lower()
-    symbol_config = replace(config, symbol=str(symbol).upper())
-    multi_output_dir = get_symbol_output_dir(config, symbol)
+    symbol_config = apply_frequency_runtime_defaults(
+        replace(config, symbol=str(symbol).upper())
+    )
+    multi_output_dir = resolve_existing_symbol_output_dir(config, symbol)
 
     if source == "multi":
         symbol_config.output_dir = str(multi_output_dir)
@@ -311,7 +315,7 @@ def load_cached_factor_inputs(
     if not bool(getattr(symbol_config, "trading_signal_use_factor_cache", True)):
         return None
 
-    output_dir = Path(symbol_config.output_dir) / "composite_factor"
+    output_dir = get_research_output_dir(symbol_config, "composite_factor")
     cache_path = output_dir / "active_factor_matrix_cache.pkl"
     detail_path = output_dir / "composite_detail.csv"
 
@@ -855,7 +859,7 @@ def save_trading_signals(
     if output_path:
         path = Path(output_path)
     else:
-        path = Path(config.output_dir) / "trading_signals" / "trading_signals_latest.csv"
+        path = get_trading_signal_output_dir(config) / "trading_signals_latest.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     signals.to_csv(path, index=False, encoding="utf-8-sig")
     return path
@@ -918,10 +922,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         choices=["auto", "single", "multi"],
         default="auto",
-        help="信号来源：single 读根目录 composite_factor；multi 读 by_symbol；auto 优先 by_symbol。",
+        help=(
+            "信号来源：single 读根目录 composite_factor；"
+            "multi 读 by_symbol/symbols；auto 优先多品种目录。"
+        ),
     )
     parser.add_argument("--output", help="输出 CSV 路径；不填则写入 output_dir/trading_signals/trading_signals_latest.csv。")
     parser.add_argument("--output-dir", help="覆盖 config.output_dir。")
+    parser.add_argument(
+        "--frequency",
+        choices=["1d", "30min", "60min", "15min", "5min"],
+        help="信号频率；1d 使用独立日频行情、因子库和模型产物。",
+    )
     parser.add_argument(
         "--rebuild-missing-factors",
         action=argparse.BooleanOptionalAction,
@@ -941,6 +953,10 @@ def main() -> None:
     configure_warning_output(config)
     if args.output_dir:
         config.output_dir = args.output_dir
+    if args.frequency:
+        config.bar_frequency = args.frequency
+        if args.frequency.endswith("min"):
+            config.bar_size = int(args.frequency.removesuffix("min"))
     if args.rebuild_missing_factors is not None:
         config.trading_signal_rebuild_missing_factors = args.rebuild_missing_factors
     run_trading_signal_export(

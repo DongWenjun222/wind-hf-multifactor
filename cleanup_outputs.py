@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report-file",
-        default="output_cleanup_report.csv",
+        default="maintenance/output_cleanup_report.csv",
         help="清理报告文件名。相对路径会放在 output-dir 下。",
     )
     parser.add_argument(
