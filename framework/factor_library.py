@@ -3,7 +3,8 @@ from __future__ import annotations
 """因子库管理模块。
 
 本文件负责把单因子回测结果沉淀成可长期维护的因子库：
-- 同时参考训练集和验证集表现做入库筛选，最终测试集只作为留存评估。
+- 新结果优先使用研究期内多折 Walk-Forward 样本外表现；最终测试集默认只作
+  留存评估，也可通过显式配置把它作为不参与排序的确认门槛。
 - 合并历史因子库，避免每次回测覆盖已有记录。
 - 对候选因子做收益门槛和相关性去重，只保留表现较好且差异足够大的因子。
 - 输出 active CSV、压缩全量主库和精简 rejected CSV，兼顾程序更新与人工复盘。
@@ -16,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from config import BacktestConfig
-from .output_layout import get_frequency_scoped_dir
+from .output_layout import get_frequency_scoped_dir, get_research_output_dir
 from .factor_taxonomy import get_factor_family
 from .factors import score_to_raw_signal
 
@@ -78,11 +79,87 @@ def consistency_score(frame: pd.DataFrame, train_column: str, validation_column:
     return score.clip(lower=0.0, upper=1.0)
 
 
+def get_walk_forward_selection_masks(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> tuple[pd.Series, pd.Series]:
+    """区分需按新口径筛选的记录，以及其中真正可用的 Walk-Forward 记录。"""
+    disabled = pd.Series(False, index=frame.index, dtype="bool")
+    if (
+        not bool(getattr(config, "single_factor_walk_forward_enabled", True))
+        or "WalkForward状态" not in frame.columns
+    ):
+        return disabled, disabled.copy()
+
+    status = frame["WalkForward状态"].fillna("").astype(str).str.strip()
+    expected = status.ne("") & status.ne("已关闭")
+    fold_count = pd.to_numeric(
+        frame.get(
+            "WalkForward有效折数",
+            pd.Series(0.0, index=frame.index),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
+    min_folds = max(
+        1,
+        int(getattr(config, "factor_library_min_walk_forward_folds", 3) or 3),
+    )
+    sharpe = pd.to_numeric(
+        frame.get("WalkForward夏普比率", pd.Series(np.nan, index=frame.index)),
+        errors="coerce",
+    )
+    total_return = pd.to_numeric(
+        frame.get("WalkForward累计收益", pd.Series(np.nan, index=frame.index)),
+        errors="coerce",
+    )
+    valid = (
+        expected
+        & status.eq("已计算")
+        & fold_count.ge(min_folds)
+        & sharpe.replace([np.inf, -np.inf], np.nan).notna()
+        & total_return.replace([np.inf, -np.inf], np.nan).notna()
+    )
+    return expected.astype("bool"), valid.astype("bool")
+
+
+def apply_walk_forward_primary_metrics(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """让新结果优先使用多折样本外指标，同时保留旧主库的兼容口径。"""
+    expected, valid = get_walk_forward_selection_masks(frame, config)
+    if not expected.any():
+        return frame, expected, valid
+
+    frame.loc[expected, ["初筛夏普", "初筛累计收益", "初筛RankIC"]] = np.nan
+    frame.loc[expected, "初筛样本"] = "WalkForward无效"
+    frame.loc[expected, "初筛有效"] = False
+    if valid.any():
+        walk_forward_sharpe = pd.to_numeric(
+            frame.get("WalkForward夏普比率", pd.Series(np.nan, index=frame.index)),
+            errors="coerce",
+        )
+        walk_forward_return = pd.to_numeric(
+            frame.get("WalkForward累计收益", pd.Series(np.nan, index=frame.index)),
+            errors="coerce",
+        )
+        walk_forward_rank_ic = pd.to_numeric(
+            frame.get("WalkForwardRankIC中位数", pd.Series(np.nan, index=frame.index)),
+            errors="coerce",
+        )
+        frame.loc[valid, "初筛夏普"] = walk_forward_sharpe.loc[valid]
+        frame.loc[valid, "初筛累计收益"] = walk_forward_return.loc[valid]
+        frame.loc[valid, "初筛RankIC"] = walk_forward_rank_ic.loc[valid]
+        frame.loc[valid, "初筛样本"] = "WalkForward样本外"
+        frame.loc[valid, "初筛有效"] = True
+    return frame, expected, valid
+
+
 def add_factor_research_scores(frame: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
     """为因子增加科研化综合评分。
 
-    评分只使用训练集和验证集的表现；如果缺少验证集，则回退训练集。
-    最终测试集仍保留在报表中，但不参与入库主排序，避免测试集污染。
+    新记录优先使用研究期内多折 Walk-Forward 指标；历史记录尚未重测时，
+    兼容使用训练集和验证集表现。最终测试集不参与主排序，避免测试集污染。
     """
     scored = frame.copy()
 
@@ -116,6 +193,73 @@ def add_factor_research_scores(frame: pd.DataFrame, config: BacktestConfig) -> p
         + 0.40 * (1.0 - pd.to_numeric(concentration, errors="coerce").clip(lower=0.0, upper=1.0)).fillna(0.0)
     )
 
+    walk_forward_expected, walk_forward_valid = get_walk_forward_selection_masks(
+        scored,
+        config,
+    )
+    if walk_forward_expected.any():
+        performance_score.loc[walk_forward_expected] = 0.0
+        predictive_score.loc[walk_forward_expected] = 0.0
+        consistency.loc[walk_forward_expected] = 0.0
+        stability_score.loc[walk_forward_expected] = 0.0
+    if walk_forward_valid.any():
+        def walk_forward_numeric(column: str) -> pd.Series:
+            return pd.to_numeric(
+                scored.get(column, pd.Series(np.nan, index=scored.index)),
+                errors="coerce",
+            )
+
+        wf_sharpe = walk_forward_numeric("WalkForward夏普比率")
+        wf_return = walk_forward_numeric("WalkForward累计收益")
+        wf_rank_ic = walk_forward_numeric("WalkForwardRankIC中位数")
+        wf_hit_rate = walk_forward_numeric("WalkForward方向命中率")
+        wf_positive_share = pd.to_numeric(
+            walk_forward_numeric("WalkForward盈利折占比"),
+            errors="coerce",
+        ).clip(0.0, 1.0)
+        wf_rank_ic_positive_share = pd.to_numeric(
+            walk_forward_numeric("WalkForwardRankIC正向折占比"),
+            errors="coerce",
+        ).clip(0.0, 1.0)
+        wf_direction_consistency = pd.to_numeric(
+            walk_forward_numeric("WalkForward方向一致率"),
+            errors="coerce",
+        ).clip(0.0, 1.0)
+        wf_median_sharpe = walk_forward_numeric("WalkForward夏普中位数")
+        wf_worst_sharpe = walk_forward_numeric("WalkForward夏普最差值")
+
+        wf_performance_score = (
+            0.65 * normalize_score_series(wf_sharpe)
+            + 0.35 * normalize_score_series(wf_return)
+        )
+        wf_predictive_score = (
+            0.45 * normalize_score_series(wf_rank_ic)
+            + 0.25 * normalize_score_series(wf_hit_rate)
+            + 0.15 * wf_rank_ic_positive_share.fillna(0.0)
+            + 0.15 * wf_positive_share.fillna(0.0)
+        )
+        wf_consistency_score = (
+            0.60 * wf_direction_consistency.fillna(0.0)
+            + 0.40 * wf_positive_share.fillna(0.0)
+        )
+        wf_stability_score = (
+            0.50 * wf_positive_share.fillna(0.0)
+            + 0.25 * normalize_score_series(wf_median_sharpe)
+            + 0.25 * normalize_score_series(wf_worst_sharpe)
+        )
+        performance_score.loc[walk_forward_valid] = wf_performance_score.loc[
+            walk_forward_valid
+        ]
+        predictive_score.loc[walk_forward_valid] = wf_predictive_score.loc[
+            walk_forward_valid
+        ]
+        consistency.loc[walk_forward_valid] = wf_consistency_score.loc[
+            walk_forward_valid
+        ]
+        stability_score.loc[walk_forward_valid] = wf_stability_score.loc[
+            walk_forward_valid
+        ]
+
     weights = {
         "performance": max(0.0, float(getattr(config, "factor_library_score_weight_performance", 0.40) or 0.0)),
         "predictive": max(0.0, float(getattr(config, "factor_library_score_weight_predictive", 0.30) or 0.0)),
@@ -144,11 +288,12 @@ def rank_single_factor_summary(
     summary: pd.DataFrame,
     config: BacktestConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """按照单因子训练集和验证集表现做初筛排序。
+    """优先按照多折 Walk-Forward 样本外表现做初筛排序。
 
     排序逻辑：
-    1. 优先使用验证集与训练集表现的较弱值排序，避免单段偶然表现决定入库。
-    2. 如果没有有效验证数据，则只使用训练集；最终测试集永不参与排序。
+    1. 新回测记录使用最终测试集之前的多折 Walk-Forward 汇总指标。
+    2. 历史记录尚未按新口径重测时，兼容使用训练/验证较弱值。
+       最终测试集永不参与排序。
     3. 仅把前 single_factor_keep_top_n 个标记为 active，其余先标记为 rejected。
 
     这里还没有做相关性去重，相关性过滤会在 build_factor_library 中完成。
@@ -217,6 +362,7 @@ def rank_single_factor_summary(
     ranked["初筛样本"] = selection_sample
     ranked["因子家族"] = ranked["因子"].map(get_factor_family)
     ranked["初筛有效"] = sharpe.notna() & total_return.notna()
+    ranked, _, _ = apply_walk_forward_primary_metrics(ranked, config)
     ranked = add_factor_research_scores(ranked, config)
     ranked = ranked.sort_values(
         [
@@ -249,9 +395,10 @@ def get_factor_library_dir(config: BacktestConfig) -> Path:
     如果是相对路径，会自动挂到 config.output_dir 下面。
     """
     library_dir = Path(config.factor_library_dir)
-    if not library_dir.is_absolute():
-        library_dir = Path(config.output_dir) / library_dir
-    library_dir = get_frequency_scoped_dir(library_dir, config)
+    if library_dir.is_absolute():
+        library_dir = get_frequency_scoped_dir(library_dir, config)
+    else:
+        library_dir = get_research_output_dir(config, str(library_dir))
     library_dir.mkdir(parents=True, exist_ok=True)
     return library_dir
 
@@ -569,7 +716,14 @@ def build_compact_rejected_library(rejected_library: pd.DataFrame) -> pd.DataFra
         "因子编号", "因子", "因子家族", "初筛样本", "初筛夏普", "初筛累计收益",
         "初筛RankIC", "初筛分组单调性", "初筛预测能力评分", "初筛一致性评分",
         "初筛科研综合评分", "训练夏普比率", "验证夏普比率",
-        "训练胜率", "验证胜率", "训练交易次数", "验证交易次数", "因子库状态",
+        "测试夏普比率", "测试累计收益", "训练胜率", "验证胜率", "测试胜率",
+        "训练交易次数", "验证交易次数", "测试交易次数", "因子库状态",
+        "WalkForward状态", "WalkForward有效折数", "WalkForward夏普比率",
+        "WalkForward夏普中位数", "WalkForward夏普最差值",
+        "WalkForward累计收益", "WalkForward盈利折占比",
+        "WalkForward方向一致率", "WalkForwardRankIC中位数",
+        "WalkForward方向命中率", "WalkForward交易次数",
+        "最终测试入库要求生效", "最终测试入库表现通过", "最终测试入库拒绝原因",
         "拒绝原因", "详细诊断状态", "人工排除原因", "人工排除时间",
         "最大库内相关性", "家族数量上限", "错误",
     ]
@@ -649,6 +803,113 @@ def get_selection_config_value(
     return getattr(config, canonical_name)
 
 
+def build_final_test_performance_reject_reasons(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.Series:
+    """向量化检查最终测试表现；空字符串表示通过或未启用。"""
+    reasons = pd.Series("", index=frame.index, dtype="object")
+    if not bool(getattr(config, "factor_library_require_test_performance", False)):
+        return reasons
+
+    def numeric(column: str) -> pd.Series:
+        values = frame.get(column, pd.Series(np.nan, index=frame.index))
+        return pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    def reject(mask: pd.Series, reason: str) -> None:
+        reasons.loc[reasons.eq("") & mask.fillna(False)] = reason
+
+    test_sharpe = numeric("测试夏普比率")
+    test_return = numeric("测试累计收益")
+    reject(test_sharpe.isna() | test_return.isna(), "missing_final_test_metrics")
+    reject(test_sharpe < float(config.factor_library_min_sharpe), "low_test_sharpe")
+    reject(
+        test_return < float(config.factor_library_min_total_return),
+        "low_test_total_return",
+    )
+
+    min_win_rate = get_selection_config_value(
+        config,
+        "factor_library_min_selection_win_rate",
+        "factor_library_min_test_win_rate",
+    )
+    if min_win_rate is not None:
+        test_win_rate = numeric("测试胜率")
+        reject(test_win_rate.isna(), "missing_final_test_metrics")
+        reject(test_win_rate <= float(min_win_rate), "low_test_win_rate")
+
+    min_rank_ic = getattr(config, "factor_library_min_selection_rank_ic", None)
+    if min_rank_ic is not None:
+        test_rank_ic = numeric("测试RankIC")
+        reject(test_rank_ic.isna(), "missing_final_test_predictive_metrics")
+        reject(test_rank_ic < float(min_rank_ic), "low_test_rank_ic")
+
+    min_monotonicity = getattr(
+        config,
+        "factor_library_min_selection_monotonicity",
+        None,
+    )
+    if min_monotonicity is not None:
+        test_monotonicity = numeric("测试分组单调性")
+        reject(test_monotonicity.isna(), "missing_final_test_predictive_metrics")
+        reject(
+            test_monotonicity < float(min_monotonicity),
+            "low_test_monotonicity",
+        )
+
+    min_trades = max(
+        0,
+        int(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_trades",
+                "factor_library_min_test_trades",
+            )
+            or 0
+        ),
+    )
+    if min_trades > 0:
+        test_trades = numeric("测试交易次数")
+        reject(test_trades.isna(), "missing_final_test_metrics")
+        reject(test_trades < min_trades, "low_test_trade_count")
+
+    min_coverage = max(
+        0.0,
+        float(
+            get_selection_config_value(
+                config,
+                "factor_library_min_selection_signal_coverage",
+                "factor_library_min_test_signal_coverage",
+            )
+            or 0.0
+        ),
+    )
+    if min_coverage > 0:
+        test_coverage = numeric("测试信号覆盖率")
+        reject(test_coverage.isna(), "missing_final_test_metrics")
+        reject(test_coverage < min_coverage, "low_test_signal_coverage")
+
+    max_drawdown = get_selection_config_value(
+        config,
+        "factor_library_max_selection_drawdown",
+        "factor_library_max_test_drawdown",
+    )
+    if max_drawdown is not None:
+        test_drawdown = numeric("测试最大回撤")
+        reject(test_drawdown.isna(), "missing_final_test_metrics")
+        reject(test_drawdown < float(max_drawdown), "high_test_drawdown")
+    return reasons
+
+
+def get_final_test_performance_reject_reason(
+    row: pd.Series,
+    config: BacktestConfig,
+) -> str:
+    """检查单条最终测试记录，主要供测试和外部诊断调用。"""
+    result = build_final_test_performance_reject_reasons(row.to_frame().T, config)
+    return str(result.iloc[0])
+
+
 def build_selection_metric(
     frame: pd.DataFrame,
     validation_column: str,
@@ -718,9 +979,12 @@ def build_factor_library(
     combined["人工排除原因"] = combined["因子"].map(manual_reason_map).fillna("")
     combined["人工排除时间"] = combined["因子"].map(manual_time_map).fillna("")
     combined["因子家族"] = combined["因子"].map(get_factor_family)
-    combined["初筛有效"] = combined["初筛有效"].map(
-        lambda value: str(value).lower() == "true" if pd.notna(value) else False
-    )
+    if "初筛有效" not in combined.columns:
+        combined["初筛有效"] = False
+    else:
+        combined["初筛有效"] = combined["初筛有效"].map(
+            lambda value: str(value).lower() == "true" if pd.notna(value) else False
+        )
     numeric_columns = [
         "初筛夏普",
         "初筛累计收益",
@@ -763,6 +1027,26 @@ def build_factor_library(
         "验证交易次数",
         "验证信号覆盖率",
         "验证最大回撤",
+        "WalkForward计划折数",
+        "WalkForward有效折数",
+        "WalkForward累计收益",
+        "WalkForward年化收益",
+        "WalkForward夏普比率",
+        "WalkForward最大回撤",
+        "WalkForward胜率",
+        "WalkForward胜率Wilson下限",
+        "WalkForward胜率Wilson上限",
+        "WalkForward交易次数",
+        "WalkForward样本K线数",
+        "WalkForward信号覆盖率",
+        "WalkForward持仓覆盖率",
+        "WalkForward夏普中位数",
+        "WalkForward夏普最差值",
+        "WalkForward盈利折占比",
+        "WalkForward方向一致率",
+        "WalkForwardRankIC中位数",
+        "WalkForwardRankIC正向折占比",
+        "WalkForward方向命中率",
         "测试IC",
         "测试RankIC",
         "测试ICIR",
@@ -780,10 +1064,29 @@ def build_factor_library(
         "测试信号覆盖率",
         "测试最大回撤",
     ]
-    for numeric_column in numeric_columns:
-        if numeric_column not in combined.columns:
-            combined[numeric_column] = np.nan
-        combined[numeric_column] = pd.to_numeric(combined[numeric_column], errors="coerce")
+    missing_numeric_columns = [
+        column for column in numeric_columns if column not in combined.columns
+    ]
+    if missing_numeric_columns:
+        combined = pd.concat(
+            [
+                combined,
+                pd.DataFrame(
+                    np.nan,
+                    index=combined.index,
+                    columns=missing_numeric_columns,
+                ),
+            ],
+            axis=1,
+        )
+    numeric_frame = combined[numeric_columns].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    combined = pd.concat(
+        [combined.drop(columns=numeric_columns), numeric_frame],
+        axis=1,
+    ).copy()
 
     # 历史初筛列可能由旧版本口径生成，统一从可追溯的训练/验证指标重建。
     combined["初筛夏普"] = conservative_pair(
@@ -825,6 +1128,11 @@ def build_factor_library(
         ["训练+验证", "训练"],
         default="不可追溯",
     )
+    combined, walk_forward_expected, walk_forward_valid = (
+        apply_walk_forward_primary_metrics(combined, config)
+    )
+    combined["WalkForward要求生效"] = walk_forward_expected
+    combined["WalkForward有效"] = walk_forward_valid
     combined = add_factor_research_scores(combined, config)
     combined = combined.sort_values(
         [
@@ -846,6 +1154,16 @@ def build_factor_library(
             [combined.loc[protected_mask], combined.loc[~protected_mask]],
             ignore_index=True,
         )
+
+    # 两列会随因子记录一起排序；从排序后的列恢复掩码，彻底隔离旧 Series 索引。
+    walk_forward_expected = combined["WalkForward要求生效"].fillna(False).astype("bool")
+    walk_forward_valid = combined["WalkForward有效"].fillna(False).astype("bool")
+    test_reject_reasons = build_final_test_performance_reject_reasons(combined, config)
+    combined["最终测试入库要求生效"] = bool(
+        getattr(config, "factor_library_require_test_performance", False)
+    )
+    combined["最终测试入库表现通过"] = test_reject_reasons.eq("")
+    combined["最终测试入库拒绝原因"] = test_reject_reasons
 
     available = set(factors.columns)
     # 只有“表现有效 + 当前代码仍能生成 + 满足收益门槛”的因子，才进入相关性去重候选池。
@@ -900,6 +1218,23 @@ def build_factor_library(
     min_selection_monotonicity = getattr(config, "factor_library_min_selection_monotonicity", None)
     min_research_score = getattr(config, "factor_library_min_research_score", None)
     min_predictive_score = getattr(config, "factor_library_min_predictive_score", None)
+    min_walk_forward_folds = max(
+        1,
+        int(getattr(config, "factor_library_min_walk_forward_folds", 3) or 3),
+    )
+    min_walk_forward_positive_share = float(
+        getattr(config, "factor_library_min_walk_forward_positive_fold_ratio", 0.60)
+    )
+    min_walk_forward_direction_consistency = float(
+        getattr(config, "factor_library_min_walk_forward_direction_consistency", 0.60)
+    )
+    min_walk_forward_median_sharpe = float(
+        getattr(config, "factor_library_min_walk_forward_median_sharpe", 0.0)
+    )
+    min_walk_forward_trades = max(
+        0,
+        int(getattr(config, "factor_library_min_walk_forward_trades", 30) or 0),
+    )
     threshold_epsilon = 1e-12
     selection_win_rate, selection_win_rate_source = build_selection_metric(
         combined,
@@ -921,6 +1256,39 @@ def build_factor_library(
         "验证最大回撤",
         "训练最大回撤",
     )
+    if walk_forward_expected.any():
+        for metric, source in (
+            (selection_win_rate, selection_win_rate_source),
+            (selection_trades, selection_trade_source),
+            (selection_coverage, selection_coverage_source),
+            (selection_drawdown, selection_drawdown_source),
+        ):
+            metric.loc[walk_forward_expected] = np.nan
+            source.loc[walk_forward_expected] = "WalkForward不可用"
+    if walk_forward_valid.any():
+        selection_win_rate.loc[walk_forward_valid] = combined.loc[
+            walk_forward_valid,
+            "WalkForward胜率",
+        ]
+        selection_trades.loc[walk_forward_valid] = combined.loc[
+            walk_forward_valid,
+            "WalkForward交易次数",
+        ]
+        selection_coverage.loc[walk_forward_valid] = combined.loc[
+            walk_forward_valid,
+            "WalkForward信号覆盖率",
+        ]
+        selection_drawdown.loc[walk_forward_valid] = combined.loc[
+            walk_forward_valid,
+            "WalkForward最大回撤",
+        ]
+        for source in (
+            selection_win_rate_source,
+            selection_trade_source,
+            selection_coverage_source,
+            selection_drawdown_source,
+        ):
+            source.loc[walk_forward_valid] = "WalkForward样本外"
     combined["入库胜率值"] = selection_win_rate
     combined["入库交易次数值"] = selection_trades
     combined["入库信号覆盖率值"] = selection_coverage
@@ -934,11 +1302,27 @@ def build_factor_library(
         combined["初筛有效"].fillna(False)
         & combined["因子"].isin(available)
         & ~combined["因子"].isin(manual_excluded)
+        & combined["最终测试入库表现通过"].fillna(False)
         & (combined["初筛夏普"] >= config.factor_library_min_sharpe)
         & (combined["初筛累计收益"] >= config.factor_library_min_total_return)
         & (combined["训练夏普比率"] >= min_train_sharpe)
         & (combined["训练累计收益"] >= min_train_total_return)
     )
+    walk_forward_gate = ~walk_forward_expected | (
+        walk_forward_valid
+        & combined["WalkForward有效折数"].fillna(0.0).ge(min_walk_forward_folds)
+        & combined["WalkForward盈利折占比"]
+        .fillna(-np.inf)
+        .ge(min_walk_forward_positive_share)
+        & combined["WalkForward方向一致率"]
+        .fillna(-np.inf)
+        .ge(min_walk_forward_direction_consistency)
+        & combined["WalkForward夏普中位数"]
+        .fillna(-np.inf)
+        .ge(min_walk_forward_median_sharpe)
+        & combined["WalkForward交易次数"].fillna(0.0).ge(min_walk_forward_trades)
+    )
+    eligible_mask &= walk_forward_gate
     if min_train_win_rate is not None:
         eligible_mask &= combined["训练胜率"] > min_train_win_rate
     if min_selection_win_rate is not None:
@@ -1042,6 +1426,40 @@ def build_factor_library(
             selected.append(factor_name)
             selected_set.add(factor_name)
             selected_family_counts[family] = family_count + 1
+        elif bool(row.get("WalkForward要求生效", False)) and str(
+            row.get("WalkForward状态", "")
+        ) != "已计算":
+            reject_reason = "walk_forward_unavailable"
+        elif bool(row.get("WalkForward要求生效", False)) and get_numeric_value(
+            row,
+            "WalkForward有效折数",
+            0.0,
+        ) < min_walk_forward_folds:
+            reject_reason = "low_walk_forward_fold_count"
+        elif bool(row.get("WalkForward要求生效", False)) and get_numeric_value(
+            row,
+            "WalkForward盈利折占比",
+            -np.inf,
+        ) < min_walk_forward_positive_share:
+            reject_reason = "low_walk_forward_positive_fold_ratio"
+        elif bool(row.get("WalkForward要求生效", False)) and get_numeric_value(
+            row,
+            "WalkForward方向一致率",
+            -np.inf,
+        ) < min_walk_forward_direction_consistency:
+            reject_reason = "low_walk_forward_direction_consistency"
+        elif bool(row.get("WalkForward要求生效", False)) and get_numeric_value(
+            row,
+            "WalkForward夏普中位数",
+            -np.inf,
+        ) < min_walk_forward_median_sharpe:
+            reject_reason = "low_walk_forward_median_sharpe"
+        elif bool(row.get("WalkForward要求生效", False)) and get_numeric_value(
+            row,
+            "WalkForward交易次数",
+            0.0,
+        ) < min_walk_forward_trades:
+            reject_reason = "low_walk_forward_trade_count"
         elif not bool(row.get("入库数据可追溯", False)):
             reject_reason = "missing_traceable_train_metrics"
         elif not bool(row.get("初筛有效", False)):
@@ -1096,6 +1514,8 @@ def build_factor_library(
             reject_reason = "high_selection_drawdown"
         elif max_train_drawdown is not None and get_numeric_value(row, "训练最大回撤", -np.inf) < float(max_train_drawdown):
             reject_reason = "high_train_drawdown"
+        elif str(row.get("最终测试入库拒绝原因", "")).strip():
+            reject_reason = str(row["最终测试入库拒绝原因"])
         elif family_quota_limit is not None and family_count >= family_quota_limit:
             status = "retired"
             reject_reason = "family_quota_exceeded"

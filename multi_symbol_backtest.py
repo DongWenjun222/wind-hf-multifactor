@@ -266,11 +266,6 @@ def build_symbol_config(base_config: BacktestConfig, symbol: str) -> BacktestCon
     if bool(getattr(base_config, "_validation_reported", False)):
         setattr(symbol_config, "_validation_reported", True)
     symbol_config.factor_prune_list_path = str(get_factor_prune_list_path(base_config))
-    progress_path = get_research_output_dir(
-        base_config,
-        "factor_library",
-    ) / "single_factor_start_index_progress.csv"
-    symbol_config.single_factor_start_index_progress_path = str(progress_path)
     if base_config.multi_symbol_separate_output_dirs:
         symbol_config.output_dir = get_symbol_output_dir(
             base_config.output_dir,
@@ -278,6 +273,11 @@ def build_symbol_config(base_config: BacktestConfig, symbol: str) -> BacktestCon
             symbol,
             getattr(base_config, "multi_symbol_symbols_subdir", "symbols"),
         )
+    progress_path = get_research_output_dir(
+        symbol_config,
+        "factor_library",
+    ) / "single_factor_start_index_progress.csv"
+    symbol_config.single_factor_start_index_progress_path = str(progress_path)
     return symbol_config
 
 

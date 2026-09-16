@@ -94,11 +94,55 @@ LIQUID_COMMODITY_MAIN_SYMBOLS: list[str] = [
 ]
 
 
+# 中国金融期货交易所中流动性较好的四个股指期货主力连续品种。
+# IF、IH、IC、IM 分别对应沪深300、上证50、中证500和中证1000股指期货。
+LIQUID_STOCK_INDEX_FUTURES: list[str] = [
+    "IF.CFE",
+    "IH.CFE",
+    "IC.CFE",
+    "IM.CFE",
+]
+
+
+# 默认多品种研究池：保留原商品池，并补充股指期货。
+LIQUID_FUTURES_MAIN_SYMBOLS: list[str] = [
+    *LIQUID_COMMODITY_MAIN_SYMBOLS,
+    *LIQUID_STOCK_INDEX_FUTURES,
+]
+
+
+# 股指期货对应的现货指数。现货指数与其余股指期货共同作为跨品种信息源，
+# 可用于构造期现联动、风格轮动和大中小盘相对强弱特征。
+STOCK_INDEX_SPOT_SYMBOL_BY_FUTURE: dict[str, str] = {
+    "IF.CFE": "000300.SH",
+    "IH.CFE": "000016.SH",
+    "IC.CFE": "000905.SH",
+    "IM.CFE": "000852.SH",
+}
+
+
+# 股指期货研究时优先使用对应现货指数及其余股指期货作为跨品种信息源，
+# 避免沿用商品期货的油脂油料关联品种。用户仍可在配置中覆盖这些映射。
+STOCK_INDEX_RELATED_SYMBOLS: dict[str, list[str]] = {
+    symbol: [
+        STOCK_INDEX_SPOT_SYMBOL_BY_FUTURE[symbol],
+        *[peer for peer in LIQUID_STOCK_INDEX_FUTURES if peer != symbol],
+    ]
+    for symbol in LIQUID_STOCK_INDEX_FUTURES
+}
+
+
 SYMBOL_UNIVERSES: dict[str, list[str]] = {
     "liquid_commodity": LIQUID_COMMODITY_MAIN_SYMBOLS,
     "commodity_liquid": LIQUID_COMMODITY_MAIN_SYMBOLS,
     "all_liquid_commodity": LIQUID_COMMODITY_MAIN_SYMBOLS,
     "all_commodity": LIQUID_COMMODITY_MAIN_SYMBOLS,
+    "liquid_stock_index": LIQUID_STOCK_INDEX_FUTURES,
+    "stock_index": LIQUID_STOCK_INDEX_FUTURES,
+    "stock_index_futures": LIQUID_STOCK_INDEX_FUTURES,
+    "equity_index_futures": LIQUID_STOCK_INDEX_FUTURES,
+    "liquid_futures": LIQUID_FUTURES_MAIN_SYMBOLS,
+    "all_liquid_futures": LIQUID_FUTURES_MAIN_SYMBOLS,
 }
 
 
@@ -142,12 +186,19 @@ class BacktestConfig:
     multi_symbol_single_factor_max_bars: int = 60000
 
     # 回测标的代码。当前为万得或本地数据中使用的合约代码，例如 "C.DCE"。
-    symbol: str = "C.DCE"
+    symbol: str = 'IF.CFE'#"C.DCE"
+
+    # 单独运行 single/composite 等单品种入口时，是否按品种隔离研究产物。
+    # 开启后目录与 multi_symbol_backtest.py 统一，例如：
+    # output_dir/by_symbol/symbols/M_DCE/factor_library/1d/active_factors.csv。
+    # 因此切换品种不会覆盖 active、protect、审批、回测图或综合模型结果。
+    single_symbol_separate_output_dirs: bool = True
 
     # 多品种批量回测标的列表。仅 multi_symbol_backtest.py 使用；
     # 单独运行 single_factor_backtest.py 或 composite_factor_backtest.py 时仍只使用 symbol。
+    # 默认包含配置中启用的流动性商品期货和 IF/IH/IC/IM 四个股指期货。
     symbols: list[str] = field(
-        default_factory=lambda: LIQUID_COMMODITY_MAIN_SYMBOLS.copy()
+        default_factory=lambda: LIQUID_FUTURES_MAIN_SYMBOLS.copy()
     )
 
     # 多品种批量回测时是否先为每个品种运行单因子流程并更新该品种自己的 active 因子库。
@@ -303,6 +354,10 @@ class BacktestConfig:
             "LC.GFE": "新能源",
             "PS.GFE": "新能源",
             "EC.INE": "航运",
+            "IF.CFE": "股指期货",
+            "IH.CFE": "股指期货",
+            "IC.CFE": "股指期货",
+            "IM.CFE": "股指期货",
         }
     )
 
@@ -376,6 +431,30 @@ class BacktestConfig:
     # 共享模型使用的分类器名称。建议先用 xgboost；也可使用 logistic_regression/random_forest/extra_trees。
     pooled_model_name: str = "xgboost"
 
+    # pooled 共享模型的层级结构。
+    # "group_only"：沿用 pooled_model_scope，分别训练板块或全市场模型；
+    # "global_symbol_residual"：先训练覆盖全部品种的全局模型，再用每个品种
+    # 已经成熟的历史预测误差做轻量残差修正，兼顾共享信息与品种差异。
+    pooled_model_hierarchy_mode: str = "global_symbol_residual"
+
+    # 是否启用全局模型之后的品种残差修正。
+    pooled_symbol_residual_enabled: bool = True
+
+    # 分钟频率下估计品种残差偏差的历史时间窗口，单位为 K 线根数。
+    pooled_symbol_residual_window: int = 1200
+
+    # 品种残差开始生效所需的最低已成熟历史样本数。
+    pooled_symbol_residual_min_history: int = 120
+
+    # 每隔多少个时间点重新估计品种残差，中间复用上次修正值。
+    pooled_symbol_residual_retrain_every: int = 25
+
+    # 品种残差向 0 收缩的先验样本数；越大越不容易被短期噪声带偏。
+    pooled_symbol_residual_prior_count: float = 80.0
+
+    # 单次品种残差修正绝对值上限，单位为标准化净收益。
+    pooled_symbol_residual_clip: float = 0.75
+
     # 回测开始时间。格式建议使用 "YYYY-MM-DD HH:MM:SS"。
     start_time: str = "2021-01-02 09:00:00"
 
@@ -415,6 +494,22 @@ class BacktestConfig:
     # 126 个交易日约为半年；至少积累 40 个已经实现的标签后才允许动态定权。
     daily_composite_ensemble_weight_window: int = 126
     daily_composite_ensemble_min_history: int = 40
+
+    # 日频概率校准和统一边际校准使用的历史窗口与最低成熟样本数。
+    daily_composite_probability_calibration_window: int = 252
+    daily_composite_probability_calibration_min_history: int = 60
+    daily_composite_edge_calibration_window: int = 252
+    daily_composite_edge_calibration_min_history: int = 60
+
+    # 日频主 XGBoost 同时使用约 1 年、2 年和 4 年训练窗口。
+    daily_composite_multi_window_train_windows: list[int] = field(
+        default_factory=lambda: [252, 504, 1008]
+    )
+
+    # 日频品种残差估计窗口和最低已成熟历史样本数。
+    daily_pooled_symbol_residual_window: int = 252
+    daily_pooled_symbol_residual_min_history: int = 60
+    daily_pooled_symbol_residual_retrain_every: int = 20
 
     # 单因子信号阈值。因子标准化分数高于该值做多，低于负该值做空，中间为空仓。
     # 调大：信号更少、更保守；调小：信号更多、交易更频繁。
@@ -495,6 +590,15 @@ class BacktestConfig:
         default_factory=lambda: ["CS.DCE", "M.DCE", "Y.DCE", "P.DCE"]
     )
 
+    # 按主预测品种覆盖跨品种信息源。命中映射时优先于 related_symbols；未命中时
+    # 仍使用上面的通用列表。默认加入对应现货指数，并让 IF/IH/IC/IM 互相提供联动信息。
+    related_symbols_by_symbol: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            symbol: peers.copy()
+            for symbol, peers in STOCK_INDEX_RELATED_SYMBOLS.items()
+        }
+    )
+
     # 跨品种因子滚动窗口。窗口越短越敏感，窗口越长越稳定。
     cross_asset_factor_windows: list[int] = field(
         default_factory=lambda: [2, 3, 5, 8, 13, 21, 34, 55]
@@ -521,10 +625,19 @@ class BacktestConfig:
     enable_macro_state_factors: bool = True
 
     # Wind 宏观/市场状态代理代码列表。可以按自己的 Wind 权限和研究方向调整。
-    # 默认给出常用市场状态代理：A股宽基、创业板、人民币汇率和中国债券指数。
+    # 默认覆盖四个股指期货对应现货指数、A股市场、人民币汇率和中国债券指数。
     # 如果某个代码在你的 Wind 权限中不可用，默认会跳过，不中断主流程。
     macro_state_symbols: list[str] = field(
-        default_factory=lambda: ["000300.SH", "000001.SH", "399006.SZ", "USDCNY.IB", "CBA00101.CS"]
+        default_factory=lambda: [
+            "000300.SH",
+            "000016.SH",
+            "000905.SH",
+            "000852.SH",
+            "000001.SH",
+            "399006.SZ",
+            "USDCNY.IB",
+            "CBA00101.CS",
+        ]
     )
 
     # Wind 日频字段。多数指数/汇率可以使用 close；利率类数据可按 Wind 字段实际情况调整。
@@ -578,14 +691,17 @@ class BacktestConfig:
 
     # 单因子测试范围。
     # "all"：测试全部因子；"new"：只测试编号 >= single_factor_new_factor_start_index 的新因子；
-    # "range"：只测试指定编号区间；"selected"：只测试 single_factor_selected_factors 中指定的因子。
-    single_factor_scope: str = "range"  # 可选："all"、"new"、"range"、"selected"
+    # "range"：只测试指定编号区间；"selected"：只测试 single_factor_selected_factors 中指定的因子；
+    # "active"：自动读取当前品种、当前频率 active_factors.csv 中的全部正式因子并重新检验。
+    single_factor_scope: str = "range"  # 可选："all"、"new"、"range"、"selected"、"active"
 
     # 当 single_factor_scope="range" 时使用的因子编号区间，起止都包含。
     # 因子编号从 1 开始；如果写成 [0, 10000]，程序会自动按 [1, 10000] 处理。
-    # 当前仍测试上一批扩展区间；已有四类因子编号为 330001-450000，
-    # 新增五类第二批因子编号为 450001-550000；程序仍只按需构建指定列。
-    single_factor_range: tuple[int, int] = (550001, 600000)
+    # 因子全集已扩展到 800000；当前区间仍保留为第四批 calendarw 因子，
+    # 如需测试第五批，可按家族设置为 700001-720000、720001-740000、
+    # 740001-760000、760001-780000 或 780001-800000。
+    # 程序只按编号构建该区间，不会额外构造更早的全部因子；若内存不足应缩小区间分批运行。
+    single_factor_range: tuple[int, int] = (1,10000)#(740001, 800000)
 
     # 当 single_factor_scope="selected" 时使用的单因子名单。
     # 留空表示不额外指定；如果启用 selected，建议填入因子列名列表。
@@ -629,6 +745,9 @@ class BacktestConfig:
 
     # 补充生成 active/pre_active 因子图时，是否复用当前 single_factor/<频率>/
     # 目录中已经存在的非空 PNG。默认开启，避免每次更新因子库都重复回测和绘图。
+    # single_factor_scope="active" 时该参数自动失效：全部保留/待审核因子都会重新画图。
+    # 每轮重筛后，旧 active 中已退出 active 的因子图片会自动删除，不受此复用参数影响；
+    # 该清理只作用于 latest 单因子目录，不会删除 runs/ 中的历史实验快照。
     # 若行情区间发生变化且需要刷新历史图，可临时设为 False 或删除对应图片。
     single_factor_reuse_existing_plots: bool = True
 
@@ -636,6 +755,11 @@ class BacktestConfig:
     # 开启后先计算收益、夏普、交易次数等基础指标；已经确定无法通过入库硬门槛的因子，
     # 不再计算滚动 qcut、分月 IC/RankIC 等昂贵诊断。该优化不会跳过任何仍可能入库的因子。
     single_factor_defer_expensive_diagnostics: bool = True
+
+    # 单因子基础回测和详细诊断使用的线程数。大于 1 时按因子并发；
+    # 线程共享只读行情/因子矩阵，不会像 Windows 多进程那样复制整张大矩阵。
+    # 当 single_factor_plot_all=True 时自动回退串行，避免 Matplotlib 线程冲突。
+    single_factor_parallel_workers: int = 4
 
     # 因子库子目录名。如果是相对路径，会放在 output_dir 下面。
     factor_library_dir: str = "factor_library"
@@ -687,6 +811,12 @@ class BacktestConfig:
     # 模型训练和产物清单全部引用该快照，避免 latest active 库在运行中变化。
     composite_auto_freeze_active_library: bool = True
 
+    # 综合模型候选因子池范围。
+    # "active"：使用 active_factors.csv 中的全部正式因子。
+    # "protected"：只使用 active 中经过 factor_library_manager.py protect
+    # 手工保护的因子；best/all/selected 都只能在该保护池内部继续选择。
+    composite_factor_pool_scope: str = "active" #protected"
+
     # active 因子库筛选截止时间与综合回测最终测试起点的校验策略。
     # "auto"：旧库缺元数据时警告，但明确检测到未来筛选时停止运行；
     # "error"：缺元数据或未来筛选均停止；"warn"：只提示；"off"：关闭检查。
@@ -701,10 +831,49 @@ class BacktestConfig:
     # 例如 "runs/20260510_120000_single/active_factors_snapshot.csv"。
     frozen_active_library_path: Optional[str] = None
 
-    # 因子入库的最低初筛夏普要求，仅由训练/验证表现计算。
+    # 是否在最终测试集之前，对通过基础门槛的单因子执行扩展窗口 Walk-Forward
+    # 样本外复核。每一折只用当时可见的历史训练数据重新确定因子方向，
+    # 最终测试集完全不参与折构造、方向选择、评分或入库。
+    single_factor_walk_forward_enabled: bool = True
+
+    # Walk-Forward 计划验证折数。验证折互不重叠，训练窗口随时间扩展；
+    # 折数越多，时期稳定性判断越充分，但单因子回测耗时也会增加。
+    single_factor_walk_forward_folds: int = 4
+
+    # 第一折训练段占“训练集+验证集研究期”的比例。
+    # 其余样本会切成多个非重叠验证折，建议保持在 0.45 到 0.70 之间。
+    single_factor_walk_forward_initial_train_ratio: float = 0.50
+
+    # 每折训练末端与验证起点之间隔离的 K 线数，用于降低相邻样本、持仓延续
+    # 以及下一根 K 线评价标签造成的边界污染；单步标签默认至少隔离 1 根。
+    single_factor_walk_forward_embargo_bars: int = 1
+
+    # 每个 Walk-Forward 验证折至少包含的 K 线数。样本不足时会自动减少折数，
+    # 仍不足则标记为“折数不足”，不会偷偷回退到最终测试集。
+    single_factor_walk_forward_min_validation_bars: int = 20
+
+    # 因子入库至少需要成功完成的 Walk-Forward 样本外折数。
+    factor_library_min_walk_forward_folds: int = 3
+
+    # Walk-Forward 验证折中累计收益为正的最低比例，用于排除只靠单一时期获利的因子。
+    factor_library_min_walk_forward_positive_fold_ratio: float = 0.60
+
+    # 各折独立择向后，主方向在有效折中出现的最低比例。
+    # 方向频繁翻转通常意味着因子经济含义或映射关系不稳定。
+    factor_library_min_walk_forward_direction_consistency: float = 0.60
+
+    # 各折验证夏普中位数的最低要求。默认只要求不为负，避免把每一折都机械卡到 1。
+    factor_library_min_walk_forward_median_sharpe: float = 0.0
+
+    # 合并全部 Walk-Forward 验证折后至少需要的交易次数。
+    # 该门槛与训练交易次数同时生效，降低少量偶然交易造成的虚高表现。
+    factor_library_min_walk_forward_trades: int = 30
+
+    # 因子入库的最低初筛夏普要求。新回测结果优先使用 Walk-Forward 合并样本外
+    # 夏普；尚未按新口径重测的历史记录才兼容使用训练/验证较弱值。
     factor_library_min_sharpe: float = 1.0
 
-    # 因子入库的最低初筛累计收益要求，仅由训练/验证表现计算。
+    # 因子入库的最低初筛累计收益要求；指标来源规则与初筛夏普一致。
     factor_library_min_total_return: float = 0.0
 
     # 因子入库的最低训练夏普要求。
@@ -713,6 +882,15 @@ class BacktestConfig:
 
     # 因子入库的最低训练累计收益要求。
     factor_library_min_train_total_return: float = 0.0
+
+    # 是否要求因子在最终测试集上也达到入库表现门槛。
+    # False（默认）：最终测试集只用于留存评估，不参与因子入库，科研口径更严格。
+    # True：测试集同时检查夏普、累计收益，以及下方已启用的胜率、交易次数、
+    # 信号覆盖率、RankIC、分组单调性和最大回撤门槛；测试指标只作通过/拒绝，
+    # 不参与因子排序。开启后该段数据已经属于“确认筛选集”，不能再视为完全
+    # 未使用的最终测试集，建议另留后续新数据或仿真期做真正样本外检验。
+    # 手工 protect 的因子仍优先保留，除非通过管理脚本人工解除保护或排除。
+    factor_library_require_test_performance: bool = True#False
 
     # 因子入库的最低训练胜率要求；None 表示不把胜率作为硬门槛。
     # 默认关闭：低胜率、高盈亏比的趋势因子也可能具有正期望，不能仅因胜率低于 50% 被淘汰。
@@ -755,12 +933,12 @@ class BacktestConfig:
     factor_library_min_selection_monotonicity: Optional[float] = None
 
     # 因子入库综合科研评分中，单因子交易表现的权重。
-    # 交易表现主要来自训练/验证较弱一侧的夏普和累计收益。
+    # 新结果来自 Walk-Forward 样本外夏普和累计收益；历史记录兼容训练/验证较弱值。
     # 当前默认降低收益权重，让入库更偏“预测有效性”而不是单纯收益排名。
     factor_library_score_weight_performance: float = 0.20
 
     # 因子入库综合科研评分中，预测能力的权重。
-    # 预测能力主要来自 RankIC、ICIR、IC胜率、方向命中率、分组单调性和分组收益差。
+    # 新结果主要来自跨折 RankIC、方向命中率及正向折比例；历史记录兼容旧预测指标。
     factor_library_score_weight_predictive: float = 0.50
 
     # 因子入库综合科研评分中，训练/验证一致性的权重。
@@ -805,11 +983,23 @@ class BacktestConfig:
 
     # new 模式每次最多测试多少个新增因子。
     # 二十万级扩展因子必须分批运行；每批完成后进度文件会自动推进起始编号。
-    single_factor_new_factor_batch_size: int = 1000
+    single_factor_new_factor_batch_size: int = 5000
 
     # 单因子正式回测前，是否先用因子值相关性做预过滤。
     # 开启后，和已保留代表因子高度相关的候选因子会被直接跳过，不进入单因子回测，可显著减少海量重复因子的耗时。
     single_factor_enable_corr_prefilter: bool = True
+
+    # 是否先在训练/验证研究期的短样本上构建候选并完成相关性预筛，
+    # 再只为保留因子生成全历史矩阵。海量 range/new 回测建议保持开启。
+    single_factor_prebuild_corr_prefilter: bool = False
+
+    # 短样本预构建额外保留的预热K线数，用于较长滚动窗口和 zscore 初始化。
+    # 该部分只负责形成历史状态，实际相关性仍只使用 sample_rows 尾部样本。
+    single_factor_prebuild_warmup_rows: int = 3000
+
+    # 短样本预构建每批最多生成多少个候选因子，限制峰值内存。
+    # 批次之间共享相关性代表矩阵，因此仍能识别跨批次的重复因子。
+    single_factor_prebuild_batch_size: int = 5000
 
     # 单因子相关性预过滤阈值。绝对相关性大于等于该值的后出现因子会被忽略。
     # 建议取 0.95-0.99；越低过滤越激进，速度越快，但也更可能误删细微差异因子。
@@ -951,7 +1141,9 @@ class BacktestConfig:
     # 直方图梯度提升模型叶节点所需的最少样本数。
     composite_hist_min_samples_leaf: int = 20
 
-    # 是否构建基础模型的动态概率融合。融合只使用各模型已经产生的滚动样本外概率。
+    # 是否构建基础模型的动态融合。历史字段名保留 probability 以兼容旧配置，
+    # 新实现统一融合模型映射后的预期标准化净收益边际，不再直接混合两阶段
+    # 诊断投影概率与真正的三分类概率。
     composite_enable_probability_ensemble: bool = True
 
     # 参与概率融合的模型；空列表表示使用本次成功运行的全部基础模型。
@@ -977,6 +1169,55 @@ class BacktestConfig:
 
     # 动态绩效权重向合格模型等权组合收缩的比例，越大越稳健。
     composite_ensemble_equal_weight_shrinkage: float = 0.35
+
+    # 动态绩效历史尚未成熟时，是否对已有模型使用无标签等权融合。
+    composite_ensemble_allow_equal_weight_warmup: bool = True
+
+    # 统一边际融合开仓所需的最低预期标准化净收益绝对值。
+    composite_ensemble_min_abs_edge: float = 0.05
+
+    # 统一边际达到该绝对值时映射为满仓，较弱边际按比例缩放仓位。
+    composite_ensemble_full_position_edge: float = 0.50
+
+    # 是否对分类模型真实类别概率以及两阶段第一阶段可交易概率做滚动温度校准。
+    composite_probability_calibration_enabled: bool = True
+
+    # 分钟频率概率校准使用的历史预测窗口和最低已成熟标签数。
+    composite_probability_calibration_window: int = 480
+    composite_probability_calibration_min_history: int = 120
+
+    # 每隔多少个预测时点重新估计一次校准温度；中间复用上次温度。
+    composite_probability_calibration_retrain_every: int = 25
+
+    # 温度缩放候选值。大于 1 会压缩过度自信概率，小于 1 会增强置信度。
+    composite_probability_temperature_grid: list[float] = field(
+        default_factory=lambda: [0.50, 0.75, 1.00, 1.50, 2.00, 3.00]
+    )
+
+    # 是否把分类概率差滚动映射为预期标准化净收益，使分类模型与
+    # 两阶段回归模型拥有统一、可直接比较的 model_edge_score。
+    composite_edge_calibration_enabled: bool = True
+    composite_edge_calibration_window: int = 480
+    composite_edge_calibration_min_history: int = 120
+    composite_edge_calibration_retrain_every: int = 25
+
+    # 边际映射向 0 收缩的先验样本数、斜率上限和最终分数截断。
+    composite_edge_calibration_prior_count: float = 40.0
+    composite_edge_calibration_slope_limit: float = 3.0
+    composite_edge_score_clip: float = 3.0
+
+    # 是否让主 XGBoost 同时训练多个历史窗口并进行时间尺度融合。
+    # 仅作用于 xgboost，其他对照模型仍各训练一次。
+    composite_multi_window_enabled: bool = True
+
+    # 分钟频率下的多个训练窗口；程序会自动去重并确保包含当前主窗口。
+    composite_multi_window_train_windows: list[int] = field(
+        default_factory=lambda: [600, 1200, 2400]
+    )
+
+    # 子窗口最低训练样本数占窗口长度的比例，以及至少需要的有效窗口数。
+    composite_multi_window_min_train_ratio: float = 0.50
+    composite_multi_window_min_models: int = 2
 
     # 是否输出验证集到最终测试集的表现衰减诊断。
     # 该报告用于识别模型是否只在验证段表现好，到了最终留存测试段明显失效。
@@ -1281,6 +1522,40 @@ class BacktestConfig:
     # 最终有效跨度还可能由 xgboost_target_align_with_min_holding 自动提高。
     xgboost_target_horizon: int = 1
 
+    # 综合主模型的决策模式。
+    # "two_stage_net_return"：快速判断是否值得交易，再预测波动率标准化净收益；
+    # "direction_classification"：直接预测 -1/0/1。两阶段模式仅作用于主 XGBoost
+    # 和 pooled XGBoost；其余对照模型保持三分类，避免无谓增加滚动训练耗时。
+    xgboost_decision_mode: str = "two_stage_net_return"
+
+    # 第一阶段允许交易所需的最低概率。第一阶段采用轻量 SGD Logistic，
+    # 不再为可交易性单独训练一套 XGBoost。
+    xgboost_two_stage_min_trade_probability: float = 0.50
+
+    # 开仓所需的最低期望标准化净收益绝对值。
+    xgboost_two_stage_min_expected_return: float = 0.05
+
+    # 期望标准化净收益达到该值时映射为满仓，较弱预测按比例缩放仓位。
+    xgboost_two_stage_full_position_expected_return: float = 0.50
+
+    # 第二阶段回归标签的绝对值截断上限，降低极端行情对模型的支配。
+    xgboost_two_stage_target_clip: float = 3.0
+
+    # 第二阶段是否只拟合被标签认定为值得交易的方向样本。
+    xgboost_two_stage_regression_tradeable_only: bool = True
+
+    # 每次滚动重训所需的最低有效净收益回归样本数。样本不足时只跳过该次重训，
+    # 不会中断整次回测；待事前波动率窗口成熟后会自动开始训练。
+    xgboost_two_stage_min_return_samples: int = 20
+
+    # 第二阶段 XGBoost 轮数相对 xgboost_n_estimators 的比例。
+    # 默认 0.5，使“两阶段中的重模型”只训练原轮数的一半，控制滚动训练耗时。
+    xgboost_two_stage_regression_round_ratio: float = 0.50
+
+    # 轻量第一阶段 SGD Logistic 的最大迭代次数和 L2 正则强度。
+    xgboost_two_stage_trade_max_iter: int = 200
+    xgboost_two_stage_trade_alpha: float = 0.001
+
     # XGBoost 标签生成模式。
     # "threshold"：使用固定/动态中性收益阈值，未来收益超过阈值标为 1，低于负阈值标为 -1，否则标为 0。
     # "quantile"：使用已经落地的历史 horizon 收益滚动分位数作为上下边界，更适合波动状态变化明显的品种。
@@ -1354,6 +1629,24 @@ def validate_backtest_config(
         and str(config.trading_signal_mode).lower() in {"compute", "model"}
     )
 
+    configured_symbols = {str(config.symbol).strip().upper()}
+    if normalized_command in {"", "multi"}:
+        configured_symbols.update(
+            str(symbol).strip().upper() for symbol in (config.symbols or [])
+        )
+    if normalized_command in {"", "pooled"}:
+        configured_symbols.update(
+            str(symbol).strip().upper()
+            for symbol in (config.pooled_model_symbols or [])
+        )
+    for symbol in sorted(configured_symbols):
+        root, _, exchange = symbol.partition(".")
+        if root in {"IF", "IH", "IC", "IM"} and exchange != "CFE":
+            errors.append(
+                f"股指期货代码 {symbol or '<空>'} 的交易所后缀错误；"
+                f"应使用 {root}.CFE，而不是 DCE/SHF 等商品期货后缀。"
+            )
+
     frequency = str(getattr(config, "bar_frequency", "") or "").strip().lower()
     daily_aliases = {"1d", "d", "day", "daily", "日频", "日线"}
     valid_minute_frequency = (
@@ -1417,8 +1710,8 @@ def validate_backtest_config(
                 "factor_library_storage_format 只能是 auto/parquet/pickle/csv。"
             )
         scope = str(config.single_factor_scope).lower()
-        if scope not in {"all", "new", "range", "selected"}:
-            errors.append("single_factor_scope 只能是 all/new/range/selected。")
+        if scope not in {"all", "new", "range", "selected", "active"}:
+            errors.append("single_factor_scope 只能是 all/new/range/selected/active。")
         elif scope == "range":
             raw_range = config.single_factor_range
             if raw_range is None or len(raw_range) != 2:
@@ -1427,6 +1720,51 @@ def validate_backtest_config(
                 errors.append("single_factor_range 的结束编号不能小于起始编号。")
         elif scope == "selected" and not config.single_factor_selected_factors:
             errors.append("selected 模式必须配置 single_factor_selected_factors。")
+        if int(config.single_factor_parallel_workers) <= 0:
+            errors.append("single_factor_parallel_workers 必须大于 0。")
+        if int(config.single_factor_prebuild_warmup_rows) < 0:
+            errors.append("single_factor_prebuild_warmup_rows 不能小于 0。")
+        if int(config.single_factor_prebuild_batch_size) <= 0:
+            errors.append("single_factor_prebuild_batch_size 必须大于 0。")
+        if int(config.single_factor_walk_forward_folds) <= 0:
+            errors.append("single_factor_walk_forward_folds 必须大于 0。")
+        if not 0.0 < float(config.single_factor_walk_forward_initial_train_ratio) < 1.0:
+            errors.append(
+                "single_factor_walk_forward_initial_train_ratio 必须位于 0 和 1 之间。"
+            )
+        if int(config.single_factor_walk_forward_embargo_bars) < 0:
+            errors.append("single_factor_walk_forward_embargo_bars 不能小于 0。")
+        elif (
+            bool(config.single_factor_walk_forward_enabled)
+            and int(config.single_factor_walk_forward_embargo_bars) == 0
+        ):
+            warnings.append("单因子 Walk-Forward 未设置隔离 K 线，边界污染风险更高。")
+        if int(config.single_factor_walk_forward_min_validation_bars) < 2:
+            errors.append(
+                "single_factor_walk_forward_min_validation_bars 不能小于 2。"
+            )
+        if int(config.factor_library_min_walk_forward_folds) <= 0:
+            errors.append("factor_library_min_walk_forward_folds 必须大于 0。")
+        if int(config.factor_library_min_walk_forward_folds) > int(
+            config.single_factor_walk_forward_folds
+        ):
+            errors.append(
+                "factor_library_min_walk_forward_folds 不能大于计划 Walk-Forward 折数。"
+            )
+        for name, value in (
+            (
+                "factor_library_min_walk_forward_positive_fold_ratio",
+                config.factor_library_min_walk_forward_positive_fold_ratio,
+            ),
+            (
+                "factor_library_min_walk_forward_direction_consistency",
+                config.factor_library_min_walk_forward_direction_consistency,
+            ),
+        ):
+            if not 0.0 <= float(value) <= 1.0:
+                errors.append(f"{name} 必须位于 0 和 1 之间。")
+        if int(config.factor_library_min_walk_forward_trades) < 0:
+            errors.append("factor_library_min_walk_forward_trades 不能小于 0。")
 
         selection_win_rate = (
             config.factor_library_min_test_win_rate
@@ -1474,6 +1812,9 @@ def validate_backtest_config(
         normalized_command == "multi" and config.multi_symbol_run_composite
     )
     if validate_feature_scope:
+        factor_pool_scope = str(config.composite_factor_pool_scope).strip().lower()
+        if factor_pool_scope not in {"active", "protected"}:
+            errors.append("composite_factor_pool_scope 只能是 active/protected。")
         feature_scope = str(config.xgboost_feature_scope).lower()
         if feature_scope not in {"all", "best", "selected"}:
             errors.append("xgboost_feature_scope 只能是 all/best/selected。")
@@ -1527,6 +1868,28 @@ def validate_backtest_config(
             errors.append("xgboost_retrain_every 必须大于 0。")
         if int(config.xgboost_target_horizon) <= 0:
             errors.append("xgboost_target_horizon 必须大于 0。")
+        decision_mode = str(config.xgboost_decision_mode).strip().lower()
+        if decision_mode not in {"direction_classification", "two_stage_net_return"}:
+            errors.append(
+                "xgboost_decision_mode 只能是 direction_classification 或 "
+                "two_stage_net_return。"
+            )
+        if not 0.0 <= float(config.xgboost_two_stage_min_trade_probability) <= 1.0:
+            errors.append("xgboost_two_stage_min_trade_probability 必须位于 [0, 1]。")
+        if float(config.xgboost_two_stage_min_expected_return) < 0:
+            errors.append("xgboost_two_stage_min_expected_return 不能小于 0。")
+        if float(config.xgboost_two_stage_full_position_expected_return) <= 0:
+            errors.append("xgboost_two_stage_full_position_expected_return 必须大于 0。")
+        if float(config.xgboost_two_stage_target_clip) <= 0:
+            errors.append("xgboost_two_stage_target_clip 必须大于 0。")
+        if int(config.xgboost_two_stage_min_return_samples) <= 0:
+            errors.append("xgboost_two_stage_min_return_samples 必须大于 0。")
+        if not 0.0 < float(config.xgboost_two_stage_regression_round_ratio) <= 1.0:
+            errors.append("xgboost_two_stage_regression_round_ratio 必须位于 (0, 1]。")
+        if int(config.xgboost_two_stage_trade_max_iter) <= 0:
+            errors.append("xgboost_two_stage_trade_max_iter 必须大于 0。")
+        if float(config.xgboost_two_stage_trade_alpha) <= 0:
+            errors.append("xgboost_two_stage_trade_alpha 必须大于 0。")
         target_label_mode = str(config.xgboost_target_label_mode).strip().lower()
         if target_label_mode not in {"threshold", "quantile"}:
             errors.append("xgboost_target_label_mode 只能是 threshold 或 quantile。")
@@ -1557,6 +1920,49 @@ def validate_backtest_config(
             errors.append("composite_ensemble_max_model_weight 必须位于 (0, 1]。")
         if not 0.0 <= float(config.composite_ensemble_equal_weight_shrinkage) <= 1.0:
             errors.append("composite_ensemble_equal_weight_shrinkage 必须位于 [0, 1]。")
+        if float(config.composite_ensemble_min_abs_edge) < 0:
+            errors.append("composite_ensemble_min_abs_edge 不能小于 0。")
+        if float(config.composite_ensemble_full_position_edge) <= 0:
+            errors.append("composite_ensemble_full_position_edge 必须大于 0。")
+        if int(config.composite_probability_calibration_window) <= 1:
+            errors.append("composite_probability_calibration_window 必须大于 1。")
+        if int(config.composite_probability_calibration_min_history) <= 1:
+            errors.append("composite_probability_calibration_min_history 必须大于 1。")
+        if int(config.composite_probability_calibration_min_history) > int(
+            config.composite_probability_calibration_window
+        ):
+            errors.append("概率校准最低历史数不能大于概率校准窗口。")
+        if int(config.composite_probability_calibration_retrain_every) <= 0:
+            errors.append("composite_probability_calibration_retrain_every 必须大于 0。")
+        if not config.composite_probability_temperature_grid or any(
+            float(value) <= 0 for value in config.composite_probability_temperature_grid
+        ):
+            errors.append("composite_probability_temperature_grid 必须包含正数。")
+        if int(config.composite_edge_calibration_window) <= 1:
+            errors.append("composite_edge_calibration_window 必须大于 1。")
+        if int(config.composite_edge_calibration_min_history) <= 1:
+            errors.append("composite_edge_calibration_min_history 必须大于 1。")
+        if int(config.composite_edge_calibration_min_history) > int(
+            config.composite_edge_calibration_window
+        ):
+            errors.append("边际校准最低历史数不能大于边际校准窗口。")
+        if int(config.composite_edge_calibration_retrain_every) <= 0:
+            errors.append("composite_edge_calibration_retrain_every 必须大于 0。")
+        if float(config.composite_edge_calibration_prior_count) < 0:
+            errors.append("composite_edge_calibration_prior_count 不能小于 0。")
+        if float(config.composite_edge_calibration_slope_limit) <= 0:
+            errors.append("composite_edge_calibration_slope_limit 必须大于 0。")
+        if float(config.composite_edge_score_clip) <= 0:
+            errors.append("composite_edge_score_clip 必须大于 0。")
+        if not 0.0 < float(config.composite_multi_window_min_train_ratio) <= 1.0:
+            errors.append("composite_multi_window_min_train_ratio 必须位于 (0, 1]。")
+        if int(config.composite_multi_window_min_models) <= 0:
+            errors.append("composite_multi_window_min_models 必须大于 0。")
+        if bool(config.composite_multi_window_enabled) and (
+            not config.composite_multi_window_train_windows
+            or any(int(value) <= 0 for value in config.composite_multi_window_train_windows)
+        ):
+            errors.append("启用多窗口融合时，composite_multi_window_train_windows 必须包含正整数。")
 
     if normalized_command in {"", "pooled"}:
         pooled_window = config.pooled_model_train_time_window
@@ -1564,6 +1970,25 @@ def validate_backtest_config(
             errors.append("pooled_model_train_time_window 必须为空或大于 0。")
         if int(config.pooled_model_max_train_rows) < 0:
             errors.append("pooled_model_max_train_rows 不能小于 0。")
+        hierarchy_mode = str(config.pooled_model_hierarchy_mode).strip().lower()
+        if hierarchy_mode not in {"group_only", "global_symbol_residual"}:
+            errors.append(
+                "pooled_model_hierarchy_mode 只能是 group_only/global_symbol_residual。"
+            )
+        if int(config.pooled_symbol_residual_window) <= 1:
+            errors.append("pooled_symbol_residual_window 必须大于 1。")
+        if int(config.pooled_symbol_residual_min_history) <= 1:
+            errors.append("pooled_symbol_residual_min_history 必须大于 1。")
+        if int(config.pooled_symbol_residual_min_history) > int(
+            config.pooled_symbol_residual_window
+        ):
+            errors.append("品种残差最低历史数不能大于品种残差窗口。")
+        if int(config.pooled_symbol_residual_retrain_every) <= 0:
+            errors.append("pooled_symbol_residual_retrain_every 必须大于 0。")
+        if float(config.pooled_symbol_residual_prior_count) < 0:
+            errors.append("pooled_symbol_residual_prior_count 不能小于 0。")
+        if float(config.pooled_symbol_residual_clip) <= 0:
+            errors.append("pooled_symbol_residual_clip 必须大于 0。")
 
     if normalized_command == "multi":
         if not config.multi_symbol_run_single_factor and not config.multi_symbol_run_composite:

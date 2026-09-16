@@ -82,6 +82,11 @@ def get_local_data_candidates(config: BacktestConfig) -> list[Path]:
 
 def normalize_intraday_data(data: pd.DataFrame) -> pd.DataFrame:
     """标准化分钟行情数据。"""
+    if data is None or data.empty:
+        raise ValueError(
+            "行情数据为空，请检查 Wind 品种代码、交易所后缀和请求时间段。"
+            "股指期货应使用 IF.CFE、IH.CFE、IC.CFE 或 IM.CFE。"
+        )
     data = data.copy()
     data.index = pd.to_datetime(data.index)
     data = data.sort_index()
@@ -102,6 +107,8 @@ def normalize_intraday_data(data: pd.DataFrame) -> pd.DataFrame:
 
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna(subset=["open", "high", "low", "close"])
+    if data.empty:
+        raise ValueError("行情 OHLC 字段没有任何完整记录，不能继续生成因子或回测。")
     market_cols = [
         "open",
         "high",
@@ -219,7 +226,13 @@ def fetch_intraday_data_from_wind(config: BacktestConfig) -> pd.DataFrame:
         )
         if error_code != 0:
             raise RuntimeError(f"Wind 日频数据获取失败，错误码: {error_code}")
-        return filter_completed_daily_bars(normalize_intraday_data(raw), config)
+        daily_data = filter_completed_daily_bars(normalize_intraday_data(raw), config)
+        if daily_data.empty:
+            raise ValueError(
+                f"Wind 未返回 {config.symbol} 的已完成日线，"
+                "请检查代码、时间范围或 daily_bar_ready_time。"
+            )
+        return daily_data
 
     options = f"BarSize={config.bar_size}"
     error_code, raw = w.wsi(
@@ -246,6 +259,10 @@ def fetch_intraday_data(config: BacktestConfig) -> pd.DataFrame:
     print(f"从 Wind 获取 {get_frequency_key(config)} 行情数据...")
     ensure_wind_started()
     data = fetch_intraday_data_from_wind(config)
+    if data.empty:
+        raise ValueError(
+            f"Wind 未返回 {config.symbol} 的有效行情，已停止写入空缓存。"
+        )
     saved_path = save_local_intraday_data(data, config)
     print(f"Wind 行情已保存到本地: {saved_path}")
     return data
@@ -497,19 +514,38 @@ def fetch_macro_state_data(config: BacktestConfig) -> dict[str, pd.DataFrame]:
     return macro_data
 
 
+def resolve_related_symbols(config: BacktestConfig) -> list[str]:
+    """按主品种解析跨品种数据源，并保持配置顺序去重。"""
+    main_symbol = str(config.symbol).strip().upper().replace("_", ".")
+    overrides = getattr(config, "related_symbols_by_symbol", {}) or {}
+    normalized_overrides = {
+        str(symbol).strip().upper().replace("_", "."): values
+        for symbol, values in overrides.items()
+    }
+    configured = normalized_overrides.get(
+        main_symbol,
+        getattr(config, "related_symbols", []) or [],
+    )
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for symbol in configured:
+        normalized = str(symbol).strip().upper().replace("_", ".")
+        if not normalized or normalized == main_symbol or normalized in seen:
+            continue
+        resolved.append(normalized)
+        seen.add(normalized)
+    return resolved
+
+
 def fetch_related_intraday_data(config: BacktestConfig) -> dict[str, pd.DataFrame]:
     """获取或读取配置中的全部相关期货行情数据。"""
     related_data: dict[str, pd.DataFrame] = {}
-    related_symbols = list(getattr(config, "related_symbols", []) or [])
+    related_symbols = resolve_related_symbols(config)
     if not getattr(config, "enable_cross_asset_factors", False) or not related_symbols:
         return related_data
 
-    main_symbol = str(config.symbol).upper()
     for symbol in related_symbols:
-        symbol = str(symbol).strip()
-        if not symbol or symbol.upper() == main_symbol:
-            continue
-
         symbol_config = replace(config, symbol=symbol)
         try:
             related_data[symbol] = fetch_intraday_data(symbol_config)

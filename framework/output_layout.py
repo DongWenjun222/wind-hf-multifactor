@@ -35,8 +35,8 @@ def get_frequency_scoped_dir(base_dir: Path | str, config: Any) -> Path:
 
 
 def get_research_output_dir(config: Any, category: str) -> Path:
-    """返回 factor_library/single_factor/composite_factor 的频率隔离目录。"""
-    return get_frequency_scoped_dir(Path(config.output_dir) / category, config)
+    """返回按品种、类别和频率隔离的研究目录。"""
+    return get_frequency_scoped_dir(get_research_output_root(config) / category, config)
 
 
 def get_trading_signal_output_dir(config: Any) -> Path:
@@ -58,6 +58,14 @@ def apply_frequency_runtime_defaults(config: Any) -> Any:
         "qcut_min_periods": "daily_qcut_min_periods",
         "composite_ensemble_weight_window": "daily_composite_ensemble_weight_window",
         "composite_ensemble_min_history": "daily_composite_ensemble_min_history",
+        "composite_probability_calibration_window": "daily_composite_probability_calibration_window",
+        "composite_probability_calibration_min_history": "daily_composite_probability_calibration_min_history",
+        "composite_edge_calibration_window": "daily_composite_edge_calibration_window",
+        "composite_edge_calibration_min_history": "daily_composite_edge_calibration_min_history",
+        "composite_multi_window_train_windows": "daily_composite_multi_window_train_windows",
+        "pooled_symbol_residual_window": "daily_pooled_symbol_residual_window",
+        "pooled_symbol_residual_min_history": "daily_pooled_symbol_residual_min_history",
+        "pooled_symbol_residual_retrain_every": "daily_pooled_symbol_residual_retrain_every",
     }
     for target, source in mappings.items():
         if hasattr(resolved, source):
@@ -68,6 +76,34 @@ def apply_frequency_runtime_defaults(config: Any) -> Any:
 def safe_symbol_dir_name(symbol: str) -> str:
     """把 Wind 品种代码转换成统一的大写目录名。"""
     return str(symbol).replace(".", "_").replace("/", "_").replace("-", "_").upper()
+
+
+def is_symbol_scoped_output_dir(base_dir: Path | str, config: Any) -> bool:
+    """判断 output_dir 是否已经是当前品种的 multi-symbol 结果根目录。"""
+    base = Path(base_dir)
+    symbol_dir = safe_symbol_dir_name(getattr(config, "symbol", ""))
+    if not symbol_dir or base.name.upper() != symbol_dir:
+        return False
+    parent_name = base.parent.name.lower()
+    return parent_name in {
+        str(getattr(config, "multi_symbol_symbols_subdir", "symbols")).lower(),
+        str(getattr(config, "multi_symbol_output_subdir", "by_symbol")).lower(),
+    }
+
+
+def get_research_output_root(config: Any) -> Path:
+    """统一单品种与多品种流程使用的当前品种研究根目录。"""
+    base = Path(config.output_dir)
+    if not bool(getattr(config, "single_symbol_separate_output_dirs", True)):
+        return base
+    if is_symbol_scoped_output_dir(base, config):
+        return base
+    return (
+        base
+        / str(getattr(config, "multi_symbol_output_subdir", "by_symbol"))
+        / str(getattr(config, "multi_symbol_symbols_subdir", "symbols"))
+        / safe_symbol_dir_name(getattr(config, "symbol", ""))
+    )
 
 
 def get_multi_symbol_root(config: Any) -> Path:

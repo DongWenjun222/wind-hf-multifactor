@@ -34,6 +34,12 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     if factor_name in BASIC_FACTORS:
         family = "basic"
         source_file = "framework/factor_builders/basic.py"
+    elif factor_name.startswith("calendarv_"):
+        family = "calendar"
+        source_file = "framework/factor_builders/family_expansion5.py"
+    elif factor_name.startswith("calendarw_"):
+        family = "calendar"
+        source_file = "framework/factor_builders/family_expansion4.py"
     elif factor_name.startswith("calendarz_"):
         family = "calendar"
         source_file = "framework/factor_builders/family_expansion3.py"
@@ -52,6 +58,12 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith("external_"):
         family = "external_daily"
         source_file = "framework/factor_builders/external_daily.py"
+    elif factor_name.startswith("crossv_"):
+        family = "cross_asset"
+        source_file = "framework/factor_builders/family_expansion5.py"
+    elif factor_name.startswith("crossw_"):
+        family = "cross_asset"
+        source_file = "framework/factor_builders/family_expansion4.py"
     elif factor_name.startswith("crossz_"):
         family = "cross_asset"
         source_file = "framework/factor_builders/family_expansion3.py"
@@ -64,6 +76,12 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith(("cross_", "crossmega_", "crossultra_", "crosshyper_", "crossomega_")):
         family = "cross_asset"
         source_file = "framework/factor_builders/cross_asset.py"
+    elif factor_name.startswith("noncrossv_"):
+        family = "non_cross_complex"
+        source_file = "framework/factor_builders/family_expansion5.py"
+    elif factor_name.startswith("noncrossw_"):
+        family = "non_cross_complex"
+        source_file = "framework/factor_builders/family_expansion4.py"
     elif factor_name.startswith("noncrossz_"):
         family = "non_cross_complex"
         source_file = "framework/factor_builders/family_expansion3.py"
@@ -76,6 +94,12 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith(("ultra_", "hyper_", "omega_")):
         family = "non_cross_complex"
         source_file = "framework/factor_builders/non_cross.py"
+    elif factor_name.startswith("expanded6_"):
+        family = "expanded"
+        source_file = "framework/factor_builders/family_expansion5.py"
+    elif factor_name.startswith("expanded5_"):
+        family = "expanded"
+        source_file = "framework/factor_builders/family_expansion4.py"
     elif factor_name.startswith("expanded4_"):
         family = "expanded"
         source_file = "framework/factor_builders/family_expansion3.py"
@@ -85,6 +109,12 @@ def classify_factor(factor_name: str) -> dict[str, Any]:
     elif factor_name.startswith(("expanded_", "expanded2_")):
         family = "expanded"
         source_file = "framework/factor_builders/expanded.py"
+    elif factor_name.startswith("paramv_"):
+        family = "parametric"
+        source_file = "framework/factor_builders/family_expansion5.py"
+    elif factor_name.startswith("paramw_"):
+        family = "parametric"
+        source_file = "framework/factor_builders/family_expansion4.py"
     elif factor_name.startswith("paramz_"):
         family = "parametric"
         source_file = "framework/factor_builders/family_expansion3.py"

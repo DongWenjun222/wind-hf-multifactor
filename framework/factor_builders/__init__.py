@@ -18,6 +18,14 @@ from .family_expansion3 import (
     add_third_family_expansion_factors,
     get_third_family_expansion_names,
 )
+from .family_expansion4 import (
+    add_fourth_family_expansion_factors,
+    get_fourth_family_expansion_names,
+)
+from .family_expansion5 import (
+    add_fifth_family_expansion_factors,
+    get_fifth_family_expansion_names,
+)
 from .macro_state import add_macro_state_factors
 from .non_cross import (
     add_complex_non_cross_factors,

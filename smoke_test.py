@@ -47,6 +47,9 @@ def make_smoke_config() -> BacktestConfig:
     config.xgboost_retrain_every = 20
     config.xgboost_n_estimators = 5
     config.xgboost_best_top_n = 5
+    config.composite_multi_window_enabled = True
+    config.composite_multi_window_train_windows = [20, 40]
+    config.composite_multi_window_min_models = 2
     config.xgboost_feature_mode = "signal"
     config.xgboost_target_horizon = 3
     config.xgboost_trade_use_market_filters = False
@@ -56,6 +59,7 @@ def make_smoke_config() -> BacktestConfig:
     config.xgboost_train_min_directional_samples = 0
     config.xgboost_train_nonzero_class_weight = 1.0
     config.xgboost_train_neutral_class_weight = 1.0
+    config.xgboost_two_stage_min_return_samples = 5
     return config
 
 
@@ -215,6 +219,22 @@ def smoke_optional_xgboost(
         raise AssertionError("XGBoost 冒烟测试生成了空 raw_signal")
     if feature_importance.empty:
         raise AssertionError("XGBoost 冒烟测试生成了空 feature_importance")
+    semantic_columns = {
+        "probability_semantics",
+        "model_edge_score",
+        "model_edge_semantics",
+    }
+    missing_semantics = semantic_columns.difference(signal.columns)
+    if missing_semantics:
+        raise AssertionError(
+            "XGBoost 冒烟测试缺少统一输出语义列: "
+            + ", ".join(sorted(missing_semantics))
+        )
+    if "multi_window_edge_ensemble" not in set(signal["decision_mode"].dropna()):
+        raise AssertionError("XGBoost 冒烟测试没有真正进入多时间窗口融合路径")
+    multi_window_diagnostics = signal.attrs.get("multi_window_diagnostics")
+    if not isinstance(multi_window_diagnostics, pd.DataFrame) or multi_window_diagnostics.empty:
+        raise AssertionError("XGBoost 冒烟测试缺少多时间窗口权重诊断")
 
     print("    XGBoost 小窗口 smoke OK")
 

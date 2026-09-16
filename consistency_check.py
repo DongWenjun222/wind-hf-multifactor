@@ -56,8 +56,8 @@ def collect_checks() -> list[tuple[bool, str]]:
     )
     checks.append(
         (
-            {"all", "new", "range", "selected"}.issubset(cli_scopes),
-            "CLI single --scope 支持 all/new/range/selected 四种模式",
+            {"all", "new", "range", "selected", "active"}.issubset(cli_scopes),
+            "CLI single --scope 支持 all/new/range/selected/active 五种模式",
         )
     )
     checks.append(
@@ -90,6 +90,17 @@ def collect_checks() -> list[tuple[bool, str]]:
     )
     checks.append(
         (
+            {
+                "--probability-calibration",
+                "--edge-calibration",
+                "--multi-window",
+                "--multi-window-train-windows",
+            }.issubset(option_strings_by_parser["composite"]),
+            "CLI composite 支持概率校准、经济边际校准和多窗口融合覆盖",
+        )
+    )
+    checks.append(
+        (
             {"--run-single-factor", "--no-run-single-factor", "--run-composite", "--no-run-composite"}.issubset(
                 option_strings_by_parser["multi"]
             ),
@@ -102,6 +113,17 @@ def collect_checks() -> list[tuple[bool, str]]:
                 option_strings_by_parser["pooled"]
             ),
             "CLI pooled 支持训练时间窗口和 long-format 最大样本行数覆盖",
+        )
+    )
+    checks.append(
+        (
+            {
+                "--pooled-hierarchy-mode",
+                "--pooled-symbol-residual",
+                "--probability-calibration",
+                "--edge-calibration",
+            }.issubset(option_strings_by_parser["pooled"]),
+            "CLI pooled 支持全局加品种残差层级和滚动校准覆盖",
         )
     )
     common_config_options = {"--print-config", "--save-config", "--dry-run"}
@@ -138,6 +160,15 @@ def collect_checks() -> list[tuple[bool, str]]:
                 "pooled_model_train_time_window" in text
                 and "long-format 样本" in text,
                 f"{filename} 中 pooled 训练窗口和 long-format 行数说明完整",
+            )
+        )
+        checks.append(
+            (
+                "framework/model_calibration.py" in text
+                and "composite_multi_window_weights.csv" in text
+                and "pooled_symbol_residual_diagnostics.csv" in text
+                and "diagnostic_projection" in text,
+                f"{filename} 中概率语义、多窗口和 pooled 残差说明完整",
             )
         )
         checks.append(

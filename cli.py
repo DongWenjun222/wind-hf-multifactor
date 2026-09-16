@@ -32,6 +32,17 @@ def parse_csv_values(value: str | None) -> list[str] | None:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_csv_integers(value: str | None) -> list[int] | None:
+    """解析逗号分隔的正整数列表。"""
+    items = parse_csv_values(value)
+    if items is None:
+        return None
+    values = [int(item) for item in items]
+    if any(value <= 0 for value in values):
+        raise ValueError("整数列表中的值必须全部大于 0。")
+    return values
+
+
 def apply_json_config(config: BacktestConfig, config_path: str | None) -> None:
     """从 JSON 文件覆盖配置中的已知字段。"""
     if not config_path:
@@ -124,12 +135,27 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
         config.xgboost_min_train_samples = args.min_train_samples
     if getattr(args, "retrain_every", None) is not None:
         config.xgboost_retrain_every = args.retrain_every
+    if getattr(args, "probability_calibration", None) is not None:
+        config.composite_probability_calibration_enabled = args.probability_calibration
+    if getattr(args, "edge_calibration", None) is not None:
+        config.composite_edge_calibration_enabled = args.edge_calibration
+    if getattr(args, "multi_window", None) is not None:
+        config.composite_multi_window_enabled = args.multi_window
+    multi_window_train_windows = parse_csv_integers(
+        getattr(args, "multi_window_train_windows", None)
+    )
+    if multi_window_train_windows is not None:
+        config.composite_multi_window_train_windows = multi_window_train_windows
     if getattr(args, "symbols", None) is not None:
         config.symbols = resolve_symbol_universe(args.symbols)
         if getattr(args, "command", "") == "pooled":
             config.pooled_model_symbols = config.symbols
     if getattr(args, "pooled_scope", None) is not None:
         config.pooled_model_scope = args.pooled_scope
+    if getattr(args, "pooled_hierarchy_mode", None) is not None:
+        config.pooled_model_hierarchy_mode = args.pooled_hierarchy_mode
+    if getattr(args, "pooled_symbol_residual", None) is not None:
+        config.pooled_symbol_residual_enabled = args.pooled_symbol_residual
     if getattr(args, "pooled_feature_source", None) is not None:
         config.pooled_model_feature_source = args.pooled_feature_source
     if getattr(args, "pooled_max_features", None) is not None:
@@ -156,6 +182,8 @@ def create_config(args: argparse.Namespace) -> BacktestConfig:
             config.daily_xgboost_min_train_samples = int(args.min_train_samples)
         if getattr(args, "retrain_every", None) is not None:
             config.daily_xgboost_retrain_every = int(args.retrain_every)
+        if multi_window_train_windows is not None:
+            config.daily_composite_multi_window_train_windows = multi_window_train_windows
     return apply_frequency_runtime_defaults(config)
 
 
@@ -234,7 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     single = subparsers.add_parser("single", help="运行单因子回测与因子入库。")
     add_common_arguments(single)
-    single.add_argument("--scope", choices=["all", "new", "range", "selected"], help="单因子构建范围。")
+    single.add_argument(
+        "--scope",
+        choices=["all", "new", "range", "selected", "active"],
+        help="单因子构建范围；active 会自动复测当前品种、当前频率的正式因子库。",
+    )
     single.add_argument("--start-index", type=int, help="new 模式下新增因子的起始编号。")
     single.add_argument("--range-start", type=int, help="range 模式下因子编号区间起点。")
     single.add_argument("--range-end", type=int, help="range 模式下因子编号区间终点。")
@@ -252,10 +284,38 @@ def build_parser() -> argparse.ArgumentParser:
     composite.add_argument("--train-window", type=int, help="滚动训练窗口长度。")
     composite.add_argument("--min-train-samples", type=int, help="最少训练样本数。")
     composite.add_argument("--retrain-every", type=int, help="每隔多少根 K 线重新训练。")
+    composite.add_argument(
+        "--probability-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否使用严格滞后的滚动温度校准。",
+    )
+    composite.add_argument(
+        "--edge-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否把模型输出滚动映射为统一标准化净收益边际。",
+    )
+    composite.add_argument(
+        "--multi-window",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否启用主 XGBoost 多训练窗口融合。",
+    )
+    composite.add_argument(
+        "--multi-window-train-windows",
+        help="逗号分隔的训练窗口，例如 600,1200,2400。",
+    )
 
     multi = subparsers.add_parser("multi", help="运行多品种批量回测和组合汇总。")
     add_common_arguments(multi)
-    multi.add_argument("--symbols", help="逗号分隔的品种列表。")
+    multi.add_argument(
+        "--symbols",
+        help=(
+            "逗号分隔的品种列表，或使用 liquid_commodity、"
+            "liquid_stock_index、liquid_futures 品种池别名。"
+        ),
+    )
     multi.add_argument(
         "--skip-existing",
         action=argparse.BooleanOptionalAction,
@@ -277,11 +337,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     pooled = subparsers.add_parser("pooled", help="运行多品种共享信息 pooled 模型。")
     add_common_arguments(pooled)
-    pooled.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
+    pooled.add_argument(
+        "--symbols",
+        help=(
+            "逗号分隔的品种列表或品种池别名；不填则使用 config.symbols。"
+        ),
+    )
     pooled.add_argument(
         "--pooled-scope",
         choices=["sector", "market"],
         help="共享模型范围：sector 按板块训练；market 全市场训练。",
+    )
+    pooled.add_argument(
+        "--pooled-hierarchy-mode",
+        choices=["group_only", "global_symbol_residual"],
+        help=(
+            "共享层级：group_only 遵循 pooled-scope；"
+            "global_symbol_residual 使用全市场模型加品种残差。"
+        ),
+    )
+    pooled.add_argument(
+        "--pooled-symbol-residual",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="全局层级下是否启用品种历史残差修正。",
+    )
+    pooled.add_argument(
+        "--probability-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否使用严格滞后的滚动概率校准。",
+    )
+    pooled.add_argument(
+        "--edge-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否输出统一的标准化净收益边际。",
     )
     pooled.add_argument(
         "--pooled-feature-source",
@@ -299,7 +390,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     signal = subparsers.add_parser("signal", help="导出最新单品种或多品种交易信号。")
     add_common_arguments(signal)
-    signal.add_argument("--symbols", help="逗号分隔的品种列表；不填则使用 config.symbols。")
+    signal.add_argument(
+        "--symbols",
+        help=(
+            "逗号分隔的品种列表或品种池别名；不填则使用 config.symbols。"
+        ),
+    )
     signal.add_argument(
         "--mode",
         choices=["compute", "model", "vote", "detail"],

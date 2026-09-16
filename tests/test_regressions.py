@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +13,9 @@ import pandas as pd
 from composite_factor_backtest import (
     audit_active_library_oos_cutoff,
     build_factor_signal_features,
+    build_historical_edge_ensemble,
     build_historical_probability_ensemble,
+    build_two_stage_targets,
     build_training_sample_weights,
     calculate_block_bootstrap_statistics,
     calculate_future_target_outcomes,
@@ -24,16 +27,27 @@ from composite_factor_backtest import (
     load_active_factor_names,
     load_composite_artifact_manifest,
     predict_composite_probability,
+    predict_fast_two_stage_net_return,
+    resolve_multi_window_train_windows,
     run_composite_backtest,
     train_composite_classifier,
+    train_fast_two_stage_net_return_model,
+    two_stage_predictions_to_probabilities,
+    uses_fast_two_stage_model,
     write_composite_artifact_manifest,
 )
-from config import BacktestConfig, validate_backtest_config
+from config import (
+    BacktestConfig,
+    LIQUID_STOCK_INDEX_FUTURES,
+    resolve_symbol_universe,
+    validate_backtest_config,
+)
 from framework.factor_library import (
     build_factor_library,
     build_compact_rejected_library,
     build_selection_metric,
     conservative_pair,
+    get_final_test_performance_reject_reason,
     get_existing_factor_library_storage_path,
     get_factor_library_dir,
     get_selection_config_value,
@@ -54,12 +68,18 @@ from framework.data_loader import (
     filter_completed_daily_bars,
     get_data_cache_path,
     get_local_data_candidates,
+    normalize_intraday_data,
+    resolve_related_symbols,
 )
 from framework.factors import (
     EXPANDED_FACTOR_END_INDEX,
     EXPANDED_FACTOR_START_INDEX,
     FAMILY_EXPANSION_END_INDEX,
     FAMILY_EXPANSION_START_INDEX,
+    FIFTH_FAMILY_EXPANSION_END_INDEX,
+    FIFTH_FAMILY_EXPANSION_START_INDEX,
+    FOURTH_FAMILY_EXPANSION_END_INDEX,
+    FOURTH_FAMILY_EXPANSION_START_INDEX,
     SECOND_FAMILY_EXPANSION_END_INDEX,
     SECOND_FAMILY_EXPANSION_START_INDEX,
     THIRD_FAMILY_EXPANSION_END_INDEX,
@@ -71,6 +91,7 @@ from framework.factors import (
 )
 from framework.factor_taxonomy import classify_factor
 from multi_symbol_backtest import (
+    build_symbol_config,
     collect_multi_symbol_manifest_outputs,
     pipeline_state_matches,
     read_single_factor_summary_for_pruning,
@@ -79,6 +100,15 @@ from multi_symbol_backtest import (
     save_pipeline_state,
     should_skip_composite_pipeline,
     summarize_active_library,
+)
+from pooled_model_backtest import (
+    apply_pooled_symbol_residual_correction,
+    build_grouped_symbol_map,
+    build_symbol_signal_from_predictions,
+)
+from framework.model_calibration import (
+    rolling_temperature_calibrate_binary,
+    rolling_temperature_calibrate_multiclass,
 )
 from framework.output_layout import (
     apply_frequency_runtime_defaults,
@@ -92,12 +122,19 @@ from framework.output_layout import (
 from framework.project_fingerprint import get_default_fingerprint_files
 from framework.runtime_utils import write_json_atomic
 from single_factor_backtest import (
+    _evaluate_single_factor_without_plot,
+    build_single_factor_walk_forward_folds,
     calculate_metrics,
+    cleanup_removed_active_factor_plots,
+    evaluate_single_factor_walk_forward,
     get_active_factor_plot_names,
     get_expensive_diagnostic_skip_reason,
     get_reusable_single_factor_plot,
     prefilter_correlated_single_factors,
+    prebuild_and_prefilter_factor_names,
     run_backtest,
+    run_single_factor_backtests,
+    split_train_validation_test_index,
 )
 from framework.factor_builders.parametric import add_parametric_factors
 from framework.factor_builders.expanded import (
@@ -125,6 +162,18 @@ from framework.factor_builders.family_expansion3 import (
     THIRD_FAMILY_TOTAL_COUNT,
     get_third_family_expansion_names,
 )
+from framework.factor_builders.family_expansion4 import (
+    FOURTH_FAMILY_COUNT,
+    FOURTH_FAMILY_PREFIXES,
+    FOURTH_FAMILY_TOTAL_COUNT,
+    get_fourth_family_expansion_names,
+)
+from framework.factor_builders.family_expansion5 import (
+    FIFTH_FAMILY_COUNT,
+    FIFTH_FAMILY_PREFIXES,
+    FIFTH_FAMILY_TOTAL_COUNT,
+    get_fifth_family_expansion_names,
+)
 from trading_signal import (
     get_factor_weight_series,
     get_live_model_predict_index,
@@ -134,6 +183,35 @@ from trading_signal import (
 
 
 class FrameworkRegressionTests(unittest.TestCase):
+
+    def test_stock_index_futures_are_available_as_independent_and_default_universes(self) -> None:
+        config = BacktestConfig()
+
+        self.assertEqual(
+            resolve_symbol_universe("liquid_stock_index"),
+            LIQUID_STOCK_INDEX_FUTURES,
+        )
+        self.assertTrue(set(LIQUID_STOCK_INDEX_FUTURES).issubset(config.symbols))
+        self.assertTrue(
+            set(LIQUID_STOCK_INDEX_FUTURES).issubset(
+                resolve_symbol_universe("liquid_futures")
+            )
+        )
+        self.assertTrue(
+            all(config.multi_symbol_group_map[symbol] == "股指期货" for symbol in LIQUID_STOCK_INDEX_FUTURES)
+        )
+
+    def test_stock_index_futures_use_stock_index_related_symbols(self) -> None:
+        config = BacktestConfig()
+        config.symbol = "IF.CFE"
+
+        self.assertEqual(
+            resolve_related_symbols(config),
+            ["000300.SH", "IH.CFE", "IC.CFE", "IM.CFE"],
+        )
+
+        config.symbol = "C.DCE"
+        self.assertEqual(resolve_related_symbols(config), config.related_symbols)
 
     def test_factor_library_uses_compressed_master_and_compact_rejected_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -382,6 +460,90 @@ class FrameworkRegressionTests(unittest.TestCase):
             self.assertEqual(active["因子"].tolist(), ["enough_trades"])
             rejected = library_all.set_index("因子").loc["too_few_trades"]
             self.assertEqual(rejected["拒绝原因"], "low_selection_trade_count")
+
+    def test_factor_library_final_test_gate_is_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.factor_library_min_predictive_score = None
+            config.factor_library_enable_family_quota = False
+            config.factor_library_use_value_corr = False
+            config.factor_library_use_signal_corr = False
+            summary = pd.DataFrame(
+                {
+                    "因子": ["test_pass", "test_fail"],
+                    "训练夏普比率": [1.5, 1.5],
+                    "验证夏普比率": [1.2, 1.2],
+                    "训练累计收益": [0.10, 0.10],
+                    "验证累计收益": [0.04, 0.04],
+                    "训练交易次数": [40, 40],
+                    "验证交易次数": [15, 15],
+                    "测试夏普比率": [1.1, -0.5],
+                    "测试累计收益": [0.03, -0.02],
+                    "测试交易次数": [12, 12],
+                }
+            )
+            factors = pd.DataFrame(
+                {
+                    "test_pass": np.arange(40, dtype="float64"),
+                    "test_fail": np.arange(40, dtype="float64") * 2,
+                }
+            )
+
+            active_without_gate, _, _ = build_factor_library(summary, factors, config)
+            self.assertEqual(set(active_without_gate["因子"]), {"test_pass", "test_fail"})
+
+            config.factor_library_require_test_performance = True
+            active_with_gate, library_all, _ = build_factor_library(summary, factors, config)
+            indexed = library_all.set_index("因子")
+
+            self.assertEqual(active_with_gate["因子"].tolist(), ["test_pass"])
+            self.assertTrue(bool(indexed.loc["test_pass", "最终测试入库表现通过"]))
+            self.assertFalse(bool(indexed.loc["test_fail", "最终测试入库表现通过"]))
+            self.assertEqual(indexed.loc["test_fail", "拒绝原因"], "low_test_sharpe")
+
+    def test_final_test_gate_reuses_enabled_selection_thresholds(self) -> None:
+        config = BacktestConfig()
+        config.factor_library_require_test_performance = True
+        config.factor_library_min_selection_win_rate = 0.50
+        config.factor_library_min_selection_trades = 10
+        config.factor_library_min_selection_signal_coverage = 0.20
+        config.factor_library_min_selection_rank_ic = 0.01
+        config.factor_library_min_selection_monotonicity = 0.50
+        config.factor_library_max_selection_drawdown = -0.20
+        passing = pd.Series(
+            {
+                "测试夏普比率": 1.2,
+                "测试累计收益": 0.05,
+                "测试胜率": 0.55,
+                "测试交易次数": 12,
+                "测试信号覆盖率": 0.30,
+                "测试RankIC": 0.03,
+                "测试分组单调性": 0.70,
+                "测试最大回撤": -0.10,
+            }
+        )
+
+        self.assertEqual(
+            get_final_test_performance_reject_reason(passing, config),
+            "",
+        )
+        failing_cases = {
+            "测试胜率": (0.50, "low_test_win_rate"),
+            "测试交易次数": (9, "low_test_trade_count"),
+            "测试信号覆盖率": (0.10, "low_test_signal_coverage"),
+            "测试RankIC": (0.0, "low_test_rank_ic"),
+            "测试分组单调性": (0.40, "low_test_monotonicity"),
+            "测试最大回撤": (-0.30, "high_test_drawdown"),
+        }
+        for column, (value, expected_reason) in failing_cases.items():
+            with self.subTest(column=column):
+                candidate = passing.copy()
+                candidate[column] = value
+                self.assertEqual(
+                    get_final_test_performance_reject_reason(candidate, config),
+                    expected_reason,
+                )
 
     def test_factor_library_requires_manual_approval_before_active(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -651,6 +813,49 @@ class FrameworkRegressionTests(unittest.TestCase):
                 "manual_restore_pending_retest",
             )
 
+    def test_automatic_active_rotation_deletes_only_removed_factor_plots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            plot_dir = get_research_output_dir(config, "single_factor")
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            removed_plot = plot_dir / "1_factor_a_report.png"
+            retained_plot = plot_dir / "2_factor_b_report.png"
+            removed_plot.write_bytes(b"removed")
+            retained_plot.write_bytes(b"retained")
+            history_dir = Path(temp_dir) / "runs" / "old_single"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            history_plot = history_dir / removed_plot.name
+            history_plot.write_bytes(b"history")
+
+            previous_active = pd.DataFrame(
+                {
+                    "因子编号": [1, 2],
+                    "因子": ["factor_a", "factor_b"],
+                    "因子标签": ["1_factor_a", "2_factor_b"],
+                    "图片文件": [str(removed_plot), str(retained_plot)],
+                }
+            )
+            current_active = previous_active.iloc[[1]].copy()
+            library_all = previous_active.copy()
+
+            removed_names, deleted_paths = cleanup_removed_active_factor_plots(
+                previous_active,
+                current_active,
+                library_all,
+                config,
+            )
+
+            self.assertEqual(removed_names, ["factor_a"])
+            self.assertEqual(deleted_paths, [removed_plot.resolve()])
+            self.assertFalse(removed_plot.exists())
+            self.assertTrue(retained_plot.exists())
+            self.assertTrue(history_plot.exists())
+            self.assertEqual(
+                library_all.loc[library_all["因子"].eq("factor_a"), "图片文件"].iloc[0],
+                "",
+            )
+
     def test_expensive_factor_diagnostics_only_skip_guaranteed_rejections(self) -> None:
         config = BacktestConfig()
         train_metrics = {
@@ -701,6 +906,7 @@ class FrameworkRegressionTests(unittest.TestCase):
 
     def test_single_factor_plots_cover_all_active_factors_by_default(self) -> None:
         config = BacktestConfig()
+        config.single_factor_scope = "range"
         active = pd.DataFrame({"因子": ["factor_a", "factor_b", "factor_c"]})
 
         self.assertEqual(
@@ -718,6 +924,7 @@ class FrameworkRegressionTests(unittest.TestCase):
     def test_existing_single_factor_plot_is_reused_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = BacktestConfig()
+            config.single_factor_scope = "range"
             output_dir = Path(temp_dir)
             plot_path = output_dir / "1_factor_a_report.png"
             plot_path.write_bytes(b"existing plot")
@@ -732,6 +939,28 @@ class FrameworkRegressionTests(unittest.TestCase):
             )
             config.single_factor_reuse_existing_plots = True
             plot_path.write_bytes(b"")
+            self.assertIsNone(
+                get_reusable_single_factor_plot(output_dir, "1_factor_a", config)
+            )
+
+    def test_active_scope_forces_all_factor_plots_to_be_regenerated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.single_factor_scope = "active"
+            config.single_factor_plot_all_active = False
+            config.single_factor_plot_top_n = 1
+            config.single_factor_reuse_existing_plots = True
+            active = pd.DataFrame(
+                {"因子": ["factor_a", "factor_b", "factor_c"]}
+            )
+            output_dir = Path(temp_dir)
+            plot_path = output_dir / "1_factor_a_report.png"
+            plot_path.write_bytes(b"existing plot")
+
+            self.assertEqual(
+                get_active_factor_plot_names(active, config),
+                ["factor_a", "factor_b", "factor_c"],
+            )
             self.assertIsNone(
                 get_reusable_single_factor_plot(output_dir, "1_factor_a", config)
             )
@@ -780,6 +1009,7 @@ class FrameworkRegressionTests(unittest.TestCase):
             config = BacktestConfig()
             config.output_dir = temp_dir
             config.bar_frequency = "30min"
+            config.composite_factor_pool_scope = "active"
             library_dir = get_factor_library_dir(config)
             run_dir = Path(temp_dir) / "runs" / "test_composite"
             output_dir = get_research_output_dir(config, "composite_factor")
@@ -813,6 +1043,60 @@ class FrameworkRegressionTests(unittest.TestCase):
                 run_dir,
             )
             self.assertEqual(audit["status"], "passed")
+
+    def test_composite_protected_pool_freezes_only_protected_active_factors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.bar_frequency = "30min"
+            config.composite_factor_pool_scope = "protected"
+            library_dir = get_factor_library_dir(config)
+            run_dir = Path(temp_dir) / "runs" / "protected_composite"
+            output_dir = get_research_output_dir(config, "composite_factor")
+            library_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "因子": ["factor_a", "factor_b", "factor_c"],
+                    "是否手工保护": [False, True, "是"],
+                    "训练截止": ["2025-01-01"] * 3,
+                    "验证截止": ["2025-02-01"] * 3,
+                }
+            ).to_csv(library_dir / "active_factors.csv", index=False)
+
+            runtime_config, snapshot_path = freeze_active_factor_library_for_run(
+                config,
+                output_dir,
+                run_dir,
+            )
+
+            self.assertEqual(load_active_factor_names(runtime_config), ["factor_b", "factor_c"])
+            snapshot = pd.read_csv(snapshot_path)
+            self.assertEqual(snapshot["因子"].tolist(), ["factor_b", "factor_c"])
+            manifest = json.loads(
+                (run_dir / "active_factors_snapshot_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["factor_pool_scope"], "protected")
+            self.assertEqual(manifest["factor_count"], 2)
+
+    def test_composite_protected_pool_stops_when_no_factor_is_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.composite_factor_pool_scope = "protected"
+            library_dir = get_factor_library_dir(config)
+            library_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {"因子": ["factor_a"], "是否手工保护": [False]}
+            ).to_csv(library_dir / "active_factors.csv", index=False)
+
+            with self.assertRaisesRegex(ValueError, "没有手工保护因子"):
+                load_active_factor_names(config)
+
+    def test_composite_factor_pool_scope_is_validated(self) -> None:
+        config = BacktestConfig()
+        config.composite_factor_pool_scope = "unknown"
+        with self.assertRaisesRegex(ValueError, "composite_factor_pool_scope"):
+            validate_backtest_config(config, "composite")
 
     def test_active_library_cutoff_audit_rejects_future_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1346,7 +1630,7 @@ class FrameworkRegressionTests(unittest.TestCase):
             THIRD_FAMILY_EXPANSION_END_INDEX - THIRD_FAMILY_EXPANSION_START_INDEX + 1,
             THIRD_FAMILY_TOTAL_COUNT,
         )
-        self.assertEqual(TOTAL_FACTOR_END_INDEX, 600_000)
+        self.assertEqual(THIRD_FAMILY_EXPANSION_END_INDEX, 600_000)
 
     def test_third_five_family_expansions_build_strictly_on_demand(self) -> None:
         config = BacktestConfig()
@@ -1371,6 +1655,148 @@ class FrameworkRegressionTests(unittest.TestCase):
         ]
         requested: list[str] = []
         for expected_prefix, start in zip(THIRD_FAMILY_PREFIXES, starts):
+            config.single_factor_range = (start, start)
+            names, factor_id_map = resolve_single_factor_requested_factors(data, config)
+            self.assertEqual(len(names or []), 1)
+            self.assertTrue(names[0].startswith(f"{expected_prefix}_"))
+            self.assertEqual(factor_id_map[names[0]], start)
+            requested.extend(names)
+
+        related = data.copy()
+        related["close"] = close * 1.01 + np.sin(np.arange(len(index)))
+        built = build_factors(
+            data,
+            config,
+            related_data_map={"M.DCE": related},
+            requested_factors=requested,
+        )
+        self.assertEqual(set(built.columns), set(requested))
+        self.assertEqual(
+            [classify_factor(name)["因子家族"] for name in requested],
+            ["cross_asset", "non_cross_complex", "expanded", "parametric", "calendar"],
+        )
+
+    def test_fourth_five_family_blocks_have_exact_counts_and_stable_ids(self) -> None:
+        names = get_fourth_family_expansion_names()
+        old_names = get_third_family_expansion_names()
+        self.assertEqual(FOURTH_FAMILY_COUNT, 20_000)
+        self.assertEqual(FOURTH_FAMILY_TOTAL_COUNT, 100_000)
+        self.assertEqual(len(names), FOURTH_FAMILY_TOTAL_COUNT)
+        self.assertEqual(len(set(names)), FOURTH_FAMILY_TOTAL_COUNT)
+        self.assertFalse(set(names).intersection(old_names))
+        for block_index, prefix in enumerate(FOURTH_FAMILY_PREFIXES):
+            self.assertTrue(names[block_index * FOURTH_FAMILY_COUNT].startswith(f"{prefix}_"))
+            self.assertTrue(
+                names[(block_index + 1) * FOURTH_FAMILY_COUNT - 1].startswith(f"{prefix}_")
+            )
+        self.assertEqual(
+            FOURTH_FAMILY_EXPANSION_START_INDEX,
+            THIRD_FAMILY_EXPANSION_END_INDEX + 1,
+        )
+        self.assertEqual(
+            FOURTH_FAMILY_EXPANSION_END_INDEX - FOURTH_FAMILY_EXPANSION_START_INDEX + 1,
+            FOURTH_FAMILY_TOTAL_COUNT,
+        )
+        self.assertEqual(FOURTH_FAMILY_EXPANSION_END_INDEX, 700_000)
+
+    def test_fifth_five_family_blocks_have_exact_counts_and_stable_ids(self) -> None:
+        names = get_fifth_family_expansion_names()
+        old_names = get_fourth_family_expansion_names()
+        self.assertEqual(FIFTH_FAMILY_COUNT, 20_000)
+        self.assertEqual(FIFTH_FAMILY_TOTAL_COUNT, 100_000)
+        self.assertEqual(len(names), FIFTH_FAMILY_TOTAL_COUNT)
+        self.assertEqual(len(set(names)), FIFTH_FAMILY_TOTAL_COUNT)
+        self.assertFalse(set(names).intersection(old_names))
+        for block_index, prefix in enumerate(FIFTH_FAMILY_PREFIXES):
+            self.assertTrue(names[block_index * FIFTH_FAMILY_COUNT].startswith(f"{prefix}_"))
+            self.assertTrue(
+                names[(block_index + 1) * FIFTH_FAMILY_COUNT - 1].startswith(f"{prefix}_")
+            )
+        self.assertEqual(
+            FIFTH_FAMILY_EXPANSION_START_INDEX,
+            FOURTH_FAMILY_EXPANSION_END_INDEX + 1,
+        )
+        self.assertEqual(
+            FIFTH_FAMILY_EXPANSION_END_INDEX - FIFTH_FAMILY_EXPANSION_START_INDEX + 1,
+            FIFTH_FAMILY_TOTAL_COUNT,
+        )
+        self.assertEqual(TOTAL_FACTOR_END_INDEX, 800_000)
+        expected_families = [
+            "cross_asset", "non_cross_complex", "expanded", "parametric", "calendar"
+        ]
+        for block, expected_family in enumerate(expected_families):
+            self.assertEqual(
+                classify_factor(names[block * FIFTH_FAMILY_COUNT])["因子家族"],
+                expected_family,
+            )
+
+    def test_fourth_five_family_expansions_build_strictly_on_demand(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_scope = "range"
+        config.zscore_window = 20
+        index = pd.date_range("2023-01-01", periods=500, freq="D")
+        close = pd.Series(100.0 + np.linspace(0.0, 20.0, len(index)), index=index)
+        data = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.004,
+                "low": close * 0.996,
+                "close": close,
+                "volume": 1000.0 + np.arange(len(index), dtype="float64"),
+                "amt": 100000.0 + np.arange(len(index), dtype="float64") * 100.0,
+            },
+            index=index,
+        )
+        starts = [
+            FOURTH_FAMILY_EXPANSION_START_INDEX + block * FOURTH_FAMILY_COUNT
+            for block in range(5)
+        ]
+        requested: list[str] = []
+        for expected_prefix, start in zip(FOURTH_FAMILY_PREFIXES, starts):
+            config.single_factor_range = (start, start)
+            names, factor_id_map = resolve_single_factor_requested_factors(data, config)
+            self.assertEqual(len(names or []), 1)
+            self.assertTrue(names[0].startswith(f"{expected_prefix}_"))
+            self.assertEqual(factor_id_map[names[0]], start)
+            requested.extend(names)
+
+        related = data.copy()
+        related["close"] = close * 1.01 + np.sin(np.arange(len(index)))
+        built = build_factors(
+            data,
+            config,
+            related_data_map={"M.DCE": related},
+            requested_factors=requested,
+        )
+        self.assertEqual(set(built.columns), set(requested))
+        self.assertEqual(
+            [classify_factor(name)["因子家族"] for name in requested],
+            ["cross_asset", "non_cross_complex", "expanded", "parametric", "calendar"],
+        )
+
+    def test_fifth_five_family_expansions_build_strictly_on_demand(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_scope = "range"
+        config.zscore_window = 20
+        index = pd.date_range("2023-01-01", periods=500, freq="D")
+        close = pd.Series(100.0 + np.linspace(0.0, 20.0, len(index)), index=index)
+        data = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.004,
+                "low": close * 0.996,
+                "close": close,
+                "volume": 1000.0 + np.arange(len(index), dtype="float64"),
+                "amt": 100000.0 + np.arange(len(index), dtype="float64") * 100.0,
+            },
+            index=index,
+        )
+        starts = [
+            FIFTH_FAMILY_EXPANSION_START_INDEX + block * FIFTH_FAMILY_COUNT
+            for block in range(5)
+        ]
+        requested: list[str] = []
+        for expected_prefix, start in zip(FIFTH_FAMILY_PREFIXES, starts):
             config.single_factor_range = (start, start)
             names, factor_id_map = resolve_single_factor_requested_factors(data, config)
             self.assertEqual(len(names or []), 1)
@@ -1463,6 +1889,7 @@ class FrameworkRegressionTests(unittest.TestCase):
             active_path = Path(temp_dir) / "active_factors.csv"
             pd.DataFrame(columns=["因子"]).to_csv(active_path, index=False)
             config = BacktestConfig()
+            config.composite_factor_pool_scope = "active"
             config.use_frozen_active_library = True
             config.frozen_active_library_path = str(active_path)
             with self.assertRaisesRegex(ValueError, "不会回退计算全部因子"):
@@ -1472,6 +1899,7 @@ class FrameworkRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = BacktestConfig()
             config.output_dir = temp_dir
+            config.composite_factor_pool_scope = "active"
             library_dir = get_factor_library_dir(config)
             library_dir.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(columns=["因子"]).to_csv(
@@ -1566,6 +1994,109 @@ class FrameworkRegressionTests(unittest.TestCase):
             self.assertEqual(factors.attrs["existing_active_factor_columns"], ["old_active"])
             self.assertEqual(list(factors.columns), ["new_factor", "old_active"])
             self.assertEqual(factors.attrs["factor_id_map"]["old_active"], 1)
+
+    def test_active_scope_resolves_current_symbol_frequency_library(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.symbol = "IF.CFE"
+            config.bar_frequency = "1d"
+            config.single_factor_scope = "active"
+            library_dir = get_factor_library_dir(config)
+            pd.DataFrame(
+                {
+                    "因子": ["momentum", "reversal"],
+                    "因子编号": [11, 29],
+                }
+            ).to_csv(
+                library_dir / "active_factors.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+            requested, factor_id_map = resolve_single_factor_requested_factors(
+                pd.DataFrame(),
+                config,
+            )
+
+            self.assertEqual(requested, ["momentum", "reversal"])
+            self.assertEqual(factor_id_map, {"momentum": 11, "reversal": 29})
+            self.assertIn("IF_CFE", str(library_dir))
+            self.assertEqual(library_dir.name, "1d")
+
+    def test_active_scope_missing_library_fails_without_full_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.symbol = "IF.CFE"
+            config.bar_frequency = "1d"
+            config.single_factor_scope = "active"
+
+            with self.assertRaisesRegex(ValueError, "active_factors.csv"):
+                resolve_single_factor_requested_factors(pd.DataFrame(), config)
+
+    def test_active_scope_builds_every_active_factor_without_corr_prefilter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.single_factor_scope = "active"
+            config.single_factor_enable_corr_prefilter = True
+            config.single_factor_prebuild_corr_prefilter = True
+            library_dir = get_factor_library_dir(config)
+            pd.DataFrame(
+                {
+                    "因子": ["momentum", "reversal"],
+                    "因子编号": [1, 2],
+                }
+            ).to_csv(
+                library_dir / "active_factors.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            index = pd.date_range("2025-01-01", periods=80, freq="D")
+            close = pd.Series(np.linspace(100.0, 110.0, len(index)), index=index)
+            data = pd.DataFrame(
+                {
+                    "open": close.shift(1).fillna(close.iloc[0]),
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 1000.0,
+                },
+                index=index,
+            )
+            requested, factor_id_map = resolve_single_factor_requested_factors(data, config)
+
+            kept = prebuild_and_prefilter_factor_names(
+                data,
+                config,
+                requested or [],
+                factor_id_map,
+                Path(temp_dir),
+            )
+            factors = build_single_factor_matrix(
+                data,
+                config,
+                requested_factors_override=kept,
+                catalog_factor_id_map_override=factor_id_map,
+                progress_factor_columns=requested,
+            )
+
+            self.assertEqual(kept, ["momentum", "reversal"])
+            self.assertEqual(factors.attrs["backtest_factor_columns"], kept)
+            self.assertEqual(factors.attrs["factor_id_map"], factor_id_map)
+            self.assertEqual(set(factors.columns), set(kept))
+
+    def test_active_scope_is_accepted_by_config_and_cli(self) -> None:
+        from cli import build_parser, create_config
+
+        args = build_parser().parse_args(
+            ["single", "--symbol", "IF.CFE", "--frequency", "1d", "--scope", "active"]
+        )
+        config = create_config(args)
+
+        self.assertEqual(config.single_factor_scope, "active")
+        validate_backtest_config(config, "single")
 
     def test_pooled_time_decay_is_equal_within_timestamp(self) -> None:
         config = BacktestConfig()
@@ -1693,20 +2224,32 @@ class FrameworkRegressionTests(unittest.TestCase):
             minute = BacktestConfig()
             minute.output_dir = temp_dir
             minute.data_cache_dir = str(Path(temp_dir) / "data")
+            minute.symbol = "C.DCE"
             minute.bar_frequency = "30min"
 
             daily = BacktestConfig()
             daily.output_dir = temp_dir
             daily.data_cache_dir = str(Path(temp_dir) / "data")
+            daily.symbol = "C.DCE"
             daily.bar_frequency = "1d"
 
             self.assertEqual(
                 get_factor_library_dir(minute),
-                Path(temp_dir) / "factor_library" / "30min",
+                Path(temp_dir)
+                / "by_symbol"
+                / "symbols"
+                / "C_DCE"
+                / "factor_library"
+                / "30min",
             )
             self.assertEqual(
                 get_factor_library_dir(daily),
-                Path(temp_dir) / "factor_library" / "1d",
+                Path(temp_dir)
+                / "by_symbol"
+                / "symbols"
+                / "C_DCE"
+                / "factor_library"
+                / "1d",
             )
             self.assertEqual(
                 get_data_cache_path(daily),
@@ -1714,6 +2257,28 @@ class FrameworkRegressionTests(unittest.TestCase):
             )
             self.assertFalse(
                 any("30min" in str(path) for path in get_local_data_candidates(daily))
+            )
+
+    def test_single_symbol_outputs_are_isolated_and_match_multi_symbol_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c_config = BacktestConfig()
+            c_config.output_dir = temp_dir
+            c_config.symbol = "C.DCE"
+            m_config = BacktestConfig()
+            m_config.output_dir = temp_dir
+            m_config.symbol = "M.DCE"
+
+            c_library = get_factor_library_dir(c_config)
+            m_library = get_factor_library_dir(m_config)
+            self.assertNotEqual(c_library, m_library)
+            self.assertIn("C_DCE", c_library.parts)
+            self.assertIn("M_DCE", m_library.parts)
+
+            multi_m_config = build_symbol_config(c_config, "M.DCE")
+            self.assertEqual(get_factor_library_dir(multi_m_config), m_library)
+            self.assertEqual(
+                get_research_output_dir(multi_m_config, "single_factor"),
+                get_research_output_dir(m_config, "single_factor"),
             )
 
     def test_daily_frequency_applies_daily_training_windows(self) -> None:
@@ -1845,6 +2410,197 @@ class FrameworkRegressionTests(unittest.TestCase):
         ].to_numpy()
         np.testing.assert_allclose(original_weight, changed_weight, atol=1e-12)
 
+    def test_probability_calibration_only_uses_matured_labels(self) -> None:
+        config = BacktestConfig()
+        config.composite_probability_calibration_enabled = True
+        config.composite_probability_calibration_window = 24
+        config.composite_probability_calibration_min_history = 8
+        config.composite_probability_calibration_retrain_every = 1
+        config.composite_probability_temperature_grid = [0.5, 1.0, 2.0]
+        index = pd.date_range("2025-01-01", periods=60, freq="D")
+        target = pd.Series(np.where(np.arange(60) % 2 == 0, 1.0, -1.0), index=index)
+        probabilities = pd.DataFrame(
+            {
+                "prob_down": np.where(target < 0, 0.70, 0.10),
+                "prob_flat": 0.20,
+                "prob_up": np.where(target > 0, 0.70, 0.10),
+            },
+            index=index,
+        )
+        trade_probability = pd.Series(0.75, index=index)
+        horizon = 3
+        timestamp = index[40]
+
+        calibrated, temperature, _ = rolling_temperature_calibrate_multiclass(
+            probabilities,
+            target,
+            config,
+            horizon=horizon,
+        )
+        calibrated_trade, trade_temperature, _ = rolling_temperature_calibrate_binary(
+            trade_probability,
+            target.abs(),
+            config,
+            horizon=horizon,
+        )
+        changed_target = target.copy()
+        changed_target.iloc[index.get_loc(timestamp) - horizon + 1 :] *= -1
+        changed, changed_temperature, _ = rolling_temperature_calibrate_multiclass(
+            probabilities,
+            changed_target,
+            config,
+            horizon=horizon,
+        )
+        changed_trade, changed_trade_temperature, _ = rolling_temperature_calibrate_binary(
+            trade_probability,
+            changed_target.abs(),
+            config,
+            horizon=horizon,
+        )
+
+        np.testing.assert_allclose(
+            calibrated.loc[timestamp],
+            changed.loc[timestamp],
+            atol=1e-12,
+        )
+        self.assertEqual(temperature.loc[timestamp], changed_temperature.loc[timestamp])
+        self.assertEqual(calibrated_trade.loc[timestamp], changed_trade.loc[timestamp])
+        self.assertEqual(
+            trade_temperature.loc[timestamp],
+            changed_trade_temperature.loc[timestamp],
+        )
+
+    def test_edge_ensemble_uses_unified_model_edge_score(self) -> None:
+        config = BacktestConfig()
+        config.xgboost_target_horizon = 2
+        config.composite_ensemble_weight_window = 20
+        config.composite_ensemble_min_history = 5
+        config.composite_ensemble_min_directional_accuracy = 0.0
+        config.composite_ensemble_min_edge_return_corr = -1.0
+        config.composite_ensemble_min_abs_edge = 0.0
+        config.xgboost_two_stage_min_trade_probability = 0.0
+        index = pd.date_range("2025-01-01", periods=40, freq="D")
+        target = pd.Series(np.where(np.arange(40) % 2 == 0, 1.0, -1.0), index=index)
+        future_return = target * 0.01
+        data = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1000.0,
+            },
+            index=index,
+        )
+
+        def make_signal(scale: float) -> pd.DataFrame:
+            # 概率投影故意给出相反方向，验证融合读取的是 model_edge_score。
+            return pd.DataFrame(
+                {
+                    "target_direction": target,
+                    "future_horizon_return": future_return,
+                    "future_horizon_standardized_net_return": target * 0.4,
+                    "model_edge_score": target * scale,
+                    "calibrated_trade_probability": 0.8,
+                    "prob_down": np.where(target > 0, 0.7, 0.1),
+                    "prob_flat": 0.2,
+                    "prob_up": np.where(target < 0, 0.7, 0.1),
+                    "xgboost_signal_direction": 1.0,
+                },
+                index=index,
+            )
+
+        ensemble, diagnostics = build_historical_edge_ensemble(
+            {"model_a": make_signal(0.3), "model_b": make_signal(0.2)},
+            data,
+            config,
+        )
+
+        valid = ensemble["model_edge_score"].dropna()
+        self.assertFalse(valid.empty)
+        self.assertTrue((np.sign(valid) == np.sign(target.loc[valid.index])).all())
+        self.assertEqual(ensemble["probability_semantics"].dropna().iloc[-1], "diagnostic_projection")
+        self.assertIn("历史边际收益相关性", diagnostics.columns)
+        np.testing.assert_allclose(
+            ensemble.loc[valid.index, ["prob_down", "prob_flat", "prob_up"]].sum(axis=1),
+            1.0,
+            atol=1e-10,
+        )
+
+    def test_daily_multi_window_defaults_include_primary_window(self) -> None:
+        config = BacktestConfig()
+        config.bar_frequency = "1d"
+        resolved = apply_frequency_runtime_defaults(config)
+
+        self.assertEqual(
+            resolve_multi_window_train_windows(resolved),
+            [504, 252, 1008],
+        )
+
+    def test_pooled_symbol_residual_only_uses_matured_symbol_history(self) -> None:
+        config = BacktestConfig()
+        config.pooled_model_hierarchy_mode = "global_symbol_residual"
+        config.pooled_symbol_residual_enabled = True
+        config.pooled_symbol_residual_window = 20
+        config.pooled_symbol_residual_min_history = 5
+        config.pooled_symbol_residual_prior_count = 0.0
+        timestamps = pd.date_range("2025-01-01", periods=50, freq="D")
+        frame = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": "A.DCE",
+                "label_available_time": timestamps + pd.Timedelta(days=2),
+                "future_horizon_standardized_net_return": 0.4,
+                "global_model_edge_score": 0.0,
+            }
+        )
+        current_time = timestamps[30]
+
+        original = apply_pooled_symbol_residual_correction(frame, config)
+        changed_frame = frame.copy()
+        changed_frame.loc[
+            changed_frame["label_available_time"] > current_time,
+            "future_horizon_standardized_net_return",
+        ] = -10.0
+        changed = apply_pooled_symbol_residual_correction(changed_frame, config)
+        original_value = original.loc[original["timestamp"] == current_time].iloc[0]
+        changed_value = changed.loc[changed["timestamp"] == current_time].iloc[0]
+
+        self.assertGreater(original_value["symbol_residual_adjustment"], 0.0)
+        self.assertAlmostEqual(
+            original_value["symbol_residual_adjustment"],
+            changed_value["symbol_residual_adjustment"],
+        )
+        self.assertEqual(
+            build_grouped_symbol_map(["A.DCE", "CU.SHF"], config),
+            {"全市场全局模型": ["A.DCE", "CU.SHF"]},
+        )
+
+    def test_pooled_residual_handles_symbol_first_seen_between_refreshes(self) -> None:
+        config = BacktestConfig()
+        config.pooled_model_hierarchy_mode = "global_symbol_residual"
+        config.pooled_symbol_residual_enabled = True
+        config.pooled_symbol_residual_window = 20
+        config.pooled_symbol_residual_min_history = 2
+        config.pooled_symbol_residual_retrain_every = 5
+        timestamps = pd.date_range("2025-01-01", periods=8, freq="D")
+        frame = pd.DataFrame(
+            {
+                "timestamp": list(timestamps) + list(timestamps[3:]),
+                "symbol": ["A.DCE"] * len(timestamps) + ["B.DCE"] * 5,
+                "label_available_time": list(timestamps + pd.Timedelta(days=1))
+                + list(timestamps[3:] + pd.Timedelta(days=1)),
+                "future_horizon_standardized_net_return": 0.2,
+                "global_model_edge_score": 0.0,
+            }
+        )
+
+        corrected = apply_pooled_symbol_residual_correction(frame, config)
+
+        first_b = corrected[corrected["symbol"] == "B.DCE"].iloc[0]
+        self.assertEqual(first_b["symbol_residual_history_count"], 0)
+        self.assertEqual(first_b["symbol_residual_adjustment"], 0.0)
+
     def test_daily_frequency_drops_unfinished_current_bar(self) -> None:
         config = BacktestConfig()
         config.bar_frequency = "1d"
@@ -1899,6 +2655,455 @@ class FrameworkRegressionTests(unittest.TestCase):
             )
             self.assertEqual(summary.loc[0, "相关性样本范围"], "train_validation")
             self.assertIn("2025-03-21", summary.loc[0, "抽样截止"])
+
+    def test_prebuild_corr_prefilter_uses_short_research_sample_before_full_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.single_factor_scope = "range"
+            config.single_factor_enable_corr_prefilter = True
+            config.single_factor_prebuild_corr_prefilter = True
+            config.single_factor_corr_prefilter_threshold = 0.95
+            config.single_factor_corr_prefilter_sample_rows = 20
+            config.single_factor_prebuild_warmup_rows = 20
+            config.single_factor_prebuild_batch_size = 1
+            config.auto_select_train_ratio = 0.60
+            config.auto_select_validation_ratio = 0.20
+            index = pd.date_range("2025-01-01", periods=100, freq="D")
+            data = pd.DataFrame(
+                {
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": np.linspace(100.0, 110.0, len(index)),
+                    "volume": 1000.0,
+                },
+                index=index,
+            )
+            observed: dict[str, object] = {}
+
+            def fake_build(preview_data, _config, **kwargs):
+                observed["rows"] = len(preview_data)
+                observed["end"] = preview_data.index[-1]
+                observed.setdefault("requested_batches", []).append(
+                    kwargs["requested_factors_override"]
+                )
+                values = np.arange(len(preview_data), dtype="float64")
+                return pd.DataFrame(
+                    {"factor_a": values, "factor_b": values},
+                    index=preview_data.index,
+                )
+
+            with patch(
+                "single_factor_backtest.build_single_factor_matrix",
+                side_effect=fake_build,
+            ):
+                kept = prebuild_and_prefilter_factor_names(
+                    data,
+                    config,
+                    ["factor_a", "factor_b"],
+                    {"factor_a": 1, "factor_b": 2},
+                    Path(temp_dir),
+                )
+
+            self.assertEqual(kept, ["factor_a"])
+            self.assertEqual(observed["rows"], 70)
+            self.assertEqual(
+                observed["requested_batches"],
+                [["factor_a"], ["factor_b"]],
+            )
+            self.assertLess(observed["end"], index[80])
+
+    def test_parallel_single_factor_worker_matches_serial_result(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_defer_expensive_diagnostics = False
+        config.single_factor_walk_forward_enabled = False
+        config.statistical_enable_block_bootstrap = False
+        config.qcut_window = 30
+        config.qcut_min_periods = 15
+        index = pd.date_range("2024-01-01", periods=320, freq="D")
+        close = pd.Series(100.0 + np.cumsum(np.sin(np.arange(320) / 7.0) + 0.1), index=index)
+        data = pd.DataFrame(
+            {
+                "open": close.shift(1).fillna(close.iloc[0]),
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 1000.0 + np.arange(320),
+            },
+            index=index,
+        )
+        split_time, validation_end = split_train_validation_test_index(
+            data.index,
+            config.auto_select_train_ratio,
+            config.auto_select_validation_ratio,
+        )
+        train = data.loc[data.index < split_time]
+        validation = data.loc[(data.index >= split_time) & (data.index < validation_end)]
+        test = data.loc[data.index >= validation_end]
+        score_a = pd.Series(np.sin(np.arange(320) / 5.0), index=index)
+        score_b = pd.Series(np.cos(np.arange(320) / 9.0), index=index)
+
+        def evaluate(name: str, factor_id: int, score: pd.Series):
+            return _evaluate_single_factor_without_plot(
+                name,
+                f"{factor_id}_{name}",
+                factor_id,
+                score,
+                data,
+                train,
+                validation,
+                test,
+                config,
+                split_time,
+                validation_end,
+            )
+
+        serial_row, serial_qcut, serial_skipped, serial_walk_forward = evaluate(
+            "factor_a",
+            1,
+            score_a,
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(evaluate, "factor_a", 1, score_a),
+                executor.submit(evaluate, "factor_b", 2, score_b),
+            ]
+            (
+                parallel_row,
+                parallel_qcut,
+                parallel_skipped,
+                parallel_walk_forward,
+            ) = futures[0].result()
+            futures[1].result()
+
+        self.assertEqual(serial_skipped, parallel_skipped)
+        self.assertEqual(serial_qcut, parallel_qcut)
+        self.assertEqual(serial_walk_forward, parallel_walk_forward)
+        self.assertEqual(serial_row.keys(), parallel_row.keys())
+        for key in serial_row:
+            left, right = serial_row[key], parallel_row[key]
+            if pd.isna(left) and pd.isna(right):
+                continue
+            self.assertEqual(left, right, key)
+
+    def test_walk_forward_folds_do_not_touch_final_test(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_walk_forward_folds = 4
+        config.single_factor_walk_forward_initial_train_ratio = 0.50
+        config.single_factor_walk_forward_embargo_bars = 1
+        config.single_factor_walk_forward_min_validation_bars = 5
+        index = pd.date_range("2024-01-01", periods=100, freq="D")
+        final_test_start = index[85]
+
+        folds = build_single_factor_walk_forward_folds(
+            index,
+            final_test_start,
+            config,
+        )
+
+        self.assertEqual(len(folds), 4)
+        validation_timestamps: list[pd.Timestamp] = []
+        for fold in folds:
+            train_index = fold["train_index"]
+            validation_index = fold["validation_index"]
+            self.assertLess(train_index[-1], validation_index[0])
+            self.assertLess(validation_index[-1], final_test_start)
+            validation_timestamps.extend(validation_index.tolist())
+        self.assertEqual(len(validation_timestamps), len(set(validation_timestamps)))
+
+    def test_walk_forward_evaluation_reports_non_overlapping_oos_metrics(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_walk_forward_folds = 4
+        config.single_factor_walk_forward_min_validation_bars = 10
+        config.factor_library_min_walk_forward_folds = 3
+        index = pd.date_range("2024-01-01", periods=220, freq="D")
+        close = pd.Series(
+            100.0 + np.cumsum(np.sin(np.arange(len(index)) / 6.0) + 0.05),
+            index=index,
+        )
+        data = pd.DataFrame(
+            {
+                "open": close.shift(1).fillna(close.iloc[0]),
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 1000.0,
+            },
+            index=index,
+        )
+        score = pd.Series(np.sin(np.arange(len(index)) / 5.0), index=index)
+        final_test_start = index[187]
+
+        metrics, records = evaluate_single_factor_walk_forward(
+            data,
+            score,
+            "factor_a",
+            "1_factor_a",
+            1,
+            config,
+            final_test_start,
+        )
+
+        self.assertEqual(metrics["WalkForward状态"], "已计算")
+        self.assertEqual(metrics["WalkForward有效折数"], 4)
+        self.assertEqual(len(records), 4)
+        self.assertGreater(metrics["WalkForward样本K线数"], 0)
+        self.assertTrue(
+            all(pd.Timestamp(record["验证结束"]) < final_test_start for record in records)
+        )
+
+    def test_factor_ranking_prefers_walk_forward_over_fixed_validation(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_keep_top_n = 2
+        summary = pd.DataFrame(
+            {
+                "因子": ["fixed_period_winner", "walk_forward_winner"],
+                "训练夏普比率": [3.0, 1.2],
+                "验证夏普比率": [2.8, 1.1],
+                "训练累计收益": [0.30, 0.12],
+                "验证累计收益": [0.20, 0.08],
+                "WalkForward状态": ["已计算", "已计算"],
+                "WalkForward有效折数": [4, 4],
+                "WalkForward夏普比率": [-0.5, 1.5],
+                "WalkForward累计收益": [-0.03, 0.10],
+                "WalkForward夏普中位数": [-0.4, 1.2],
+                "WalkForward夏普最差值": [-1.0, 0.2],
+                "WalkForward盈利折占比": [0.25, 0.75],
+                "WalkForward方向一致率": [0.50, 0.75],
+                "WalkForwardRankIC中位数": [-0.04, 0.06],
+                "WalkForwardRankIC正向折占比": [0.25, 0.75],
+                "WalkForward方向命中率": [0.45, 0.56],
+            }
+        )
+
+        _, ranked = rank_single_factor_summary(summary, config)
+        ranked = ranked.set_index("因子")
+
+        self.assertEqual(ranked.sort_values("初筛科研综合评分").index[-1], "walk_forward_winner")
+        self.assertEqual(ranked.loc["walk_forward_winner", "初筛样本"], "WalkForward样本外")
+        self.assertAlmostEqual(ranked.loc["walk_forward_winner", "初筛夏普"], 1.5)
+        self.assertAlmostEqual(ranked.loc["fixed_period_winner", "初筛夏普"], -0.5)
+
+    def test_factor_library_rejects_unstable_walk_forward_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.factor_library_storage_format = "pickle"
+            config.factor_library_min_sharpe = 0.0
+            config.factor_library_min_train_sharpe = 0.0
+            config.factor_library_min_predictive_score = None
+            config.factor_library_min_selection_trades = 0
+            config.factor_library_min_train_trades = 0
+            config.factor_library_min_walk_forward_trades = 0
+            config.factor_library_enable_family_quota = False
+            config.factor_library_use_value_corr = False
+            config.factor_library_use_signal_corr = False
+            summary = pd.DataFrame(
+                {
+                    "因子": ["unstable_factor"],
+                    "训练夏普比率": [2.0],
+                    "验证夏普比率": [1.5],
+                    "训练累计收益": [0.20],
+                    "验证累计收益": [0.10],
+                    "训练交易次数": [40],
+                    "验证交易次数": [20],
+                    "WalkForward状态": ["已计算"],
+                    "WalkForward有效折数": [4],
+                    "WalkForward夏普比率": [1.2],
+                    "WalkForward累计收益": [0.08],
+                    "WalkForward夏普中位数": [0.5],
+                    "WalkForward夏普最差值": [-0.7],
+                    "WalkForward盈利折占比": [0.25],
+                    "WalkForward方向一致率": [0.75],
+                    "WalkForwardRankIC中位数": [0.04],
+                    "WalkForwardRankIC正向折占比": [0.75],
+                    "WalkForward方向命中率": [0.55],
+                    "WalkForward胜率": [0.52],
+                    "WalkForward交易次数": [40],
+                    "WalkForward信号覆盖率": [0.40],
+                    "WalkForward最大回撤": [-0.08],
+                }
+            )
+            factors = pd.DataFrame(
+                {"unstable_factor": np.arange(100, dtype="float64")}
+            )
+
+            active, master, _ = build_factor_library(summary, factors, config)
+
+            self.assertTrue(active.empty)
+            self.assertEqual(
+                master.iloc[0]["拒绝原因"],
+                "low_walk_forward_positive_fold_ratio",
+            )
+
+    def test_factor_library_retest_realigns_walk_forward_masks_after_history_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.factor_library_storage_format = "pickle"
+            config.factor_library_min_sharpe = 0.0
+            config.factor_library_min_train_sharpe = 0.0
+            config.factor_library_min_predictive_score = None
+            config.factor_library_min_selection_trades = 0
+            config.factor_library_min_train_trades = 0
+            config.factor_library_min_walk_forward_trades = 0
+            config.factor_library_enable_family_quota = False
+            config.factor_library_use_value_corr = False
+            config.factor_library_use_signal_corr = False
+            retest_summary = pd.DataFrame(
+                {
+                    "因子编号": [1],
+                    "因子": ["factor_a"],
+                    "训练夏普比率": [2.0],
+                    "验证夏普比率": [1.5],
+                    "训练累计收益": [0.20],
+                    "验证累计收益": [0.10],
+                    "训练交易次数": [40],
+                    "验证交易次数": [20],
+                    "WalkForward状态": ["已计算"],
+                    "WalkForward有效折数": [4],
+                    "WalkForward夏普比率": [1.2],
+                    "WalkForward累计收益": [0.08],
+                    "WalkForward夏普中位数": [0.8],
+                    "WalkForward夏普最差值": [0.1],
+                    "WalkForward盈利折占比": [0.75],
+                    "WalkForward方向一致率": [0.75],
+                    "WalkForwardRankIC中位数": [0.04],
+                    "WalkForwardRankIC正向折占比": [0.75],
+                    "WalkForward方向命中率": [0.55],
+                    "WalkForward胜率": [0.52],
+                    "WalkForward交易次数": [40],
+                    "WalkForward信号覆盖率": [0.40],
+                    "WalkForward最大回撤": [-0.08],
+                }
+            )
+            historical = retest_summary.copy()
+            historical["因子库状态"] = "active"
+            historical["拒绝原因"] = ""
+            save_factor_library(
+                historical,
+                historical,
+                historical.iloc[0:0].copy(),
+                config,
+            )
+            factors = pd.DataFrame(
+                {"factor_a": np.arange(100, dtype="float64")}
+            )
+
+            active, master, _ = build_factor_library(
+                retest_summary,
+                factors,
+                config,
+            )
+
+            self.assertEqual(active["因子"].tolist(), ["factor_a"])
+            self.assertEqual(master.loc[0, "因子库状态"], "active")
+            self.assertTrue(bool(master.loc[0, "WalkForward有效"]))
+
+    def test_empty_market_data_fails_before_factor_generation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "行情数据为空"):
+            normalize_intraday_data(pd.DataFrame())
+
+    def test_invalid_stock_index_future_exchange_is_rejected(self) -> None:
+        config = BacktestConfig()
+        config.symbol = "IF.DCE"
+
+        with self.assertRaisesRegex(ValueError, "IF.CFE"):
+            validate_backtest_config(config, "single")
+
+    def test_parallel_single_factor_pipeline_preserves_factor_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = BacktestConfig()
+            config.output_dir = temp_dir
+            config.enable_experiment_run_dirs = False
+            config.factor_library_storage_format = "pickle"
+            config.single_factor_parallel_workers = 2
+            config.single_factor_enable_corr_prefilter = False
+            config.single_factor_plot_all = False
+            config.single_factor_plot_all_active = False
+            config.single_factor_plot_top_n = 0
+            config.single_factor_defer_expensive_diagnostics = True
+            config.factor_library_min_sharpe = 999.0
+            config.factor_library_min_train_sharpe = 999.0
+            config.factor_library_min_predictive_score = None
+            config.statistical_enable_block_bootstrap = False
+            index = pd.date_range("2024-01-01", periods=180, freq="D")
+            close = pd.Series(100.0 + np.cumsum(np.sin(np.arange(180) / 8.0)), index=index)
+            data = pd.DataFrame(
+                {
+                    "open": close.shift(1).fillna(close.iloc[0]),
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 1000.0 + np.arange(180),
+                },
+                index=index,
+            )
+            factors = pd.DataFrame(
+                {
+                    "factor_a": np.sin(np.arange(180) / 5.0),
+                    "factor_b": np.cos(np.arange(180) / 7.0),
+                },
+                index=index,
+            )
+            factors.attrs["factor_id_map"] = {"factor_a": 1, "factor_b": 2}
+            factors.attrs["factor_label_map"] = {
+                "factor_a": "1_factor_a",
+                "factor_b": "2_factor_b",
+            }
+            factors.attrs["backtest_factor_columns"] = ["factor_a", "factor_b"]
+            factors.attrs["progress_factor_columns"] = ["factor_a", "factor_b"]
+
+            run_single_factor_backtests(data, factors, config)
+
+            summary = pd.read_csv(
+                get_research_output_dir(config, "single_factor")
+                / "single_factor_all_summary.csv",
+                encoding="utf-8-sig",
+            )
+            self.assertEqual(set(summary["因子"]), {"factor_a", "factor_b"})
+            self.assertEqual(
+                summary.set_index("因子")["因子编号"].astype(int).to_dict(),
+                {"factor_a": 1, "factor_b": 2},
+            )
+            self.assertTrue(summary["错误"].fillna("").eq("").all())
+
+    def test_prefiltered_factor_ids_remain_available_for_progress_updates(self) -> None:
+        config = BacktestConfig()
+        config.single_factor_scope = "range"
+        index = pd.date_range("2025-01-01", periods=30, freq="D")
+        data = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+            },
+            index=index,
+        )
+
+        def fake_build(_data, _config, requested_factors=None):
+            return pd.DataFrame(
+                {name: np.arange(len(_data), dtype="float64") for name in requested_factors},
+                index=_data.index,
+            )
+
+        with patch("framework.factors.build_factors", side_effect=fake_build):
+            factors = build_single_factor_matrix(
+                data,
+                config,
+                requested_factors_override=["factor_b"],
+                catalog_factor_id_map_override={"factor_a": 10, "factor_b": 11},
+                progress_factor_columns=["factor_a", "factor_b"],
+                include_active_references=False,
+            )
+
+        self.assertEqual(factors.attrs["factor_id_map"], {"factor_b": 11})
+        self.assertEqual(
+            factors.attrs["progress_factor_id_map"],
+            {"factor_a": 10, "factor_b": 11},
+        )
 
     def test_factor_library_corr_excludes_final_test_covariates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1967,6 +3172,109 @@ class FrameworkRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(outcomes.iloc[0]["future_horizon_net_return"], 0.0)
         self.assertAlmostEqual(outcomes.iloc[1]["future_horizon_net_return"], 0.0007)
 
+    def test_fast_two_stage_is_limited_to_xgboost(self) -> None:
+        config = BacktestConfig()
+        config.xgboost_decision_mode = "two_stage_net_return"
+
+        self.assertTrue(uses_fast_two_stage_model("xgboost", config))
+        self.assertFalse(uses_fast_two_stage_model("random_forest", config))
+        self.assertFalse(uses_fast_two_stage_model("logistic_regression", config))
+        config.xgboost_decision_mode = "direction_classification"
+        self.assertFalse(uses_fast_two_stage_model("xgboost", config))
+        self.assertFalse(uses_fast_two_stage_model("extra_trees", config))
+
+    def test_fast_two_stage_uses_reduced_regression_rounds(self) -> None:
+        try:
+            import sklearn  # noqa: F401
+            import xgboost  # noqa: F401
+        except ImportError:
+            self.skipTest("当前测试环境未安装 scikit-learn 或 xgboost")
+        config = BacktestConfig()
+        config.xgboost_n_estimators = 20
+        config.xgboost_two_stage_regression_round_ratio = 0.50
+        rng = np.random.default_rng(42)
+        index = pd.RangeIndex(100)
+        features = pd.DataFrame(
+            {
+                "feature_a": rng.normal(size=len(index)),
+                "feature_b": rng.normal(size=len(index)),
+            },
+            index=index,
+        )
+        latent_return = features["feature_a"] * 0.6 - features["feature_b"] * 0.2
+        direction = np.sign(latent_return).where(latent_return.abs() > 0.20, 0.0)
+        targets = build_two_stage_targets(direction, latent_return, config)
+
+        model = train_fast_two_stage_net_return_model(
+            "xgboost",
+            features,
+            targets["trade_target"],
+            targets["return_target"],
+            features.columns.tolist(),
+            config,
+            sample_weight=pd.Series(1.0, index=index),
+        )
+        prediction = predict_fast_two_stage_net_return(
+            "xgboost",
+            model,
+            features.iloc[-10:],
+            features.columns.tolist(),
+        )
+        probability = two_stage_predictions_to_probabilities(prediction)
+
+        self.assertEqual(model.return_model.num_boosted_rounds(), 10)
+        self.assertTrue(prediction["trade_probability"].between(0.0, 1.0).all())
+        np.testing.assert_allclose(probability.sum(axis=1), 1.0)
+
+    def test_fast_two_stage_supports_all_auxiliary_model_families(self) -> None:
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            self.skipTest("当前测试环境未安装 scikit-learn")
+        config = BacktestConfig()
+        config.composite_sklearn_n_estimators = 20
+        config.composite_hist_max_iter = 20
+        config.xgboost_two_stage_regression_round_ratio = 0.50
+        rng = np.random.default_rng(17)
+        index = pd.RangeIndex(120)
+        features = pd.DataFrame(
+            {
+                "feature_a": rng.normal(size=len(index)),
+                "feature_b": rng.normal(size=len(index)),
+                "feature_c": rng.normal(size=len(index)),
+            },
+            index=index,
+        )
+        latent_return = features["feature_a"] * 0.5 - features["feature_b"] * 0.2
+        direction = np.sign(latent_return).where(latent_return.abs() > 0.15, 0.0)
+        targets = build_two_stage_targets(direction, latent_return, config)
+        weights = pd.Series(1.0, index=index)
+
+        for model_name in (
+            "logistic_regression",
+            "elastic_net_logistic",
+            "hist_gradient_boosting",
+            "random_forest",
+            "extra_trees",
+        ):
+            with self.subTest(model=model_name):
+                model = train_fast_two_stage_net_return_model(
+                    model_name,
+                    features,
+                    targets["trade_target"],
+                    targets["return_target"],
+                    features.columns.tolist(),
+                    config,
+                    sample_weight=weights,
+                )
+                prediction = predict_fast_two_stage_net_return(
+                    model_name,
+                    model,
+                    features.iloc[-5:],
+                    features.columns.tolist(),
+                )
+                self.assertTrue(prediction.notna().all().all())
+
     def test_metrics_report_standard_sharpe_separately_from_cagr_vol(self) -> None:
         index = pd.date_range("2025-01-01", periods=6, freq="D")
         returns = pd.Series([0.01, -0.004, 0.006, -0.002, 0.008, 0.001], index=index)
@@ -2006,7 +3314,12 @@ class FrameworkRegressionTests(unittest.TestCase):
             calibrated_prob_edge=probabilities["prob_up"] - probabilities["prob_down"],
             xgboost_signal_direction=1.0,
             raw_signal=prediction,
+            decision_mode="direction_classification",
+            probability_semantics="calibrated_class_probability",
+            model_edge_semantics="rolling_calibrated_standardized_net_return_edge",
         )
+        for column in ("prob_down", "prob_flat", "prob_up"):
+            frame[f"uncalibrated_{column}"] = frame[column]
 
         metrics = calculate_prediction_metrics_for_segment("测试集", frame, config)
 
@@ -2016,6 +3329,13 @@ class FrameworkRegressionTests(unittest.TestCase):
         self.assertIn("概率校准误差ECE", metrics)
         self.assertIn("概率差与未来净收益Spearman", metrics)
         self.assertIn("方向准确率Wilson下限", metrics)
+        self.assertIn("校准前三分类LogLoss", metrics)
+        self.assertIn("校准后三分类LogLoss", metrics)
+        self.assertIn("三分类LogLoss改善", metrics)
+        self.assertEqual(
+            metrics["模型边际口径"],
+            "rolling_calibrated_standardized_net_return_edge",
+        )
 
     def test_block_bootstrap_statistics_are_reproducible(self) -> None:
         config = BacktestConfig()
@@ -2051,6 +3371,39 @@ class FrameworkRegressionTests(unittest.TestCase):
         self.assertEqual(config.xgboost_train_window, 360)
         self.assertEqual(config.xgboost_min_train_samples, 90)
         self.assertEqual(config.xgboost_retrain_every, 10)
+
+    def test_cli_exposes_calibration_multi_window_and_pooled_hierarchy(self) -> None:
+        from cli import build_parser, create_config
+
+        composite_args = build_parser().parse_args(
+            [
+                "composite",
+                "--no-probability-calibration",
+                "--edge-calibration",
+                "--multi-window",
+                "--multi-window-train-windows",
+                "300,600,1200",
+            ]
+        )
+        composite_config = create_config(composite_args)
+        self.assertFalse(composite_config.composite_probability_calibration_enabled)
+        self.assertTrue(composite_config.composite_edge_calibration_enabled)
+        self.assertEqual(
+            composite_config.composite_multi_window_train_windows,
+            [300, 600, 1200],
+        )
+
+        pooled_args = build_parser().parse_args(
+            [
+                "pooled",
+                "--pooled-hierarchy-mode",
+                "group_only",
+                "--no-pooled-symbol-residual",
+            ]
+        )
+        pooled_config = create_config(pooled_args)
+        self.assertEqual(pooled_config.pooled_model_hierarchy_mode, "group_only")
+        self.assertFalse(pooled_config.pooled_symbol_residual_enabled)
 
     def test_config_validation_isolated_by_pipeline(self) -> None:
         config = BacktestConfig()

@@ -32,6 +32,7 @@ from .data_loader import (
     load_local_intraday_data as data_load_local_intraday_data,
     normalize_intraday_data as data_normalize_intraday_data,
     normalize_macro_daily_data as data_normalize_macro_daily_data,
+    resolve_related_symbols as data_resolve_related_symbols,
     safe_symbol_name as data_safe_symbol_name,
     stop_wind as data_stop_wind,
 )
@@ -44,6 +45,8 @@ from .factor_builders import (
     add_expanded_factors,
     add_external_daily_factors,
     add_family_expansion_factors,
+    add_fifth_family_expansion_factors,
+    add_fourth_family_expansion_factors,
     add_second_family_expansion_factors,
     add_third_family_expansion_factors,
     add_hyper_cross_asset_factors,
@@ -54,6 +57,8 @@ from .factor_builders import (
     add_parametric_factors,
     get_expanded_factor_names,
     get_family_expansion_names,
+    get_fifth_family_expansion_names,
+    get_fourth_family_expansion_names,
     get_second_family_expansion_names,
     get_third_family_expansion_names,
 )
@@ -82,7 +87,19 @@ NONCROSSZ_FACTOR_END_INDEX = 570000
 EXPANDED4_FACTOR_END_INDEX = 580000
 PARAMZ_FACTOR_END_INDEX = 590000
 THIRD_FAMILY_EXPANSION_END_INDEX = 600000
-TOTAL_FACTOR_END_INDEX = THIRD_FAMILY_EXPANSION_END_INDEX
+FOURTH_FAMILY_EXPANSION_START_INDEX = 600001
+CROSSW_FACTOR_END_INDEX = 620000
+NONCROSSW_FACTOR_END_INDEX = 640000
+EXPANDED5_FACTOR_END_INDEX = 660000
+PARAMW_FACTOR_END_INDEX = 680000
+FOURTH_FAMILY_EXPANSION_END_INDEX = 700000
+FIFTH_FAMILY_EXPANSION_START_INDEX = 700001
+CROSSV_FACTOR_END_INDEX = 720000
+NONCROSSV_FACTOR_END_INDEX = 740000
+EXPANDED6_FACTOR_END_INDEX = 760000
+PARAMV_FACTOR_END_INDEX = 780000
+FIFTH_FAMILY_EXPANSION_END_INDEX = 800000
+TOTAL_FACTOR_END_INDEX = FIFTH_FAMILY_EXPANSION_END_INDEX
 
 
 def get_on_demand_factor_names() -> tuple[str, ...]:
@@ -92,6 +109,8 @@ def get_on_demand_factor_names() -> tuple[str, ...]:
         + get_family_expansion_names()
         + get_second_family_expansion_names()
         + get_third_family_expansion_names()
+        + get_fourth_family_expansion_names()
+        + get_fifth_family_expansion_names()
     )
 
 
@@ -430,11 +449,12 @@ def load_pruned_factor_names(config: Any) -> set[str]:
 def select_single_factor_columns(factors: pd.DataFrame, config: Any) -> list[str]:
     """根据配置选择本轮需要做单因子回测的因子。
 
-    支持四种模式：
+    支持五种模式：
     - all：测试全部因子。
     - new：从指定编号之后开始测试，适合增量测试 AI 新生成的因子。
     - range：只测试指定编号区间内的因子。
     - selected：只测试手工指定的因子列表。
+    - active：测试当前品种、当前频率 active_factors.csv 中的正式因子。
     """
     factor_columns = get_factor_columns(factors)
     scope = config.single_factor_scope.lower()
@@ -460,7 +480,26 @@ def select_single_factor_columns(factors: pd.DataFrame, config: Any) -> list[str
             raise ValueError(f"single_factor_selected_factors 中存在未知因子: {missing}")
         return selected
 
-    raise ValueError("single_factor_scope 只能是 'all'、'new'、'range' 或 'selected'。")
+    if scope == "active":
+        active = load_existing_active_factor_metadata(config)
+        if active.empty:
+            raise ValueError(
+                "single_factor_scope='active' 需要当前品种、当前频率存在非空的 "
+                "active_factors.csv；请先完成一次单因子入库。"
+            )
+        selected = active["因子"].tolist()
+        missing = [factor_name for factor_name in selected if factor_name not in factor_columns]
+        if missing:
+            preview = ", ".join(missing[:10])
+            suffix = "..." if len(missing) > 10 else ""
+            raise ValueError(
+                f"active 因子矩阵缺少 {len(missing)} 个因子: {preview}{suffix}"
+            )
+        return selected
+
+    raise ValueError(
+        "single_factor_scope 只能是 'all'、'new'、'range'、'selected' 或 'active'。"
+    )
 
 
 def make_factor_catalog_dummy_data(data: pd.DataFrame, rows: int = 4) -> pd.DataFrame:
@@ -488,11 +527,7 @@ def make_factor_catalog_dummy_data(data: pd.DataFrame, rows: int = 4) -> pd.Data
 def make_dummy_related_data_map(config: Any, dummy_data: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """为因子名称目录构造跨品种哑数据，避免为了拿列名去读取真实 Wind/CSV。"""
     related_data_map: dict[str, pd.DataFrame] = {}
-    main_symbol = str(getattr(config, "symbol", "")).upper()
-    for symbol in getattr(config, "related_symbols", []) or []:
-        symbol = str(symbol).strip()
-        if not symbol or symbol.upper() == main_symbol:
-            continue
+    for symbol in data_resolve_related_symbols(config):
         related_data_map[symbol] = dummy_data.copy()
     return related_data_map
 
@@ -661,6 +696,25 @@ def resolve_single_factor_requested_factors(
     if scope == "selected":
         selected = list(getattr(config, "single_factor_selected_factors", []) or [])
         return selected, None
+    if scope == "active":
+        active = load_existing_active_factor_metadata(config)
+        if active.empty:
+            library_dir = Path(getattr(config, "factor_library_dir", "factor_library"))
+            if not library_dir.is_absolute():
+                library_dir = get_research_output_dir(config, str(library_dir))
+            raise ValueError(
+                "active 复测模式找不到可用因子："
+                f"{library_dir / 'active_factors.csv'}。"
+                "请确认品种、频率正确，并先完成一次单因子入库。"
+            )
+        active_names = active["因子"].astype(str).tolist()
+        active_ids = pd.to_numeric(active["因子编号"], errors="coerce")
+        factor_id_map = {
+            factor_name: int(factor_id)
+            for factor_name, factor_id in zip(active_names, active_ids)
+            if pd.notna(factor_id)
+        }
+        return active_names, factor_id_map
     if scope == "range":
         start_factor_id, end_factor_id = get_single_factor_range(config)
         expanded_names = get_on_demand_factor_names()
@@ -789,14 +843,36 @@ def load_existing_active_factor_metadata(config: Any) -> pd.DataFrame:
     return active.reset_index(drop=True)
 
 
-def build_single_factor_matrix(data: pd.DataFrame, config: Any) -> pd.DataFrame:
-    """构建单因子矩阵，并在部分测试模式下带上旧 active 因子作为相关性参照。"""
-    requested_factors, catalog_factor_id_map = resolve_single_factor_requested_factors(data, config)
+def build_single_factor_matrix(
+    data: pd.DataFrame,
+    config: Any,
+    requested_factors_override: list[str] | None = None,
+    catalog_factor_id_map_override: dict[str, int] | None = None,
+    progress_factor_columns: list[str] | None = None,
+    include_active_references: bool = True,
+) -> pd.DataFrame:
+    """构建单因子矩阵，并在部分测试模式下带上旧 active 因子作为相关性参照。
+
+    requested_factors_override 用于短样本相关性预筛后只构建保留因子；
+    progress_factor_columns 仍记录预筛前的原始候选，避免 new 模式重复测试。
+    """
+    if requested_factors_override is None:
+        requested_factors, catalog_factor_id_map = resolve_single_factor_requested_factors(
+            data,
+            config,
+        )
+    else:
+        requested_factors = list(dict.fromkeys(requested_factors_override))
+        catalog_factor_id_map = dict(catalog_factor_id_map_override or {})
     scope = str(getattr(config, "single_factor_scope", "all")).lower()
     backtest_factors = list(requested_factors or [])
     existing_active = pd.DataFrame(columns=["因子", "因子编号"])
     construction_factors = requested_factors
-    if requested_factors is not None and scope in {"new", "range", "selected"}:
+    if (
+        include_active_references
+        and requested_factors is not None
+        and scope in {"new", "range", "selected"}
+    ):
         existing_active = load_existing_active_factor_metadata(config)
         active_names = existing_active["因子"].dropna().astype(str).tolist()
         construction_factors = list(dict.fromkeys([*requested_factors, *active_names]))
@@ -847,6 +923,17 @@ def build_single_factor_matrix(data: pd.DataFrame, config: Any) -> pd.DataFrame:
             for factor_name in existing_active["因子"].astype(str)
             if factor_name in factors.columns
         ]
+        factors.attrs["progress_factor_columns"] = list(
+            progress_factor_columns
+            if progress_factor_columns is not None
+            else backtest_factors
+        )
+        if catalog_factor_id_map:
+            factors.attrs["progress_factor_id_map"] = {
+                factor_name: int(catalog_factor_id_map[factor_name])
+                for factor_name in factors.attrs["progress_factor_columns"]
+                if factor_name in catalog_factor_id_map
+            }
     return factors
 
 
@@ -873,7 +960,9 @@ def build_factors(
         raise ValueError(
             "requested_factors 为空，已拒绝静默回退为全量因子构建。"
         )
-    pruned_factor_names = load_pruned_factor_names(config)
+    # active 是当前正式使用清单，复测时优先级高于历史自动淘汰记录。
+    active_recheck = str(getattr(config, "single_factor_scope", "")).lower() == "active"
+    pruned_factor_names = set() if active_recheck else load_pruned_factor_names(config)
     if requested_set:
         requested_set = requested_set.difference(pruned_factor_names)
     if pruned_factor_names and not requested_mode:
@@ -938,6 +1027,16 @@ def build_factors(
                 "expanded4_",
                 "paramz_",
                 "calendarz_",
+                "crossw_",
+                "noncrossw_",
+                "expanded5_",
+                "paramw_",
+                "calendarw_",
+                "crossv_",
+                "noncrossv_",
+                "expanded6_",
+                "paramv_",
+                "calendarv_",
             )
         )
     )
@@ -1124,6 +1223,44 @@ def build_factors(
         print(f"五类第三批扩展因子数量: {third_family_factors.shape[1]}")
         factor_parts.append(third_family_factors)
 
+    fourth_family_factors = pd.DataFrame(index=df.index)
+    fourth_family_prefixes = (
+        "crossw_", "noncrossw_", "expanded5_", "paramw_", "calendarw_"
+    )
+    if has_requested_prefix(fourth_family_prefixes):
+        if has_requested_prefix(("crossw_",)) and related_data_map is None:
+            related_data_map = fetch_related_intraday_data(config)
+        fourth_family_factors = filter_requested(
+            add_fourth_family_expansion_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+                related_data_map=related_data_map,
+            )
+        )
+    if not fourth_family_factors.empty:
+        print(f"五类第四批扩展因子数量: {fourth_family_factors.shape[1]}")
+        factor_parts.append(fourth_family_factors)
+
+    fifth_family_factors = pd.DataFrame(index=df.index)
+    fifth_family_prefixes = (
+        "crossv_", "noncrossv_", "expanded6_", "paramv_", "calendarv_"
+    )
+    if has_requested_prefix(fifth_family_prefixes):
+        if has_requested_prefix(("crossv_",)) and related_data_map is None:
+            related_data_map = fetch_related_intraday_data(config)
+        fifth_family_factors = filter_requested(
+            add_fifth_family_expansion_factors(
+                df,
+                config,
+                requested_factors=requested_set,
+                related_data_map=related_data_map,
+            )
+        )
+    if not fifth_family_factors.empty:
+        print(f"五类第五批扩展因子数量: {fifth_family_factors.shape[1]}")
+        factor_parts.append(fifth_family_factors)
+
     calendar_factors = pd.DataFrame(index=df.index)
     if need_any_factor() or has_requested_prefix(("calendar_",)):
         calendar_factors = filter_requested(
@@ -1169,11 +1306,19 @@ def build_factors(
         ]
     factors = pd.concat(factor_parts, axis=1).copy()
     if requested_mode:
-        missing_count = len(requested_set.difference(factors.columns))
+        missing_factors = sorted(requested_set.difference(factors.columns))
+        missing_count = len(missing_factors)
         print(
             "因子按需构建完成: "
             f"请求={len(requested_set)}，生成={factors.shape[1]}，缺失={missing_count}"
         )
+        if active_recheck and missing_factors:
+            preview = ", ".join(missing_factors[:10])
+            suffix = "..." if missing_count > 10 else ""
+            raise ValueError(
+                f"active 复测有 {missing_count} 个正式因子已无法由当前代码生成: "
+                f"{preview}{suffix}。请先核对因子构造代码或从 active 库手工移除。"
+            )
     return factors
 
 
